@@ -1,0 +1,35 @@
+{
+    "title": "2024年度项目报价单",
+    "date": "2024-03-15",
+    "company": "科技创新有限公司",
+    "contact_name": "张经理",
+    "contact_title": "采购部经理",
+    "greeting": "感谢贵公司对我们的信任。根据您的需求，我们提供以下报价：",
+    "items": [
+        {
+            "name": "软件开发服务",
+            "quantity": 1,
+            "price": "50000.00",
+            "subtotal": "50000.00"
+        },
+        {
+            "name": "系统部署实施",
+            "quantity": 2,
+            "price": "8000.00",
+            "subtotal": "16000.00"
+        },
+        {
+            "name": "年度维护支持",
+            "quantity": 1,
+            "price": "12000.00",
+            "subtotal": "12000.00"
+        }
+    ],
+    "subtotal": "78000.00",
+    "tax_rate": 6,
+    "tax_amount": "4680.00",
+    "total": "82680.00",
+    "notes": "付款方式：合同签订后支付50%，项目验收后支付50%。项目周期：30个工作日。",
+    "author": "销售部",
+    "author_email": "sales@example.com"
+}
