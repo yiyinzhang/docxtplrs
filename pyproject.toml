@@ -9,7 +9,7 @@ description = "A Rust implementation of python-docx-template with Python binding
 readme = "README.md"
 license = { text = "MIT" }
 authors = [
-    { name = "Your Name", email = "your.email@example.com" },
+    { name = "yiyinzhang", email = "542214021@qq.com" },
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
