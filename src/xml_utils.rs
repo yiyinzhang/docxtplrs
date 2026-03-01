@@ -427,6 +427,26 @@ fn merge_split_tags(xml: &str) -> String {
 pub fn preprocess_xml_content(xml: &str) -> String {
     let mut result = xml.to_string();
 
+    // Convert Chinese quotes to ASCII quotes in Jinja2 tags
+    // These can appear in Word documents when user types quotes
+    // Handle both Unicode characters and XML entity encodings
+    // U+2018 LEFT SINGLE QUOTATION MARK -> '
+    // U+2019 RIGHT SINGLE QUOTATION MARK -> '
+    // U+201C LEFT DOUBLE QUOTATION MARK -> "
+    // U+201D RIGHT DOUBLE QUOTATION MARK -> "
+    
+    // Unicode characters
+    result = result.replace('\u{2018}', "'").replace('\u{2019}', "'");
+    result = result.replace('\u{201C}', "\"").replace('\u{201D}', "\"");
+    
+    // XML decimal entities (8216 = 0x2018, 8217 = 0x2019, 8220 = 0x201C, 8221 = 0x201D)
+    result = result.replace("&#8216;", "'").replace("&#8217;", "'");
+    result = result.replace("&#8220;", "\"").replace("&#8221;", "\"");
+    
+    // XML hexadecimal entities
+    result = result.replace("&#x2018;", "'").replace("&#x2019;", "'");
+    result = result.replace("&#x201C;", "\"").replace("&#x201D;", "\"");
+
     // First, merge Jinja2 tags that are split across multiple runs
     result = merge_split_tags(&result);
 
@@ -435,9 +455,48 @@ pub fn preprocess_xml_content(xml: &str) -> String {
     result = t_re
         .replace_all(&result, |caps: &regex::Captures| {
             let prefix = &caps[1];
-            let content = unescape_xml(&caps[2]);
+            let content = &caps[2];
             let suffix = &caps[3];
-            format!("{}{}{}", prefix, escape_xml(&content), suffix)
+            
+            // Special handling for Jinja2 tags: don't escape quotes inside them
+            // Pattern to match Jinja2 tags
+            // \{\{[^{}]*\}\} matches {{ ... }}
+            // \{%[^{}%]*%\} matches {% ... %}
+            let jinja_re = Regex::new(r"\{\{[^{}]*\}\}|\{%[^{}%]*%\}").unwrap();
+            let mut new_content = String::new();
+            let mut last_end = 0;
+            
+            for mat in jinja_re.find_iter(content) {
+                // Process content before Jinja2 tag
+                let before = &content[last_end..mat.start()];
+                new_content.push_str(&escape_xml(&unescape_xml(before)));
+                
+                // Process Jinja2 tag itself - unescape but don't re-escape quotes
+                let tag = &content[mat.start()..mat.end()];
+                let unescaped_tag = unescape_xml(tag);
+                // Don't escape single quotes in Jinja2 tags
+                let processed_tag = unescaped_tag.replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+                    .replace('"', "&quot;");
+                // Note: we don't escape ' here
+                new_content.push_str(&processed_tag);
+                
+                last_end = mat.end();
+            }
+            
+            // Process remaining content after last Jinja2 tag
+            if last_end < content.len() {
+                let after = &content[last_end..];
+                new_content.push_str(&escape_xml(&unescape_xml(after)));
+            }
+            
+            // If no Jinja2 tags found, process normally
+            if last_end == 0 {
+                new_content = escape_xml(&unescape_xml(content));
+            }
+            
+            format!("{}{}{}", prefix, new_content, suffix)
         })
         .to_string();
 
@@ -457,5 +516,46 @@ pub fn postprocess_xml_content(xml: &str) -> String {
     let empty_run_with_rpr_re = Regex::new(r"<w:r>\s*<w:rPr>.*?</w:rPr>\s*</w:r>").unwrap();
     result = empty_run_with_rpr_re.replace_all(&result, "").to_string();
 
+    // Remove empty table rows (rows with no visible text content)
+    // These are typically leftover from {%tr for %} and {%tr endfor %} tags
+    // A row is empty if it has no text content or only whitespace
+    result = remove_empty_table_rows(&result);
+
+    result
+}
+
+/// Remove table rows that have no visible text content
+fn remove_empty_table_rows(xml: &str) -> String {
+    let mut result = xml.to_string();
+    let tr_start_re = Regex::new(r"<w:tr\b[^>]*>").unwrap();
+    let tr_end = "</w:tr>";
+    
+    // Find all table rows and check if they're empty
+    let mut rows_to_remove: Vec<(usize, usize)> = Vec::new();
+    
+    for mat in tr_start_re.find_iter(&result) {
+        let start = mat.start();
+        if let Some(end) = result[start..].find(tr_end) {
+            let end = start + end + tr_end.len();
+            let row_content = &result[start..end];
+            
+            // Check if row has any non-empty text
+            // Extract all <w:t> contents
+            let t_re = Regex::new(r"<w:t[^>]*>([^<]*)</w:t>").unwrap();
+            let has_content = t_re.captures_iter(row_content).any(|caps| {
+                caps.get(1).map(|m| m.as_str().trim()).unwrap_or("").len() > 0
+            });
+            
+            if !has_content {
+                rows_to_remove.push((start, end));
+            }
+        }
+    }
+    
+    // Remove rows in reverse order to maintain indices
+    for (start, end) in rows_to_remove.into_iter().rev() {
+        result.replace_range(start..end, "");
+    }
+    
     result
 }

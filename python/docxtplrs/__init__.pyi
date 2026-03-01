@@ -125,6 +125,67 @@ class DocxTemplate:
         """Reset all replacements (for multiple renderings)."""
         ...
 
+    def set_updatefields_true(self) -> None:
+        """
+        Set updateFields to true in settings.xml.
+
+        This enables automatic update of fields (like table of contents, page numbers)
+        when the document is opened in Word.
+        """
+        ...
+
+    def get_docx_properties(self) -> Dict[str, str]:
+        """
+        Get document core properties (metadata).
+
+        Returns:
+            Dictionary with properties like:
+            - author/creator
+            - title
+            - subject
+            - keywords
+            - description
+            - last_modified_by
+            - revision
+        """
+        ...
+
+    def set_docx_properties(self, properties: Dict[str, str]) -> None:
+        """
+        Set document core properties (metadata).
+
+        Args:
+            properties: Dictionary with properties to set:
+                - author/creator
+                - title
+                - subject
+                - keywords
+                - description
+                - last_modified_by
+                - revision
+        """
+        ...
+
+    def set_paragraph_properties(
+        self,
+        paragraph_index: int,
+        style_id: Optional[str] = None,
+        alignment: Optional[str] = None,
+        space_before: Optional[int] = None,
+        space_after: Optional[int] = None,
+    ) -> None:
+        """
+        Modify paragraph properties in the document.
+
+        Args:
+            paragraph_index: Index of the paragraph to modify (0-based)
+            style_id: Optional style ID to apply (e.g., "Heading1", "Normal")
+            alignment: Optional alignment ("left", "center", "right", "justify")
+            space_before: Optional space before paragraph (in twips)
+            space_after: Optional space after paragraph (in twips)
+        """
+        ...
+
     def get_xml(self) -> str:
         """Get a preview of the document XML (for debugging)."""
         ...
@@ -250,8 +311,8 @@ class InlineImage:
         self,
         template: DocxTemplate,
         image_descriptor: str,
-        width: Optional[Union[Mm, Inches, Pt, float]] = None,
-        height: Optional[Union[Mm, Inches, Pt, float]] = None,
+        width: Optional[Union[Mm, Cm, Inches, Pt, float]] = None,
+        height: Optional[Union[Mm, Cm, Inches, Pt, float]] = None,
     ) -> None:
         """
         Create a new InlineImage object.
@@ -359,6 +420,19 @@ class Mm:
 
     def __init__(self, value: float) -> None:
         """Create a millimeters measurement."""
+        ...
+
+    def __float__(self) -> float:
+        ...
+
+    def __repr__(self) -> str:
+        ...
+
+class Cm:
+    """Centimeters measurement."""
+
+    def __init__(self, value: float) -> None:
+        """Create a centimeters measurement."""
         ...
 
     def __float__(self) -> float:

@@ -53,3 +53,8 @@ ignore = ["D100", "D104"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+[dependency-groups]
+dev = [
+    "minijinja>=2.16.0",
+]

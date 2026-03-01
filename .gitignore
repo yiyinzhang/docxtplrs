@@ -1,1 +1,24 @@
 /target
+__pycache__/
+*.pyc
+*.so
+*.egg-info/
+.pytest_cache/
+.venv/
+
+# Examples directory - generated files
+examples/*.docx
+examples/~$*.docx
+examples/*.json
+examples/*.py
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

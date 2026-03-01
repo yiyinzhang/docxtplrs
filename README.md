@@ -1,15 +1,22 @@
 # docxtplrs
 
-A Rust implementation of [python-docx-template](https://github.com/elapouya/python-docx-template) with Python bindings.
-
 [![PyPI version](https://badge.fury.io/py/docxtplrs.svg)](https://badge.fury.io/py/docxtplrs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Built with Vibe Coding](https://img.shields.io/badge/Built%20with-Vibe%20Coding-purple.svg)](https://twitter.com/karpathy/status/1886191732477106580)
+[![Status](https://img.shields.io/badge/Status-Work%20in%20Progress-orange.svg)]()
+
+> 🎧 **A Vibe Coding Project** — This entire library was built through AI-assisted programming. No traditional coding sessions, just pure vibes with Claude and Cursor. If you find any "vibey" code patterns, now you know why!
+
+> ⚠️ **Under Active Development** — This project is still in early development. APIs may change, features may break, and documentation is evolving. Use at your own risk, and feel free to open issues for bugs or feature requests!
+
+A Rust implementation of [python-docx-template](https://github.com/elapouya/python-docx-template) with Python bindings.
 
 ## Features
 
 - 🦀 **High Performance**: Written in Rust for maximum speed
 - 🐍 **Python Compatible**: Drop-in replacement for python-docx-template
 - 📝 **Jinja2 Templates**: Use familiar Jinja2 syntax in Word documents
+- 🔧 **Custom Filters**: Define your own Jinja2 filters for data transformation
 - 🎨 **Rich Text**: Styled text with fonts, colors, and formatting
 - 🖼️ **Images**: Inline image support with customizable dimensions
 - 📄 **Sub-documents**: Embed other documents or build content programmatically
@@ -122,7 +129,7 @@ Use `{{r styled_text }}` in your template (note the `r` after `{{`).
 ### Inline Images
 
 ```python
-from docxtplrs import DocxTemplate, InlineImage, Mm
+from docxtplrs import DocxTemplate, InlineImage, Mm, Cm
 
 doc = DocxTemplate("template.docx")
 
@@ -130,7 +137,7 @@ doc = DocxTemplate("template.docx")
 image = InlineImage(
     doc,
     "logo.png",
-    width=Mm(50),
+    width=Mm(50),  # or Cm(5), Inches(2), Pt(144)
     height=Mm(30)
 )
 
@@ -139,6 +146,12 @@ doc.render(context)
 ```
 
 Use `{{ logo }}` in your template.
+
+**Measurement Units:**
+- `Mm(mm)` - Millimeters
+- `Cm(cm)` - Centimeters
+- `Inches(inches)` - Inches
+- `Pt(points)` - Points
 
 ### Hyperlinks
 
@@ -242,20 +255,101 @@ doc.replace_pic("dummy_logo.png", "real_logo.png")
 doc.save("output.docx")
 ```
 
-### Custom Filters
+### Automatic Field Update
+
+Enable automatic update of fields (table of contents, page numbers, etc.) when the document is opened:
 
 ```python
-from docxtplrs import DocxTemplate
+doc = DocxTemplate("template.docx")
+doc.render(context)
+
+# Enable automatic field update
+doc.set_updatefields_true()
+doc.save("output.docx")
+```
+
+### Document Properties (Metadata)
+
+Get and set document core properties:
+
+```python
+doc = DocxTemplate("template.docx")
+
+# Get current properties
+props = doc.get_docx_properties()
+print(props)  # {'author': '...', 'title': '...', 'subject': '...', ...}
+
+# Set properties
+doc.set_docx_properties({
+    "author": "John Doe",
+    "title": "My Document",
+    "subject": "Quarterly Report",
+    "keywords": "report, quarterly, finance",
+    "description": "This is a quarterly report",
+})
+
+doc.render(context)
+doc.save("output.docx")
+```
+
+### Paragraph Properties
+
+Modify paragraph styles programmatically:
+
+```python
+doc = DocxTemplate("template.docx")
+doc.render(context)
+
+# Modify paragraph at index 0 (first paragraph)
+doc.set_paragraph_properties(
+    paragraph_index=0,
+    style_id="Heading1",      # Apply heading style
+    alignment="center",        # Center alignment
+    space_before=240,         # Space before (in twips, 1/20 of a point)
+    space_after=120,          # Space after (in twips)
+)
+
+doc.save("output.docx")
+```
+
+### Custom Filters
+
+You can define custom Jinja2 filters to transform values in your templates:
+
+```python
+from docxtplrs import DocxTemplate, JinjaEnv
 
 def format_currency(value):
+    """Format a number as currency."""
     return f"${value:,.2f}"
 
-doc = DocxTemplate("template.docx")
-context = {"price": 1234.5}
+def uppercase(value):
+    """Convert value to uppercase."""
+    return str(value).upper()
 
-# Custom filters can be passed via jinja_env (advanced usage)
-doc.render(context)
+# Create Jinja environment and add filters
+env = JinjaEnv()
+env.add_filter("currency", format_currency)
+env.add_filter("upper", uppercase)
+
+# Use in template: {{ price|currency }} or {{ name|upper }}
+doc = DocxTemplate("template.docx")
+context = {"price": 1234.5, "name": "john doe"}
+doc.render(context, jinja_env=env)
+doc.save("output.docx")
 ```
+
+#### JinjaEnv API
+
+- `add_filter(name, func)` - Add a custom filter
+- `remove_filter(name)` - Remove a filter
+- `get_filter_names()` - Get list of all filter names
+- `has_filter(name)` - Check if a filter exists
+- `clear_filters()` - Remove all filters
+
+#### Built-in Filters
+
+- `e` / `escape` - Escape XML special characters
 
 ## Comparison with python-docx-template
 
@@ -264,10 +358,14 @@ doc.render(context)
 | Language | Python | Rust + Python bindings |
 | Performance | Good | Excellent |
 | Jinja2 Support | Full | Most features |
+| Custom Filters | ✅ | ✅ |
 | RichText | ✅ | ✅ |
 | Inline Images | ✅ | ✅ |
 | Sub-documents | ✅ | ✅ |
 | Hyperlinks | ✅ | ✅ |
+| Document Properties | ✅ | ✅ |
+| Paragraph Styling | ✅ | ✅ |
+| Field Auto-Update | Manual | ✅ Built-in |
 | Type Hints | Partial | Full |
 
 ## Performance
@@ -302,6 +400,18 @@ pytest tests/
 ```bash
 maturin build --release
 ```
+
+## Vibe Coding
+
+This project was built entirely through **Vibe Coding** — a collaborative approach where AI and humans work together in a continuous flow of ideas and implementation. No rigid specifications, just good vibes and iterative refinement.
+
+If you're curious about the process:
+- All major features were implemented through conversational AI interactions
+- Code reviews were done by AI assistants
+- Documentation written collaboratively
+- Bugs fixed through vibe-based debugging sessions
+
+Want to contribute? Just bring good vibes! 🎧✨
 
 ## License
 

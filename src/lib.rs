@@ -15,6 +15,7 @@
 //! ```
 
 mod image;
+mod jinja_env;
 mod richtext;
 mod subdoc;
 mod template;
@@ -24,7 +25,8 @@ mod xml_utils;
 use pyo3::prelude::*;
 
 // Re-export Python classes
-pub use crate::image::{ImageFormat, Inches, InlineImage, Mm, Pt};
+pub use crate::image::{Cm, ImageFormat, Inches, InlineImage, Mm, Pt};
+pub use crate::jinja_env::JinjaEnv;
 pub use crate::richtext::{r_shortcut, rp_shortcut, Listing, RichText, RichTextParagraph};
 pub use crate::subdoc::{
     CellColor, ColSpan, DocumentBuilder, Subdoc, VerticalMerge,
@@ -75,6 +77,7 @@ fn version() -> String {
 ///
 /// Measurement Classes:
 ///     Mm: Millimeters
+///     Cm: Centimeters
 ///     Inches: Inches
 ///     Pt: Points
 ///
@@ -88,6 +91,9 @@ fn docxtplrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Core template class
     m.add_class::<DocxTemplate>()?;
 
+    // Jinja environment class
+    m.add_class::<JinjaEnv>()?;
+
     // Rich text classes
     m.add_class::<RichText>()?;
     m.add_class::<RichTextParagraph>()?;
@@ -96,6 +102,7 @@ fn docxtplrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Image classes
     m.add_class::<InlineImage>()?;
     m.add_class::<Mm>()?;
+    m.add_class::<Cm>()?;
     m.add_class::<Inches>()?;
     m.add_class::<Pt>()?;
 

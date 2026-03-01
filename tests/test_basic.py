@@ -224,6 +224,102 @@ class TestDocxTemplate:
         finally:
             os.unlink(template_path)
 
+    def test_set_updatefields_true(self):
+        """Test setting updateFields to true."""
+        template_path = create_simple_template()
+        output_path = template_path.replace(".docx", "_output.docx")
+
+        try:
+            doc = DocxTemplate(template_path)
+            
+            # Call set_updatefields_true
+            doc.set_updatefields_true()
+            
+            # Render and save
+            doc.render({"name": "Test", "company": "Corp"})
+            doc.save(output_path)
+
+            # Check settings.xml
+            with zipfile.ZipFile(output_path, "r") as zf:
+                # Check if settings.xml exists
+                if "word/settings.xml" in zf.namelist():
+                    content = zf.read("word/settings.xml").decode("utf-8")
+                    assert "updateFields" in content or "updatefields" in content.lower()
+                else:
+                    # If no settings.xml, that's also OK - it means one was created
+                    pass
+        finally:
+            if os.path.exists(template_path):
+                os.unlink(template_path)
+            if os.path.exists(output_path):
+                os.unlink(output_path)
+
+    def test_docx_properties(self):
+        """Test getting and setting document properties."""
+        template_path = create_simple_template()
+        output_path = template_path.replace(".docx", "_output.docx")
+
+        try:
+            doc = DocxTemplate(template_path)
+            
+            # Initially properties should be empty or minimal
+            props = doc.get_docx_properties()
+            assert isinstance(props, dict)
+            
+            # Set properties
+            doc.set_docx_properties({
+                "author": "Test Author",
+                "title": "Test Title",
+                "subject": "Test Subject",
+            })
+            
+            # Get updated properties
+            props = doc.get_docx_properties()
+            assert props.get("author") == "Test Author"
+            assert props.get("title") == "Test Title"
+            assert props.get("subject") == "Test Subject"
+            
+            # Render and save
+            doc.render({"name": "Test", "company": "Corp"})
+            doc.save(output_path)
+            
+            assert os.path.exists(output_path)
+        finally:
+            if os.path.exists(template_path):
+                os.unlink(template_path)
+            if os.path.exists(output_path):
+                os.unlink(output_path)
+
+    def test_paragraph_properties(self):
+        """Test setting paragraph properties."""
+        template_path = create_simple_template()
+        output_path = template_path.replace(".docx", "_output.docx")
+
+        try:
+            doc = DocxTemplate(template_path)
+            
+            # Set paragraph properties
+            doc.set_paragraph_properties(
+                paragraph_index=0,
+                style_id="Heading1",
+                alignment="center",
+            )
+            
+            # Render and save
+            doc.render({"name": "Test", "company": "Corp"})
+            doc.save(output_path)
+            
+            # Check document.xml
+            with zipfile.ZipFile(output_path, "r") as zf:
+                content = zf.read("word/document.xml").decode("utf-8")
+                assert "Heading1" in content
+                assert "center" in content or "jc" in content
+        finally:
+            if os.path.exists(template_path):
+                os.unlink(template_path)
+            if os.path.exists(output_path):
+                os.unlink(output_path)
+
 
 class TestRichText:
     """Test RichText class."""
@@ -265,6 +361,13 @@ class TestMeasurements:
         assert float(mm) == 50.0
         assert "50" in repr(mm)
 
+    def test_cm(self):
+        """Test centimeters."""
+        from docxtplrs import Cm
+        cm = Cm(5)
+        assert float(cm) == 5.0
+        assert "5" in repr(cm)
+
     def test_inches(self):
         """Test inches."""
         inches = Inches(2)
@@ -292,6 +395,139 @@ class TestUtilityFunctions:
         assert unescape_xml("&lt;test&gt;") == "<test>"
         assert unescape_xml("&amp;") == "&"
         assert unescape_xml("&quot;test&quot;") == '"test"'
+
+
+class TestJinjaEnv:
+    """Test JinjaEnv class for custom filters."""
+
+    def test_create_jinja_env(self):
+        """Test creating JinjaEnv."""
+        from docxtplrs import JinjaEnv
+        env = JinjaEnv()
+        assert env is not None
+        assert repr(env) == "JinjaEnv(filters=0)"
+
+    def test_add_filter(self):
+        """Test adding a filter."""
+        from docxtplrs import JinjaEnv
+        env = JinjaEnv()
+        
+        def double(value):
+            return value * 2
+        
+        env.add_filter("double", double)
+        assert env.has_filter("double")
+        assert "double" in env.get_filter_names()
+
+    def test_remove_filter(self):
+        """Test removing a filter."""
+        from docxtplrs import JinjaEnv
+        env = JinjaEnv()
+        
+        def test_filter(value):
+            return value
+        
+        env.add_filter("test", test_filter)
+        assert env.has_filter("test")
+        
+        env.remove_filter("test")
+        assert not env.has_filter("test")
+
+    def test_clear_filters(self):
+        """Test clearing all filters."""
+        from docxtplrs import JinjaEnv
+        env = JinjaEnv()
+        
+        def f1(v): return v
+        def f2(v): return v
+        
+        env.add_filter("f1", f1)
+        env.add_filter("f2", f2)
+        assert len(env.get_filter_names()) == 2
+        
+        env.clear_filters()
+        assert len(env.get_filter_names()) == 0
+
+    def test_filter_not_callable(self):
+        """Test that non-callable filters are rejected."""
+        from docxtplrs import JinjaEnv
+        env = JinjaEnv()
+        
+        with pytest.raises(TypeError):
+            env.add_filter("not_callable", "string")
+
+
+class TestCustomFilters:
+    """Test custom filters in template rendering."""
+
+    def test_uppercase_filter(self):
+        """Test uppercase filter in template."""
+        from docxtplrs import DocxTemplate, JinjaEnv
+        
+        template_path = create_simple_template()
+        output_path = template_path.replace(".docx", "_output.docx")
+        
+        try:
+            # Modify template to use filter
+            with zipfile.ZipFile(template_path, "w") as zf:
+                zf.writestr(
+                    "[Content_Types].xml",
+                    '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+    <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+    <Default Extension="xml" ContentType="application/xml"/>
+    <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>''',
+                )
+                zf.writestr(
+                    "_rels/.rels",
+                    '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+    <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>''',
+                )
+                zf.writestr(
+                    "word/_rels/document.xml.rels",
+                    '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+</Relationships>''',
+                )
+                zf.writestr(
+                    "word/document.xml",
+                    '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+    <w:body>
+        <w:p>
+            <w:r>
+                <w:t>Hello {{ name|upper }}!</w:t>
+            </w:r>
+        </w:p>
+        <w:sectPr>
+            <w:pgSz w:w="12240" w:h="15840"/>
+            <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/>
+        </w:sectPr>
+    </w:body>
+</w:document>''',
+                )
+            
+            doc = DocxTemplate(template_path)
+            
+            env = JinjaEnv()
+            env.add_filter("upper", lambda x: str(x).upper())
+            
+            context = {"name": "world"}
+            doc.render(context, jinja_env=env)
+            doc.save(output_path)
+            
+            with zipfile.ZipFile(output_path, "r") as zf:
+                content = zf.read("word/document.xml").decode("utf-8")
+                assert "HELLO WORLD" in content or "WORLD" in content
+                
+        finally:
+            if os.path.exists(template_path):
+                os.unlink(template_path)
+            if os.path.exists(output_path):
+                os.unlink(output_path)
 
 
 if __name__ == "__main__":

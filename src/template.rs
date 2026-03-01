@@ -1,20 +1,22 @@
 //! Core DocxTemplate implementation
 
 use crate::image::InlineImage;
+use crate::jinja_env::JinjaEnv;
 use crate::richtext::{Listing, RichText};
-use crate::subdoc::{ColSpan, Subdoc, VerticalMerge, CellColor};
+use crate::subdoc::{CellColor, ColSpan, Subdoc, VerticalMerge};
 use crate::types::{DocxTplError, Result};
 use crate::xml_utils::{
     escape_xml, extract_template_variables, postprocess_xml_content, preprocess_xml_content,
 };
 use minijinja::Value;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyTuple};
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
 /// DocxTemplate for rendering Word documents with Jinja2 templates
@@ -27,6 +29,7 @@ use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 pub struct DocxTemplate {
     template_path: PathBuf,
     xml_parts: HashMap<String, String>, // path -> content
+    binary_parts: HashMap<String, Vec<u8>>, // path -> binary data (images, etc.)
     content_types: HashMap<String, String>, // extension -> content type
     relationships: HashMap<String, Vec<(String, String, String)>>, // part -> [(id, type, target)]
     next_rel_id: u32,
@@ -59,6 +62,7 @@ impl DocxTemplate {
         let mut tpl = Self {
             template_path: path.to_path_buf(),
             xml_parts: HashMap::new(),
+            binary_parts: HashMap::new(),
             content_types: HashMap::new(),
             relationships: HashMap::new(),
             next_rel_id: 1,
@@ -78,21 +82,36 @@ impl DocxTemplate {
     ///
     /// Args:
     ///     context: Dictionary of variables for Jinja2 templating
-    ///     jinja_env: Optional custom Jinja2 environment with filters
+    ///     jinja_env: Optional custom Jinja2 environment with custom filters
     ///     autoescape: Whether to autoescape special characters (default: False)
+    ///
+    /// Example:
+    ///     from docxtplrs import DocxTemplate, JinjaEnv
+    ///
+    ///     def format_currency(value):
+    ///         return f"${value:,.2f}"
+    ///
+    ///     env = JinjaEnv()
+    ///     env.add_filter("currency", format_currency)
+    ///
+    ///     doc = DocxTemplate("template.docx")
+    ///     doc.render(context, jinja_env=env)
     #[pyo3(signature = (context, jinja_env=None, autoescape=false))]
     fn render(
         &mut self,
         context: &Bound<'_, PyDict>,
-        jinja_env: Option<PyObject>,
+        jinja_env: Option<PyRef<'_, JinjaEnv>>,
         autoescape: bool,
     ) -> PyResult<()> {
         // Convert Python context to HashMap
         let context_map = self.py_dict_to_context(context)?;
 
-        // TODO: Support Python custom filters from jinja_env
-        // For now, we ignore jinja_env parameter
-        let _py_filters: HashMap<String, PyObject> = HashMap::new();
+        // Convert JinjaEnv filters to an Arc so we can share them with the closure
+        let filters: Arc<HashMap<String, Arc<PyObject>>> = if let Some(je) = jinja_env {
+            je.get_filters_arc()
+        } else {
+            Arc::new(HashMap::new())
+        };
 
         // Process each XML part
         let part_keys: Vec<String> = self.xml_parts.keys().cloned().collect();
@@ -101,14 +120,23 @@ impl DocxTemplate {
             if !part_path.starts_with("word/") {
                 continue;
             }
+            
+            // Skip non-XML files
+            if !part_path.ends_with(".xml") && !part_path.ends_with(".rels") {
+                continue;
+            }
 
             let content = self.xml_parts.get(&part_path).unwrap().clone();
 
             // Preprocess XML
             let preprocessed = preprocess_xml_content(&content);
 
+            // Process special tags ({%p %}, {%tr %}, etc.) before rendering
+            let preprocessed = self.process_special_tags(&preprocessed)?;
+
             // Render with Jinja2
-            let rendered = self.render_template(&preprocessed, &context_map, autoescape, HashMap::new())?;
+            let rendered =
+                self.render_template(&preprocessed, &context_map, autoescape, filters.clone())?;
 
             // Postprocess
             let postprocessed = postprocess_xml_content(&rendered);
@@ -159,7 +187,10 @@ impl DocxTemplate {
 
         // Collect variables from all document parts
         for (path, content) in &self.xml_parts {
-            if path.starts_with("word/document") || path.starts_with("word/header") || path.starts_with("word/footer") {
+            if path.starts_with("word/document")
+                || path.starts_with("word/header")
+                || path.starts_with("word/footer")
+            {
                 let vars = extract_template_variables(content);
                 all_vars.extend(vars);
             }
@@ -208,12 +239,14 @@ impl DocxTemplate {
         self.next_rel_id += 1;
 
         // Add to relationships
-        let part_rels = self.relationships
+        let part_rels = self
+            .relationships
             .entry("word/_rels/document.xml.rels".to_string())
             .or_insert_with(Vec::new);
         part_rels.push((
             rel_id.clone(),
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink".to_string(),
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"
+                .to_string(),
             url,
         ));
 
@@ -259,7 +292,10 @@ impl DocxTemplate {
         // Read the new file
         let data = fs::read(&new_file)?;
         // Store in a special key for later processing
-        self.xml_parts.insert(format!("__REPLACE__{}", zip_name), String::from_utf8_lossy(&data).to_string());
+        self.xml_parts.insert(
+            format!("__REPLACE__{}", zip_name),
+            String::from_utf8_lossy(&data).to_string(),
+        );
         Ok(())
     }
 
@@ -267,6 +303,315 @@ impl DocxTemplate {
     fn reset_replacements(&mut self) {
         self.media_replacements.clear();
         self.embedded_replacements.clear();
+    }
+
+    /// Set updateFields to true in settings.xml
+    ///
+    /// This enables automatic update of fields (like table of contents, page numbers)
+    /// when the document is opened.
+    fn set_updatefields_true(&mut self) -> PyResult<()> {
+        let settings_path = "word/settings.xml";
+        
+        if let Some(settings_content) = self.xml_parts.get_mut(settings_path) {
+            // Check if updateFields already exists
+            if !settings_content.contains("updateFields") {
+                // Add updateFields element before closing </w:settings> tag
+                let update_field_elem = r#"<w:updateFields w:val="true"/>"#;
+                
+                // Find the last </w:settings> tag and insert before it with proper formatting
+                if let Some(pos) = settings_content.rfind("</w:settings>") {
+                    settings_content.insert_str(pos, &format!("\n    {}\n", update_field_elem));
+                } else {
+                    // Try without namespace prefix
+                    if let Some(pos) = settings_content.rfind("</settings>") {
+                        settings_content.insert_str(pos, &format!("\n    {}\n", update_field_elem));
+                    } else {
+                        return Err(DocxTplError::Other(
+                            "Could not find </w:settings> tag in settings.xml".to_string()
+                        ).into());
+                    }
+                }
+            }
+            Ok(())
+        } else {
+            // Settings.xml doesn't exist, create it
+            let settings_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+    <w:updateFields w:val="true"/>
+</w:settings>"#;
+            self.xml_parts.insert(settings_path.to_string(), settings_xml.to_string());
+            
+            // Add content type for settings.xml
+            self.content_types.insert(
+                "/word/settings.xml".to_string(),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml".to_string()
+            );
+            
+            // Add relationship for settings.xml
+            let doc_rels = self.relationships
+                .entry("word/_rels/document.xml.rels".to_string())
+                .or_insert_with(Vec::new);
+            
+            // Check if settings relationship already exists
+            let has_settings_rel = doc_rels.iter().any(|(_, rel_type, _)| {
+                rel_type.contains("officeDocument/2006/relationships/settings")
+            });
+            
+            if !has_settings_rel {
+                let rel_id = format!("rId{}", self.next_rel_id);
+                self.next_rel_id += 1;
+                doc_rels.push((
+                    rel_id,
+                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings".to_string(),
+                    "settings.xml".to_string(),
+                ));
+            }
+            
+            Ok(())
+        }
+    }
+
+    /// Get document core properties (metadata)
+    ///
+    /// Returns a dictionary with properties like:
+    /// - author/creator
+    /// - title
+    /// - subject
+    /// - keywords
+    /// - description
+    /// - last_modified_by
+    /// - revision
+    fn get_docx_properties(&self) -> PyResult<HashMap<String, String>> {
+        let mut props = HashMap::new();
+        
+        if let Some(core_content) = self.xml_parts.get("docProps/core.xml") {
+            // Extract creator/author
+            let re = Regex::new(r"<dc:creator>([^<]+)</dc:creator>").unwrap();
+            if let Some(cap) = re.captures(core_content) {
+                props.insert("author".to_string(), cap[1].to_string());
+                props.insert("creator".to_string(), cap[1].to_string());
+            }
+            
+            // Extract title
+            let re = Regex::new(r"<dc:title>([^<]+)</dc:title>").unwrap();
+            if let Some(cap) = re.captures(core_content) {
+                props.insert("title".to_string(), cap[1].to_string());
+            }
+            
+            // Extract subject
+            let re = Regex::new(r"<dc:subject>([^<]+)</dc:subject>").unwrap();
+            if let Some(cap) = re.captures(core_content) {
+                props.insert("subject".to_string(), cap[1].to_string());
+            }
+            
+            // Extract description
+            let re = Regex::new(r"<dc:description>([^<]+)</dc:description>").unwrap();
+            if let Some(cap) = re.captures(core_content) {
+                props.insert("description".to_string(), cap[1].to_string());
+            }
+            
+            // Extract keywords
+            let re = Regex::new(r"<cp:keywords>([^<]+)</cp:keywords>").unwrap();
+            if let Some(cap) = re.captures(core_content) {
+                props.insert("keywords".to_string(), cap[1].to_string());
+            }
+            
+            // Extract last modified by
+            let re = Regex::new(r"<cp:lastModifiedBy>([^<]+)</cp:lastModifiedBy>").unwrap();
+            if let Some(cap) = re.captures(core_content) {
+                props.insert("last_modified_by".to_string(), cap[1].to_string());
+            }
+            
+            // Extract revision
+            let re = Regex::new(r"<cp:revision>([^<]+)</cp:revision>").unwrap();
+            if let Some(cap) = re.captures(core_content) {
+                props.insert("revision".to_string(), cap[1].to_string());
+            }
+        }
+        
+        Ok(props)
+    }
+
+    /// Set document core properties (metadata)
+    ///
+    /// Args:
+    ///     properties: Dictionary with properties to set:
+    ///         - author/creator
+    ///         - title
+    ///         - subject
+    ///         - keywords
+    ///         - description
+    ///         - last_modified_by
+    ///         - revision
+    #[pyo3(signature = (properties))]
+    fn set_docx_properties(&mut self, properties: &Bound<'_, PyDict>) -> PyResult<()> {
+        let core_path = "docProps/core.xml";
+        
+        // Get existing content or create new
+        let mut core_content = if let Some(content) = self.xml_parts.get(core_path) {
+            content.clone()
+        } else {
+            // Create new core.xml
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+</cp:coreProperties>"#.to_string()
+        };
+        
+        // Helper function to update or insert element
+        let mut update_element = |tag: &str, ns: &str, value: &str| {
+            let pattern = format!(r"<{}:{}>[^<]*</{}:{}>", ns, tag, ns, tag);
+            let replacement = format!("<{}:{}>{}</{}:{}>", ns, tag, value, ns, tag);
+            let re = Regex::new(&pattern).unwrap();
+            
+            if re.is_match(&core_content) {
+                // Update existing
+                core_content = re.replace(&core_content, &replacement).to_string();
+            } else {
+                // Insert before closing tag
+                let close_tag = "</cp:coreProperties>";
+                if let Some(pos) = core_content.rfind(close_tag) {
+                    core_content.insert_str(pos, &format!("<{}:{}>{}</{}:{}>", ns, tag, value, ns, tag));
+                }
+            }
+        };
+        
+        Python::with_gil(|py| {
+            for (key, value) in properties {
+                let key_str: String = key.extract()?;
+                let value_str: String = value.extract()?;
+                
+                match key_str.as_str() {
+                    "author" | "creator" => update_element("creator", "dc", &value_str),
+                    "title" => update_element("title", "dc", &value_str),
+                    "subject" => update_element("subject", "dc", &value_str),
+                    "description" => update_element("description", "dc", &value_str),
+                    "keywords" => update_element("keywords", "cp", &value_str),
+                    "last_modified_by" => update_element("lastModifiedBy", "cp", &value_str),
+                    "revision" => update_element("revision", "cp", &value_str),
+                    _ => {}
+                }
+            }
+            Ok::<(), PyErr>(())
+        })?;
+        
+        self.xml_parts.insert(core_path.to_string(), core_content);
+        
+        // Ensure content type is set
+        self.content_types.insert(
+            "/docProps/core.xml".to_string(),
+            "application/vnd.openxmlformats-package.core-properties+xml".to_string()
+        );
+        
+        Ok(())
+    }
+
+    /// Modify paragraph properties in the document
+    ///
+    /// Args:
+    ///     paragraph_index: Index of the paragraph to modify (0-based)
+    ///     style_id: Optional style ID to apply (e.g., "Heading1", "Normal")
+    ///     alignment: Optional alignment ("left", "center", "right", "justify")
+    ///     space_before: Optional space before paragraph (in twips)
+    ///     space_after: Optional space after paragraph (in twips)
+    #[pyo3(signature = (paragraph_index, style_id=None, alignment=None, space_before=None, space_after=None))]
+    fn set_paragraph_properties(
+        &mut self,
+        paragraph_index: usize,
+        style_id: Option<String>,
+        alignment: Option<String>,
+        space_before: Option<i32>,
+        space_after: Option<i32>,
+    ) -> PyResult<()> {
+        let doc_path = "word/document.xml";
+        
+        // First, collect the information we need
+        let modification = if let Some(doc_content) = self.xml_parts.get(doc_path) {
+            // Find all paragraphs
+            let re = Regex::new(r"<w:p[>\s][^>]*>").unwrap();
+            let paragraphs: Vec<_> = re.find_iter(doc_content).collect();
+            
+            if paragraph_index >= paragraphs.len() {
+                return Err(DocxTplError::InvalidArgument(
+                    format!("Paragraph index {} out of range (max: {})", paragraph_index, paragraphs.len().saturating_sub(1))
+                ).into());
+            }
+            
+            let p_start = paragraphs[paragraph_index].start();
+            let p_match_len = paragraphs[paragraph_index].as_str().len();
+            
+            // Find the paragraph content
+            if let Some(p_close) = find_tag_end(doc_content, p_start) {
+                let paragraph = &doc_content[p_start..p_close];
+                
+                // Check if pPr exists
+                let has_ppr = paragraph.contains("<w:pPr>");
+                
+                let mut props_to_add = Vec::new();
+                
+                // Build pPr content
+                if let Some(style) = style_id {
+                    props_to_add.push(format!(r#"<w:pStyle w:val="{}"/>"#, style));
+                }
+                
+                if let Some(align) = alignment {
+                    let align_val = match align.as_str() {
+                        "left" => "left",
+                        "center" => "center",
+                        "right" => "right",
+                        "justify" => "both",
+                        "both" => "both",
+                        _ => &align,
+                    };
+                    props_to_add.push(format!(r#"<w:jc w:val="{}"/>"#, align_val));
+                }
+                
+                if space_before.is_some() || space_after.is_some() {
+                    let mut spacing = String::from("<w:spacing");
+                    if let Some(before) = space_before {
+                        spacing.push_str(&format!(r#" w:before="{}""#, before));
+                    }
+                    if let Some(after) = space_after {
+                        spacing.push_str(&format!(r#" w:after="{}""#, after));
+                    }
+                    spacing.push_str("/>");
+                    props_to_add.push(spacing);
+                }
+                
+                if !props_to_add.is_empty() {
+                    let ppr_content = format!("<w:pPr>{}</w:pPr>", props_to_add.join(""));
+                    
+                    if has_ppr {
+                        // Replace existing pPr
+                        let ppr_re = Regex::new(r"<w:pPr>.*?</w:pPr>").unwrap();
+                        let new_paragraph = ppr_re.replace(paragraph, &ppr_content);
+                        Some((p_start, p_close, new_paragraph.to_string()))
+                    } else {
+                        // Insert pPr after <w:p>
+                        let insert_pos = p_start + p_match_len;
+                        Some((insert_pos, insert_pos, ppr_content))
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        
+        // Apply the modification
+        if let Some((start, end, new_content)) = modification {
+            if let Some(doc_content) = self.xml_parts.get_mut(doc_path) {
+                if start == end {
+                    doc_content.insert_str(start, &new_content);
+                } else {
+                    doc_content.replace_range(start..end, &new_content);
+                }
+            }
+        }
+        
+        Ok(())
     }
 
     /// Get a preview of the document XML (for debugging)
@@ -311,10 +656,10 @@ impl DocxTemplate {
                 file.read_to_string(&mut content)?;
                 self.xml_parts.insert(name, content);
             } else if name.starts_with("word/media/") || name.starts_with("word/embeddings/") {
-                // Store binary files
+                // Store binary files separately to avoid corruption
                 let mut data = Vec::new();
                 file.read_to_end(&mut data)?;
-                self.xml_parts.insert(name, String::from_utf8_lossy(&data).to_string());
+                self.binary_parts.insert(name, data);
             }
         }
 
@@ -484,7 +829,7 @@ impl DocxTemplate {
         template: &str,
         context: &HashMap<String, Value>,
         _autoescape: bool,
-        py_filters: HashMap<String, PyObject>,
+        filters: Arc<HashMap<String, Arc<PyObject>>>,
     ) -> Result<String> {
         let mut env = minijinja::Environment::new();
 
@@ -496,24 +841,188 @@ impl DocxTemplate {
         env.add_filter("e", |s: String| escape_xml(&s));
         env.add_filter("escape", |s: String| escape_xml(&s));
 
-        // TODO: Add Python custom filters
-        // This requires complex bridging between Python functions and Rust closures
-        // For now, we only support built-in filters
+        // Add custom filters from JinjaEnv
+        // Clone the filters Arc for each filter to avoid lifetime issues
+        let filters_for_closure = Arc::clone(&filters);
+        if !filters_for_closure.is_empty() {
+            for (name, func) in filters_for_closure.iter() {
+                let filter_name = name.clone();
+                let func = Arc::clone(func);
+
+                // Create a wrapper function that calls the Python filter
+                env.add_filter(
+                    filter_name.clone(),
+                    move |value: minijinja::Value| -> minijinja::Value {
+                        Python::with_gil(|py| {
+                            // Convert value to Python
+                            let py_value =
+                                Self::minijinja_to_python(py, &value).unwrap_or_else(|_| py.None());
+
+                            // Call the Python filter function
+                            let result = func.call1(py, (py_value,));
+
+                            // Convert result back to minijinja Value
+                            match result {
+                                Ok(obj) => Self::python_to_minijinja(py, &obj)
+                                    .unwrap_or_else(|_| minijinja::Value::from(())),
+                                Err(e) => {
+                                    // Log error and return original value
+                                    eprintln!("Filter '{}' error: {}", filter_name, e);
+                                    value
+                                }
+                            }
+                        })
+                    },
+                );
+            }
+        }
 
         // Add template
-        env.add_template("doc", template)?;
+        if let Err(e) = env.add_template("doc", template) {
+            eprintln!("DEBUG: Template parsing error: {}", e);
+            eprintln!("DEBUG: Error location - template length: {}", template.len());
+            // Find line 73
+            let lines: Vec<&str> = template.lines().collect();
+            if lines.len() >= 73 {
+                eprintln!("DEBUG: Line 73: {}", lines[72]);
+                // Show surrounding lines
+                for i in 70..std::cmp::min(76, lines.len()) {
+                    eprintln!("DEBUG: Line {}: {}", i+1, lines[i]);
+                }
+            }
+            return Err(e.into());
+        }
 
         // Render
         let tmpl = env.get_template("doc")?;
-        let result = tmpl.render(context)?;
+        let mut result = tmpl.render(context)?;
 
-        // Post-process: handle special tags ({%p %}, {%tr %}, etc.)
-        let result = self.process_special_tags(&result)?;
+        // Unescape XML entities that minijinja might have escaped in loop iterations
+        // This is necessary to preserve XML tag structure
+        result = result.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&").replace("&quot;", "\"").replace("&#39;", "'");
 
         // Handle inline images
         let result = self.process_inline_images(&result)?;
 
         Ok(result)
+    }
+
+    /// Convert minijinja Value to Python object
+    fn minijinja_to_python(py: Python, value: &minijinja::Value) -> PyResult<PyObject> {
+        use minijinja::value::ValueKind;
+
+        match value.kind() {
+            ValueKind::Undefined | ValueKind::None => Ok(py.None()),
+            ValueKind::String => Ok(value
+                .as_str()
+                .map(|s| s.to_string().into_py(py))
+                .unwrap_or_else(|| py.None())),
+            ValueKind::Number => {
+                // Try integer first, then float
+                if let Some(i) = value.as_i64() {
+                    Ok(i.into_py(py))
+                } else {
+                    // Try to get as f64 via string conversion
+                    let s = value.to_string();
+                    if let Ok(f) = s.parse::<f64>() {
+                        Ok(f.into_py(py))
+                    } else {
+                        Ok(s.into_py(py))
+                    }
+                }
+            }
+            ValueKind::Bool => {
+                // Boolean check via string representation for now
+                let s = value.to_string();
+                Ok(s.parse::<bool>().unwrap_or(false).into_py(py))
+            }
+            ValueKind::Seq => {
+                // Convert sequence to list
+                if let Some(obj) = value.as_object() {
+                    if let Some(iter) = obj.try_iter() {
+                        let items: Vec<PyObject> = iter
+                            .filter_map(|item| Self::minijinja_to_python(py, &item).ok())
+                            .collect();
+                        return Ok(items.into_py(py));
+                    }
+                }
+                Ok(py.None())
+            }
+            ValueKind::Map => {
+                // Convert to dict - simplified version
+                // For now, just convert to string representation
+                // This could be enhanced to properly support map iteration
+                let s = value.to_string();
+                Ok(s.into_py(py))
+            }
+            _ => Ok(value.to_string().into_py(py)),
+        }
+    }
+
+    /// Convert Python object to minijinja Value
+    fn python_to_minijinja(py: Python, obj: &PyObject) -> PyResult<minijinja::Value> {
+        let bound = obj.bind(py);
+
+        // Handle None
+        if bound.is_none() {
+            return Ok(minijinja::Value::from(()));
+        }
+
+        // Handle strings
+        if let Ok(s) = bound.extract::<String>() {
+            return Ok(minijinja::Value::from(s));
+        }
+
+        // Handle integers
+        if let Ok(i) = bound.extract::<i64>() {
+            return Ok(minijinja::Value::from(i));
+        }
+
+        // Handle floats
+        if let Ok(f) = bound.extract::<f64>() {
+            return Ok(minijinja::Value::from(f));
+        }
+
+        // Handle booleans (must be before integers since bool is a subtype)
+        if let Ok(b) = bound.extract::<bool>() {
+            return Ok(minijinja::Value::from(b));
+        }
+
+        // Handle lists/tuples
+        if let Ok(list) = bound.downcast::<PyList>() {
+            let mut vec = Vec::new();
+            for item in list {
+                let py_obj: PyObject = item.into_py(py);
+                vec.push(Self::python_to_minijinja(py, &py_obj)?);
+            }
+            return Ok(minijinja::Value::from(vec));
+        }
+
+        // Handle tuples
+        if let Ok(tuple) = bound.downcast::<PyTuple>() {
+            let mut vec = Vec::new();
+            for item in tuple {
+                let py_obj: PyObject = item.into_py(py);
+                vec.push(Self::python_to_minijinja(py, &py_obj)?);
+            }
+            return Ok(minijinja::Value::from(vec));
+        }
+
+        // Handle dicts
+        if let Ok(dict) = bound.downcast::<PyDict>() {
+            let mut map = std::collections::HashMap::new();
+            for (k, v) in dict {
+                let key: String = k.extract()?;
+                let py_obj: PyObject = v.into_py(py);
+                let val = Self::python_to_minijinja(py, &py_obj)?;
+                map.insert(key, val);
+            }
+            return Ok(minijinja::Value::from(map));
+        }
+
+        // Default: convert to string
+        let s = bound.str()?.to_string_lossy().to_string();
+        Ok(minijinja::Value::from(s))
     }
 
     /// Process special Jinja2 tags ({%p %}, {%tr %}, etc.)
@@ -539,15 +1048,11 @@ impl DocxTemplate {
     fn process_paragraph_tags(&self, content: &str) -> Result<String> {
         let mut result = content.to_string();
 
-        // Pattern to match {%p ... %} tags
-        let re = Regex::new(r"<w:p[^>]*>.*?<w:t[^>]*>\s*\{%p\s+(.+?)%\}\s*</w:t>.*?</w:p>")?;
-
-        // Replace with normal {% ... %} and mark paragraph for removal
-        result = re
-            .replace_all(&result, |caps: &regex::Captures| {
-                format!("{{{{ % {} % }}}}", &caps[1])
-            })
-            .to_string();
+        // Simply replace {%p ... %} with {% ... %}
+        let re = Regex::new(r"\{%p\s+(.+?)\s*%\}")?;
+        result = re.replace_all(&result, |caps: &regex::Captures| {
+            format!("{{% {} %}}", &caps[1].trim())
+        }).to_string();
 
         Ok(result)
     }
@@ -556,14 +1061,11 @@ impl DocxTemplate {
     fn process_table_row_tags(&self, content: &str) -> Result<String> {
         let mut result = content.to_string();
 
-        // Pattern to match {%tr ... %} tags
-        let re = Regex::new(r"<w:tr[^>]*>.*?<w:t[^>]*>\s*\{%tr\s+(.+?)%\}\s*</w:t>.*?</w:tr>")?;
-
-        result = re
-            .replace_all(&result, |caps: &regex::Captures| {
-                format!("{{{{ % {} % }}}}", &caps[1])
-            })
-            .to_string();
+        // Simply replace {%tr ... %} with {% ... %}
+        let re = Regex::new(r"\{%tr\s+(.+?)\s*%\}")?;
+        result = re.replace_all(&result, |caps: &regex::Captures| {
+            format!("{{% {} %}}", &caps[1].trim())
+        }).to_string();
 
         Ok(result)
     }
@@ -572,13 +1074,11 @@ impl DocxTemplate {
     fn process_table_cell_tags(&self, content: &str) -> Result<String> {
         let mut result = content.to_string();
 
-        let re = Regex::new(r"<w:tc[^>]*>.*?<w:t[^>]*>\s*\{%tc\s+(.+?)%\}\s*</w:t>.*?</w:tc>")?;
-
-        result = re
-            .replace_all(&result, |caps: &regex::Captures| {
-                format!("{{{{ % {} % }}}}", &caps[1])
-            })
-            .to_string();
+        // Simply replace {%tc ... %} with {% ... %}
+        let re = Regex::new(r"\{%tc\s+(.+?)\s*%\}")?;
+        result = re.replace_all(&result, |caps: &regex::Captures| {
+            format!("{{% {} %}}", &caps[1].trim())
+        }).to_string();
 
         Ok(result)
     }
@@ -587,23 +1087,17 @@ impl DocxTemplate {
     fn process_run_tags(&self, content: &str) -> Result<String> {
         let mut result = content.to_string();
 
-        // Pattern to match {%r ... %} tags
-        let re = Regex::new(r"<w:t[^>]*>\s*\{%r\s+(.+?)%\}\s*</w:t>")?;
+        // Replace {%r ... %} with {% ... %} (control flow tags)
+        let re = Regex::new(r"\{%r\s+(.+?)\s*%\}")?;
+        result = re.replace_all(&result, |caps: &regex::Captures| {
+            format!("{{% {} %}}", &caps[1].trim())
+        }).to_string();
 
-        result = re
-            .replace_all(&result, |caps: &regex::Captures| {
-                format!("{{{{ % {} % }}}}", &caps[1])
-            })
-            .to_string();
-
-        // Also handle {{r ... }} for variables
-        let re2 = Regex::new(r"<w:t[^>]*>\s*\{\{r\s+(.+?)\}\}\s*</w:t>")?;
-
-        result = re2
-            .replace_all(&result, |caps: &regex::Captures| {
-                format!("{{{{ {} }}}}", &caps[1])
-            })
-            .to_string();
+        // Also handle {{r ... }} for variables - replace with {{ ... }}
+        let re2 = Regex::new(r"\{\{r\s+(.+?)\s*\}\}")?;
+        result = re2.replace_all(&result, |caps: &regex::Captures| {
+            format!("{{{{ {} }}}}", &caps[1].trim())
+        }).to_string();
 
         Ok(result)
     }
@@ -661,21 +1155,20 @@ impl DocxTemplate {
                         </a:graphic>
                     </wp:inline>
                 </w:drawing>"#,
-                doc_pr_id,
-                doc_pr_id,
-                image_path,
-                rel_id
+                doc_pr_id, doc_pr_id, image_path, rel_id
             );
 
             result = result.replace(&caps[0], &image_xml);
 
             // Add relationship
-            let rels = self.relationships
+            let rels = self
+                .relationships
                 .entry("word/_rels/document.xml.rels".to_string())
                 .or_insert_with(Vec::new);
             rels.push((
                 rel_id,
-                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image".to_string(),
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+                    .to_string(),
                 format!("media/{}", image_path),
             ));
         }
@@ -709,16 +1202,25 @@ impl DocxTemplate {
             zip.write_all(content.as_bytes())?;
         }
 
-        // Write [Content_Types].xml
-        zip.start_file("[Content_Types].xml", options)?;
-        zip.write_all(self.build_content_types()?.as_bytes())?;
-
         // Write relationships (only if not already in xml_parts)
         for (path, rels) in &self.relationships {
             if !self.xml_parts.contains_key(path) {
                 zip.start_file(path, options)?;
                 zip.write_all(self.build_relationships(rels)?.as_bytes())?;
             }
+        }
+
+        // Write binary parts (images, embeddings) - skip if replaced
+        for (path, data) in &self.binary_parts {
+            // Skip if this media file is being replaced
+            if path.starts_with("word/media/") {
+                let media_name = path.strip_prefix("word/media/").unwrap_or(path);
+                if self.media_replacements.contains_key(media_name) {
+                    continue;
+                }
+            }
+            zip.start_file(path, options)?;
+            zip.write_all(data)?;
         }
 
         // Handle media replacements
@@ -729,6 +1231,10 @@ impl DocxTemplate {
                 zip.write_all(&data)?;
             }
         }
+
+        // Write [Content_Types].xml
+        zip.start_file("[Content_Types].xml", options)?;
+        zip.write_all(self.build_content_types()?.as_bytes())?;
 
         zip.finish()?;
         Ok(())
@@ -779,4 +1285,59 @@ impl DocxTemplate {
         xml.push_str("</Relationships>");
         Ok(xml)
     }
+}
+
+/// Helper function to find the end position of a tag (handles nested tags)
+fn find_tag_end(content: &str, start_pos: usize) -> Option<usize> {
+    // Find the tag name from the start position
+    let tag_start = &content[start_pos..];
+    if let Some(tag_end) = tag_start.find('>') {
+        let opening_tag = &tag_start[..=tag_end];
+        
+        // Extract tag name (handles attributes)
+        let tag_name = if let Some(space_pos) = opening_tag.find(' ') {
+            &opening_tag[1..space_pos]
+        } else {
+            &opening_tag[1..opening_tag.len()-1]
+        };
+        
+        // Handle self-closing tags
+        if opening_tag.ends_with("/>") {
+            return Some(start_pos + tag_end + 1);
+        }
+        
+        // Find closing tag
+        let close_tag = format!("</{}>", tag_name);
+        let mut depth = 1;
+        let mut pos = start_pos + tag_end + 1;
+        
+        while pos < content.len() {
+            if let Some(open_pos) = content[pos..].find(&format!("<{}>", tag_name)) {
+                let absolute_open = pos + open_pos;
+                if let Some(close_match) = content[pos..].find(&close_tag) {
+                    let absolute_close = pos + close_match;
+                    
+                    if absolute_open < absolute_close {
+                        depth += 1;
+                        pos = absolute_open + tag_name.len() + 2;
+                    } else {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(absolute_close + close_tag.len());
+                        }
+                        pos = absolute_close + close_tag.len();
+                    }
+                } else {
+                    return None;
+                }
+            } else {
+                // No more opening tags, find closing tag
+                if let Some(close_match) = content[pos..].find(&close_tag) {
+                    return Some(pos + close_match + close_tag.len());
+                }
+                return None;
+            }
+        }
+    }
+    None
 }

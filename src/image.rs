@@ -294,13 +294,19 @@ impl InlineImage {
 /// Convert a Python measurement object to Measurement
 fn python_to_measurement(obj: &PyObject) -> PyResult<Measurement> {
     Python::with_gil(|py| {
-        // Check if it's a Mm object
+        // Check if it's a raw number (treat as millimeters)
         if let Ok(mm) = obj.extract::<f64>(py) {
             return Ok(Measurement::Millimeters(mm));
         }
 
         // Try to get the value from measurement objects
-        // Mm, Inches, Pt classes from docx.shared
+        // Cm, Mm, Inches, Pt classes from docxtplrs
+        if let Ok(bound) = obj.bind(py).getattr("cm") {
+            if let Ok(v) = bound.extract::<f64>() {
+                return Ok(Measurement::Centimeters(v));
+            }
+        }
+
         if let Ok(bound) = obj.bind(py).getattr("mm") {
             if let Ok(v) = bound.extract::<f64>() {
                 return Ok(Measurement::Millimeters(v));
@@ -332,7 +338,7 @@ fn python_to_measurement(obj: &PyObject) -> PyResult<Measurement> {
         }
 
         Err(pyo3::exceptions::PyTypeError::new_err(
-            "Invalid measurement type. Use Mm, Inches, or Pt from docx.shared.",
+            "Invalid measurement type. Use Cm, Mm, Inches, or Pt from docxtplrs.",
         ))
     })
 }
@@ -419,6 +425,28 @@ impl Mm {
 
     fn __repr__(&self) -> String {
         format!("Mm({})", self.value)
+    }
+}
+
+#[pyclass(name = "Cm")]
+#[derive(Debug, Clone, Copy)]
+pub struct Cm {
+    value: f64,
+}
+
+#[pymethods]
+impl Cm {
+    #[new]
+    fn new(value: f64) -> Self {
+        Self { value }
+    }
+
+    fn __float__(&self) -> f64 {
+        self.value
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Cm({})", self.value)
     }
 }
 

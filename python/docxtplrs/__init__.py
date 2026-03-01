@@ -14,6 +14,7 @@ Example:
 
 from docxtplrs.docxtplrs import (
     DocxTemplate,
+    JinjaEnv,
     RichText,
     RichTextParagraph,
     InlineImage,
@@ -24,6 +25,7 @@ from docxtplrs.docxtplrs import (
     ColSpan,
     VerticalMerge,
     Mm,
+    Cm,
     Inches,
     Pt,
     R,
@@ -37,6 +39,7 @@ __version__ = version()
 
 __all__ = [
     "DocxTemplate",
+    "JinjaEnv",
     "RichText",
     "RichTextParagraph",
     "InlineImage",
@@ -47,6 +50,7 @@ __all__ = [
     "ColSpan",
     "VerticalMerge",
     "Mm",
+    "Cm",
     "Inches",
     "Pt",
     "R",

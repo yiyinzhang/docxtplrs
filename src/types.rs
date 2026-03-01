@@ -143,6 +143,7 @@ impl TagType {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Measurement {
     Millimeters(f64),
+    Centimeters(f64),
     Inches(f64),
     Points(f64),
     Emus(i64),
@@ -153,6 +154,7 @@ impl Measurement {
     pub fn to_emus(&self) -> i64 {
         match self {
             Measurement::Millimeters(mm) => (*mm * 36000.0) as i64,
+            Measurement::Centimeters(cm) => (*cm * 360000.0) as i64,
             Measurement::Inches(inches) => (*inches * 914400.0) as i64,
             Measurement::Points(points) => (*points * 12700.0) as i64,
             Measurement::Emus(emus) => *emus,
@@ -163,6 +165,7 @@ impl Measurement {
     pub fn to_points(&self) -> f64 {
         match self {
             Measurement::Millimeters(mm) => *mm * 2.83465,
+            Measurement::Centimeters(cm) => *cm * 28.3465,
             Measurement::Inches(inches) => *inches * 72.0,
             Measurement::Points(points) => *points,
             Measurement::Emus(emus) => *emus as f64 / 12700.0,
@@ -174,6 +177,7 @@ impl fmt::Display for Measurement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Measurement::Millimeters(v) => write!(f, "{:.2}mm", v),
+            Measurement::Centimeters(v) => write!(f, "{:.2}cm", v),
             Measurement::Inches(v) => write!(f, "{:.2}in", v),
             Measurement::Points(v) => write!(f, "{:.2}pt", v),
             Measurement::Emus(v) => write!(f, "{}emu", v),
