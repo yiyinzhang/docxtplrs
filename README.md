@@ -1,6 +1,5 @@
 # docxtplrs
 
-[![PyPI version](https://badge.fury.io/py/docxtplrs.svg)](https://badge.fury.io/py/docxtplrs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Built with Vibe Coding](https://img.shields.io/badge/Built%20with-Vibe%20Coding-purple.svg)](https://twitter.com/karpathy/status/1886191732477106580)
 [![Status](https://img.shields.io/badge/Status-Work%20in%20Progress-orange.svg)]()
@@ -26,24 +25,66 @@ A Rust implementation of [python-docx-template](https://github.com/elapouya/pyth
 
 ## Installation
 
-### Using uv (Recommended)
+This is a Rust library with Python bindings and is **not available on PyPI**. You need to build it from source.
+
+### Prerequisites
+
+- [Rust](https://www.rust-lang.org/tools/install) toolchain
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) package manager
+
+### Build with uv + maturin
 
 ```bash
-uv pip install docxtplrs
-```
-
-### Using pip
-
-```bash
-pip install docxtplrs
-```
-
-### Build from source
-
-```bash
+# Clone the repository
 git clone https://github.com/yourusername/docxtplrs
 cd docxtplrs
-maturin develop --uv
+
+# Create virtual environment and install maturin
+uv venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+uv pip install maturin
+
+# Build and install in development mode
+maturin develop --release
+
+# Or use uv run directly
+uv run maturin develop --release
+```
+
+### Import in Python
+
+After building, you can import the package in your Python code:
+
+```python
+from docxtplrs import DocxTemplate
+
+# Load template
+doc = DocxTemplate("my_template.docx")
+
+# Render with context
+context = {
+    "company_name": "Example Corp",
+    "user_name": "John Doe",
+}
+doc.render(context)
+
+# Save result
+doc.save("generated_doc.docx")
+```
+
+### Use in Your Project
+
+Add the local package to your project's dependencies in `pyproject.toml`:
+
+```toml
+[tool.uv.sources]
+docxtplrs = { path = "/path/to/docxtplrs" }
+```
+
+Or install directly:
+
+```bash
+uv pip install /path/to/docxtplrs
 ```
 
 ## Quick Start
