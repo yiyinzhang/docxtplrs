@@ -29,8 +29,35 @@ This is a Rust library with Python bindings and is **not available on PyPI**. Yo
 
 ### Prerequisites
 
-- [Rust](https://www.rust-lang.org/tools/install) toolchain
-- [uv](https://docs.astral.sh/uv/getting-started/installation/) package manager
+#### 1. Install Rust
+
+```bash
+# Using rustup (recommended)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Or using system package manager (Ubuntu/Debian)
+sudo apt update && sudo apt install rustc
+
+# Verify installation
+rustc --version
+```
+
+For more options, see the [official Rust installation guide](https://www.rust-lang.org/tools/install).
+
+#### 2. Install uv
+
+```bash
+# Using the official installer
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Or using pip
+pip install uv
+
+# Verify installation
+uv --version
+```
+
+For more options, see the [uv documentation](https://docs.astral.sh/uv/getting-started/installation/).
 
 ### Build with uv + maturin
 
@@ -45,10 +72,10 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 uv pip install maturin
 
 # Build and install in development mode
-maturin develop --release
+maturin develop
 
 # Or use uv run directly
-uv run maturin develop --release
+uv run maturin develop
 ```
 
 ### Import in Python
