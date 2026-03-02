@@ -494,12 +494,13 @@ pub fn preprocess_xml_content(xml: &str) -> String {
                 // Process Jinja2 tag itself - unescape but don't re-escape quotes
                 let tag = &content[mat.start()..mat.end()];
                 let unescaped_tag = unescape_xml(tag);
-                // Don't escape single quotes in Jinja2 tags
+                // In Jinja2 tags, we only need to escape & < > to keep XML valid
+                // We must NOT escape quotes because they are part of Jinja2 syntax
+                // (e.g., string literals like "addChemo" or 'value')
                 let processed_tag = unescaped_tag.replace('&', "&amp;")
                     .replace('<', "&lt;")
-                    .replace('>', "&gt;")
-                    .replace('"', "&quot;");
-                // Note: we don't escape ' here
+                    .replace('>', "&gt;");
+                // Note: we don't escape " or ' here - they are valid in Jinja2
                 new_content.push_str(&processed_tag);
                 
                 last_end = mat.end();
