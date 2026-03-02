@@ -874,9 +874,8 @@ impl DocxTemplate {
                             match result {
                                 Ok(obj) => Self::python_to_minijinja(py, &obj)
                                     .unwrap_or_else(|_| minijinja::Value::from(())),
-                                Err(e) => {
-                                    // Log error and return original value
-                                    eprintln!("Filter '{}' error: {}", filter_name, e);
+                                Err(_) => {
+                                    // Return original value on filter error
                                     value
                                 }
                             }
