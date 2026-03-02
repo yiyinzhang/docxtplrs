@@ -435,11 +435,6 @@ pub fn convert_unicode_attributes(xml: &str) -> String {
         format!("['{}']", attr)
     }).to_string();
     
-    // Debug: check if conversion happened
-    if result != xml {
-        eprintln!("DEBUG: Unicode attribute conversion applied");
-    }
-    
     result
 }
 

@@ -1072,9 +1072,7 @@ impl DocxTemplate {
             format!("{{% {} %}}", &caps[1].trim())
         }).to_string();
         
-        if count > 0 {
-            eprintln!("DEBUG: process_paragraph_tags: {} tags converted", count);
-        }
+
 
         Ok(result)
     }
@@ -1091,9 +1089,7 @@ impl DocxTemplate {
         }).to_string();
         let count_after = Regex::new(r"\{%tr\s+").unwrap().find_iter(&result).count();
         
-        if count_before > 0 {
-            eprintln!("DEBUG: process_table_row_tags: {} tags found, {} remaining", count_before, count_after);
-        }
+
 
         Ok(result)
     }
