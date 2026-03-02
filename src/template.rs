@@ -888,25 +888,6 @@ impl DocxTemplate {
 
         // Add template
         if let Err(e) = env.add_template("doc", template) {
-            eprintln!("DEBUG: Template parsing error: {}", e);
-            eprintln!("DEBUG: Error location - template length: {}", template.len());
-            // Show first few lines of the template
-            let lines: Vec<&str> = template.lines().collect();
-            eprintln!("DEBUG: First 5 lines of template:");
-            for i in 0..std::cmp::min(5, lines.len()) {
-                eprintln!("DEBUG: Line {}: {}", i+1, &lines[i][..std::cmp::min(200, lines[i].len())]);
-            }
-            // Find the problematic line mentioned in error
-            if let Some(line_num) = e.to_string().find("(in doc:") {
-                let line_str = &e.to_string()[line_num + 8..];
-                if let Some(end_paren) = line_str.find(')') {
-                    if let Ok(line_no) = line_str[..end_paren].parse::<usize>() {
-                        if line_no > 0 && line_no <= lines.len() {
-                            eprintln!("DEBUG: Error at line {}: {}", line_no, lines[line_no - 1]);
-                        }
-                    }
-                }
-            }
             return Err(e.into());
         }
 
