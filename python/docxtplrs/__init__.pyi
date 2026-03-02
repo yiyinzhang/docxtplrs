@@ -310,7 +310,7 @@ class InlineImage:
     def __init__(
         self,
         template: DocxTemplate,
-        image_descriptor: str,
+        image_descriptor: Union[str, bytes, "io.BytesIO"],
         width: Optional[Union[Mm, Cm, Inches, Pt, float]] = None,
         height: Optional[Union[Mm, Cm, Inches, Pt, float]] = None,
     ) -> None:
@@ -319,7 +319,7 @@ class InlineImage:
 
         Args:
             template: The DocxTemplate object (for relationship management)
-            image_descriptor: Path to the image file
+            image_descriptor: Path to the image file, bytes data, or a file-like object (e.g., BytesIO)
             width: Optional width (use Mm, Inches, or Pt classes)
             height: Optional height (use Mm, Inches, or Pt classes)
         """

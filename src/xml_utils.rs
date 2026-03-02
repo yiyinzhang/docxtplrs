@@ -389,9 +389,10 @@ fn merge_split_tags(xml: &str) -> String {
     // Step 2: Merge {{...}} patterns split across runs
     // Handle pattern: {{text</w:t></w:r><w:r><w:t>text}}
     // The key is to match across </w:t></w:r>...<w:r>...<w:t> boundaries
+    // Use [^{}<]* to prevent matching across multiple }} or XML tags
     loop {
         let new_result = Regex::new(
-            r"(\{\{[^}]*?)</w:t>\s*</w:r>\s*<w:r[^>]*>(?:<w:rPr>.*?</w:rPr>)?\s*<w:t[^>]*>([^}]*?\}\})"
+            r"(\{\{[^{}<]*?)</w:t>\s*</w:r>\s*<w:r[^>]*>(?:<w:rPr>.*?</w:rPr>)?\s*<w:t[^>]*>([^{}]*?\}\})"
         ).unwrap()
         .replace_all(&result, |caps: &regex::Captures| {
             format!("{}{}", &caps[1], &caps[2])
@@ -407,7 +408,7 @@ fn merge_split_tags(xml: &str) -> String {
     // Step 3: Merge {%-...%} patterns split across runs  
     loop {
         let new_result = Regex::new(
-            r"(\{%[^%]*?)</w:t>\s*</w:r>\s*<w:r[^>]*>(?:<w:rPr>.*?</w:rPr>)?\s*<w:t[^>]*>([^%]*?%\})"
+            r"(\{%[^{}%<]*?)</w:t>\s*</w:r>\s*<w:r[^>]*>(?:<w:rPr>.*?</w:rPr>)?\s*<w:t[^>]*>([^{}%]*?%\})"
         ).unwrap()
         .replace_all(&result, |caps: &regex::Captures| {
             format!("{}{}", &caps[1], &caps[2])
@@ -418,6 +419,25 @@ fn merge_split_tags(xml: &str) -> String {
             break;
         }
         result = new_result;
+    }
+    
+    result
+}
+
+/// Convert non-ASCII attribute access to bracket notation
+/// Minijinja doesn't support Unicode identifiers like Python Jinja2 does
+/// This converts `obj.中文` to `obj['中文']`
+pub fn convert_unicode_attributes(xml: &str) -> String {
+    let re = Regex::new(r"\.([a-zA-Z_][a-zA-Z0-9_]*[\u{4e00}-\u{9fff}][a-zA-Z0-9_\u{4e00}-\u{9fff}]*|[\u{4e00}-\u{9fff}][a-zA-Z0-9_\u{4e00}-\u{9fff}]*|\d+[\u{4e00}-\u{9fff}]+)").unwrap();
+    
+    let result = re.replace_all(xml, |caps: &regex::Captures| {
+        let attr = &caps[1];
+        format!("['{}']", attr)
+    }).to_string();
+    
+    // Debug: check if conversion happened
+    if result != xml {
+        eprintln!("DEBUG: Unicode attribute conversion applied");
     }
     
     result
@@ -558,4 +578,19 @@ fn remove_empty_table_rows(xml: &str) -> String {
     }
     
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_convert_unicode_attributes() {
+        let input = r#"{{ sum.chemo.drug_category.推荐 }}"#;
+        let output = convert_unicode_attributes(input);
+        println!("Input: {}", input);
+        println!("Output: {}", output);
+        assert!(output.contains("['推荐']"));
+        assert!(!output.contains(".推荐"));
+    }
 }

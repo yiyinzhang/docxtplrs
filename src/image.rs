@@ -118,21 +118,19 @@ impl ImageDimensions {
     }
 }
 
-/// Read image dimensions from file
-pub fn read_image_dimensions(path: &Path) -> Result<(u32, u32)> {
-    let data = fs::read(path)?;
-
+/// Read image dimensions from byte data
+fn read_image_dimensions_from_bytes(data: &[u8]) -> Option<(u32, u32)> {
     // Try PNG
     if data.starts_with(b"\x89PNG\r\n\x1a\n") {
-        if let Some(dimensions) = read_png_dimensions(&data) {
-            return Ok(dimensions);
+        if let Some(dimensions) = read_png_dimensions(data) {
+            return Some(dimensions);
         }
     }
 
     // Try JPEG
     if data.starts_with(b"\xff\xd8") {
-        if let Some(dimensions) = read_jpeg_dimensions(&data) {
-            return Ok(dimensions);
+        if let Some(dimensions) = read_jpeg_dimensions(data) {
+            return Some(dimensions);
         }
     }
 
@@ -141,7 +139,7 @@ pub fn read_image_dimensions(path: &Path) -> Result<(u32, u32)> {
         if data.len() >= 10 {
             let width = u16::from_le_bytes([data[6], data[7]]) as u32;
             let height = u16::from_le_bytes([data[8], data[9]]) as u32;
-            return Ok((width, height));
+            return Some((width, height));
         }
     }
 
@@ -149,13 +147,36 @@ pub fn read_image_dimensions(path: &Path) -> Result<(u32, u32)> {
     if data.starts_with(b"BM") && data.len() >= 26 {
         let width = u32::from_le_bytes([data[18], data[19], data[20], data[21]]);
         let height = u32::from_le_bytes([data[22], data[23], data[24], data[25]]);
-        return Ok((width, height));
+        return Some((width, height));
     }
 
-    Err(DocxTplError::InvalidArgument(format!(
-        "Could not read dimensions for image: {}",
-        path.display()
-    )))
+    None
+}
+
+/// Read image dimensions from file
+pub fn read_image_dimensions(path: &Path) -> Result<(u32, u32)> {
+    let data = fs::read(path)?;
+    
+    read_image_dimensions_from_bytes(&data)
+        .ok_or_else(|| DocxTplError::InvalidArgument(format!(
+            "Could not read dimensions for image: {}",
+            path.display()
+        )))
+}
+
+/// Detect image format from byte data (magic numbers)
+fn detect_format_from_bytes(data: &[u8]) -> ImageFormat {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        ImageFormat::Png
+    } else if data.starts_with(b"\xff\xd8") {
+        ImageFormat::Jpeg
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        ImageFormat::Gif
+    } else if data.starts_with(b"BM") && data.len() >= 26 {
+        ImageFormat::Bmp
+    } else {
+        ImageFormat::Unknown
+    }
 }
 
 fn read_png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
@@ -227,56 +248,106 @@ impl InlineImage {
     ///
     /// Args:
     ///     template: The DocxTemplate object (for relationship management)
-    ///     image_descriptor: Path to the image file
+    ///     image_descriptor: Path to the image file, a file-like object (e.g., BytesIO), or bytes
     ///     width: Optional width (use Mm, Inches, or Pt classes)
     ///     height: Optional height (use Mm, Inches, or Pt classes)
     #[new]
     #[pyo3(signature = (template, image_descriptor, width=None, height=None))]
     fn new(
         template: &crate::template::DocxTemplate,
-        image_descriptor: String,
+        image_descriptor: PyObject,
         width: Option<PyObject>,
         height: Option<PyObject>,
     ) -> PyResult<Self> {
-        let path = Path::new(&image_descriptor);
+        Python::with_gil(|py| {
+            // Try to extract as string (file path) first
+            let (image_data, image_path, format): (Vec<u8>, String, ImageFormat) = 
+                if let Ok(path_str) = image_descriptor.extract::<String>(py) {
+                    // It's a file path
+                    let path = Path::new(&path_str);
+                    
+                    if !path.exists() {
+                        return Err(DocxTplError::Io(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("Image not found: {}", path_str),
+                        ))
+                        .into());
+                    }
+                    
+                    let format = ImageFormat::from_path(path);
+                    let data = fs::read(path)
+                        .map_err(|e| DocxTplError::Io(e))?;
+                    
+                    (data, path_str, format)
+                } else if let Ok(bytes) = image_descriptor.extract::<Vec<u8>>(py) {
+                    // It's bytes directly
+                    let format = detect_format_from_bytes(&bytes);
+                    let path = format!("image.{}", format.extension());
+                    (bytes, path, format)
+                } else {
+                    // Try to treat as file-like object (e.g., BytesIO)
+                    let obj = image_descriptor.bind(py);
+                    
+                    // Check if it has a 'read' method
+                    if obj.hasattr("read")? {
+                        // Call read() to get the bytes
+                        let bytes_obj = obj.call_method0("read")?;
+                        let bytes: Vec<u8> = bytes_obj.extract()?;
+                        
+                        // Try to get the name attribute (for file objects)
+                        let path = if let Ok(name_obj) = obj.getattr("name") {
+                            if let Ok(name) = name_obj.extract::<String>() {
+                                name
+                            } else {
+                                format!("image.{}", detect_format_from_bytes(&bytes).extension())
+                            }
+                        } else {
+                            format!("image.{}", detect_format_from_bytes(&bytes).extension())
+                        };
+                        
+                        let format = if path.contains('.') {
+                            ImageFormat::from_path(Path::new(&path))
+                        } else {
+                            detect_format_from_bytes(&bytes)
+                        };
+                        
+                        (bytes, path, format)
+                    } else {
+                        return Err(pyo3::exceptions::PyTypeError::new_err(
+                            "image_descriptor must be a file path (str), bytes, or a file-like object with a read() method"
+                        ));
+                    }
+                };
 
-        if !path.exists() {
-            return Err(DocxTplError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Image not found: {}", image_descriptor),
-            ))
-            .into());
-        }
+            // Read image dimensions from the data
+            let (orig_width, orig_height) = read_image_dimensions_from_bytes(&image_data)
+                .ok_or_else(|| DocxTplError::InvalidArgument(
+                    "Could not read image dimensions".to_string()
+                ))?;
 
-        let format = ImageFormat::from_path(path);
-        let (orig_width, orig_height) = read_image_dimensions(path)
-            .map_err(|e| DocxTplError::Other(e.to_string()))?;
+            // Convert Python measurement objects to Measurement
+            let width_meas = width
+                .map(|w| python_to_measurement(&w))
+                .transpose()
+                .map_err(|e| DocxTplError::InvalidArgument(e.to_string()))?;
 
-        // Convert Python measurement objects to Measurement
-        let width_meas = width
-            .map(|w| python_to_measurement(&w))
-            .transpose()
-            .map_err(|e| DocxTplError::InvalidArgument(e.to_string()))?;
+            let height_meas = height
+                .map(|h| python_to_measurement(&h))
+                .transpose()
+                .map_err(|e| DocxTplError::InvalidArgument(e.to_string()))?;
 
-        let height_meas = height
-            .map(|h| python_to_measurement(&h))
-            .transpose()
-            .map_err(|e| DocxTplError::InvalidArgument(e.to_string()))?;
+            let dimensions =
+                ImageDimensions::from_measurements(width_meas, height_meas, orig_width, orig_height);
 
-        let dimensions =
-            ImageDimensions::from_measurements(width_meas, height_meas, orig_width, orig_height);
-
-        let image_data = fs::read(path)
-            .map_err(|e| DocxTplError::Io(e))?;
-
-        Ok(Self {
-            image_path: image_descriptor,
-            width: width_meas.map(|m| m.to_emus()),
-            height: height_meas.map(|m| m.to_emus()),
-            image_data,
-            format,
-            dimensions,
-            relationship_id: None,
+            Ok(Self {
+                image_path,
+                width: width_meas.map(|m| m.to_emus()),
+                height: height_meas.map(|m| m.to_emus()),
+                image_data,
+                format,
+                dimensions,
+                relationship_id: None,
+            })
         })
     }
 
