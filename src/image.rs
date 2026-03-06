@@ -255,14 +255,13 @@ impl InlineImage {
     #[pyo3(signature = (template, image_descriptor, width=None, height=None))]
     fn new(
         template: &crate::template::DocxTemplate,
-        image_descriptor: PyObject,
-        width: Option<PyObject>,
-        height: Option<PyObject>,
+        image_descriptor: Bound<'_, PyAny>,
+        width: Option<Bound<'_, PyAny>>,
+        height: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        Python::with_gil(|py| {
-            // Try to extract as string (file path) first
-            let (image_data, image_path, format): (Vec<u8>, String, ImageFormat) = 
-                if let Ok(path_str) = image_descriptor.extract::<String>(py) {
+        // Try to extract as string (file path) first
+        let (image_data, image_path, format): (Vec<u8>, String, ImageFormat) = 
+            if let Ok(path_str) = image_descriptor.extract::<String>() {
                     // It's a file path
                     let path = Path::new(&path_str);
                     
@@ -279,75 +278,72 @@ impl InlineImage {
                         .map_err(|e| DocxTplError::Io(e))?;
                     
                     (data, path_str, format)
-                } else if let Ok(bytes) = image_descriptor.extract::<Vec<u8>>(py) {
-                    // It's bytes directly
-                    let format = detect_format_from_bytes(&bytes);
-                    let path = format!("image.{}", format.extension());
-                    (bytes, path, format)
-                } else {
-                    // Try to treat as file-like object (e.g., BytesIO)
-                    let obj = image_descriptor.bind(py);
+            } else if let Ok(bytes) = image_descriptor.extract::<Vec<u8>>() {
+                // It's bytes directly
+                let format = detect_format_from_bytes(&bytes);
+                let path = format!("image.{}", format.extension());
+                (bytes, path, format)
+            } else {
+                // Try to treat as file-like object (e.g., BytesIO)
+                // Check if it has a 'read' method
+                if image_descriptor.hasattr("read")? {
+                    // Call read() to get the bytes
+                    let bytes_obj = image_descriptor.call_method0("read")?;
+                    let bytes: Vec<u8> = bytes_obj.extract()?;
                     
-                    // Check if it has a 'read' method
-                    if obj.hasattr("read")? {
-                        // Call read() to get the bytes
-                        let bytes_obj = obj.call_method0("read")?;
-                        let bytes: Vec<u8> = bytes_obj.extract()?;
-                        
-                        // Try to get the name attribute (for file objects)
-                        let path = if let Ok(name_obj) = obj.getattr("name") {
-                            if let Ok(name) = name_obj.extract::<String>() {
-                                name
-                            } else {
-                                format!("image.{}", detect_format_from_bytes(&bytes).extension())
-                            }
+                    // Try to get the name attribute (for file objects)
+                    let path = if let Ok(name_obj) = image_descriptor.getattr("name") {
+                        if let Ok(name) = name_obj.extract::<String>() {
+                            name
                         } else {
                             format!("image.{}", detect_format_from_bytes(&bytes).extension())
-                        };
-                        
-                        let format = if path.contains('.') {
-                            ImageFormat::from_path(Path::new(&path))
-                        } else {
-                            detect_format_from_bytes(&bytes)
-                        };
-                        
-                        (bytes, path, format)
+                        }
                     } else {
-                        return Err(pyo3::exceptions::PyTypeError::new_err(
-                            "image_descriptor must be a file path (str), bytes, or a file-like object with a read() method"
-                        ));
-                    }
-                };
+                        format!("image.{}", detect_format_from_bytes(&bytes).extension())
+                    };
+                    
+                    let format = if path.contains('.') {
+                        ImageFormat::from_path(Path::new(&path))
+                    } else {
+                        detect_format_from_bytes(&bytes)
+                    };
+                    
+                    (bytes, path, format)
+                } else {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(
+                        "image_descriptor must be a file path (str), bytes, or a file-like object with a read() method"
+                    ));
+                }
+            };
 
-            // Read image dimensions from the data
-            let (orig_width, orig_height) = read_image_dimensions_from_bytes(&image_data)
-                .ok_or_else(|| DocxTplError::InvalidArgument(
-                    "Could not read image dimensions".to_string()
-                ))?;
+        // Read image dimensions from the data
+        let (orig_width, orig_height) = read_image_dimensions_from_bytes(&image_data)
+            .ok_or_else(|| DocxTplError::InvalidArgument(
+                "Could not read image dimensions".to_string()
+            ))?;
 
-            // Convert Python measurement objects to Measurement
-            let width_meas = width
-                .map(|w| python_to_measurement(&w))
-                .transpose()
-                .map_err(|e| DocxTplError::InvalidArgument(e.to_string()))?;
+        // Convert Python measurement objects to Measurement
+        let width_meas = width
+            .map(|w| python_to_measurement(&w))
+            .transpose()
+            .map_err(|e| DocxTplError::InvalidArgument(e.to_string()))?;
 
-            let height_meas = height
-                .map(|h| python_to_measurement(&h))
-                .transpose()
-                .map_err(|e| DocxTplError::InvalidArgument(e.to_string()))?;
+        let height_meas = height
+            .map(|h| python_to_measurement(&h))
+            .transpose()
+            .map_err(|e| DocxTplError::InvalidArgument(e.to_string()))?;
 
-            let dimensions =
-                ImageDimensions::from_measurements(width_meas, height_meas, orig_width, orig_height);
+        let dimensions =
+            ImageDimensions::from_measurements(width_meas, height_meas, orig_width, orig_height);
 
-            Ok(Self {
-                image_path,
-                width: width_meas.map(|m| m.to_emus()),
-                height: height_meas.map(|m| m.to_emus()),
-                image_data,
-                format,
-                dimensions,
-                relationship_id: None,
-            })
+        Ok(Self {
+            image_path,
+            width: width_meas.map(|m| m.to_emus()),
+            height: height_meas.map(|m| m.to_emus()),
+            image_data,
+            format,
+            dimensions,
+            relationship_id: None,
         })
     }
 
@@ -363,55 +359,53 @@ impl InlineImage {
 }
 
 /// Convert a Python measurement object to Measurement
-fn python_to_measurement(obj: &PyObject) -> PyResult<Measurement> {
-    Python::with_gil(|py| {
-        // Check if it's a raw number (treat as millimeters)
-        if let Ok(mm) = obj.extract::<f64>(py) {
-            return Ok(Measurement::Millimeters(mm));
-        }
+fn python_to_measurement(obj: &Bound<'_, PyAny>) -> PyResult<Measurement> {
+    // Check if it's a raw number (treat as millimeters)
+    if let Ok(mm) = obj.extract::<f64>() {
+        return Ok(Measurement::Millimeters(mm));
+    }
 
-        // Try to get the value from measurement objects
-        // Cm, Mm, Inches, Pt classes from docxtplrs
-        if let Ok(bound) = obj.bind(py).getattr("cm") {
-            if let Ok(v) = bound.extract::<f64>() {
-                return Ok(Measurement::Centimeters(v));
-            }
+    // Try to get the value from measurement objects
+    // Cm, Mm, Inches, Pt classes from docxtplrs
+    if let Ok(bound) = obj.getattr("cm") {
+        if let Ok(v) = bound.extract::<f64>() {
+            return Ok(Measurement::Centimeters(v));
         }
+    }
 
-        if let Ok(bound) = obj.bind(py).getattr("mm") {
-            if let Ok(v) = bound.extract::<f64>() {
-                return Ok(Measurement::Millimeters(v));
-            }
+    if let Ok(bound) = obj.getattr("mm") {
+        if let Ok(v) = bound.extract::<f64>() {
+            return Ok(Measurement::Millimeters(v));
         }
+    }
 
-        if let Ok(bound) = obj.bind(py).getattr("inches") {
-            if let Ok(v) = bound.extract::<f64>() {
-                return Ok(Measurement::Inches(v));
-            }
+    if let Ok(bound) = obj.getattr("inches") {
+        if let Ok(v) = bound.extract::<f64>() {
+            return Ok(Measurement::Inches(v));
         }
+    }
 
-        if let Ok(bound) = obj.bind(py).getattr("pt") {
-            if let Ok(v) = bound.extract::<f64>() {
-                return Ok(Measurement::Points(v));
-            }
-        }
-
-        // Try EMUs directly
-        if let Ok(bound) = obj.bind(py).getattr("emu") {
-            if let Ok(v) = bound.extract::<i64>() {
-                return Ok(Measurement::Emus(v));
-            }
-        }
-
-        // Last resort - try extracting as f64
-        if let Ok(v) = obj.extract::<f64>(py) {
+    if let Ok(bound) = obj.getattr("pt") {
+        if let Ok(v) = bound.extract::<f64>() {
             return Ok(Measurement::Points(v));
         }
+    }
 
-        Err(pyo3::exceptions::PyTypeError::new_err(
-            "Invalid measurement type. Use Cm, Mm, Inches, or Pt from docxtplrs.",
-        ))
-    })
+    // Try EMUs directly
+    if let Ok(bound) = obj.getattr("emu") {
+        if let Ok(v) = bound.extract::<i64>() {
+            return Ok(Measurement::Emus(v));
+        }
+    }
+
+    // Last resort - try extracting as f64
+    if let Ok(v) = obj.extract::<f64>() {
+        return Ok(Measurement::Points(v));
+    }
+
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "Invalid measurement type. Use Cm, Mm, Inches, or Pt from docxtplrs.",
+    ))
 }
 
 impl InlineImage {

@@ -63,7 +63,7 @@ For more options, see the [uv documentation](https://docs.astral.sh/uv/getting-s
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/docxtplrs
+git clone https://github.com/yiyinzhang/docxtplrs
 cd docxtplrs
 
 # Create virtual environment and install maturin

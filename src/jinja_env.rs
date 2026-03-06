@@ -10,6 +10,7 @@ use std::sync::Arc;
 /// in your templates. Filters are Python functions that transform values.
 ///
 /// Example:
+///     ```ignore
 ///     from docxtplrs import DocxTemplate, JinjaEnv
 ///
 ///     def format_currency(value):
@@ -20,11 +21,12 @@ use std::sync::Arc;
 ///
 ///     doc = DocxTemplate("template.docx")
 ///     doc.render(context, jinja_env=env)
+///     ```
 #[pyclass(name = "JinjaEnv")]
 #[derive(Debug)]
 pub struct JinjaEnv {
     /// Map of filter name to Python callable (wrapped in Arc for thread safety)
-    filters: HashMap<String, Arc<PyObject>>,
+    filters: HashMap<String, Arc<Py<PyAny>>>,
 }
 
 #[pymethods]
@@ -44,22 +46,22 @@ impl JinjaEnv {
     ///     func: A Python callable that takes the value as argument
     ///
     /// Example:
+    ///     ```ignore
     ///     def uppercase(value):
     ///         return str(value).upper()
     ///
     ///     env.add_filter("upper", uppercase)
     ///     # In template: {{ name|upper }}
-    fn add_filter(&mut self, name: String, func: PyObject) -> PyResult<()> {
-        Python::with_gil(|py| {
-            // Verify it's callable
-            if !func.bind(py).is_callable() {
-                return Err(pyo3::exceptions::PyTypeError::new_err(
-                    "Filter must be callable",
-                ));
-            }
-            self.filters.insert(name, Arc::new(func));
-            Ok(())
-        })
+    ///     ```
+    fn add_filter(&mut self, name: String, func: Bound<'_, PyAny>) -> PyResult<()> {
+        // Verify it's callable
+        if !func.is_callable() {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "Filter must be callable",
+            ));
+        }
+        self.filters.insert(name, Arc::new(func.unbind()));
+        Ok(())
     }
 
     /// Remove a filter
@@ -107,13 +109,21 @@ impl JinjaEnv {
 
 impl JinjaEnv {
     /// Get a filter function by name
-    pub fn get_filter(&self, name: &str) -> Option<Arc<PyObject>> {
+    pub fn get_filter(&self, name: &str) -> Option<Arc<Py<PyAny>>> {
         self.filters.get(name).cloned()
     }
 
     /// Get all filters as a new Arc HashMap
-    pub fn get_filters_arc(&self) -> Arc<HashMap<String, Arc<PyObject>>> {
+    pub fn get_filters_arc(&self) -> Arc<HashMap<String, Arc<Py<PyAny>>>> {
         Arc::new(self.filters.clone())
+    }
+
+    /// Get all filters as HashMap with cloned Py<PyAny> values
+    pub fn get_filters_cloned(&self, py: Python<'_>) -> HashMap<String, Py<PyAny>> {
+        self.filters
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone_ref(py)))
+            .collect()
     }
 
     /// Get filters count

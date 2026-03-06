@@ -13,14 +13,15 @@ rust-version = "1.70"
 [lib]
 name = "docxtplrs"
 crate-type = ["cdylib", "rlib"]
+doctest = false
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.28", features = ["extension-module", "abi3-py39", "py-clone", "auto-initialize"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-zip = { version = "2.2", default-features = false, features = ["deflate", "time"] }
-quick-xml = { version = "0.36", features = ["serialize"] }
-minijinja = { version = "2.5", features = ["builtins", "json"] }
+zip = { version = "8.2", default-features = false, features = ["deflate", "time"] }
+quick-xml = { version = "0.39", features = ["serialize"] }
+minijinja = { version = "2.17", features = ["builtins", "json"] }
 regex = "1.11"
 thiserror = "2.0"
 chrono = "0.4"

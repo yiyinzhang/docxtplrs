@@ -11,7 +11,7 @@ use crate::xml_utils::{
 };
 use minijinja::Value;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::{PyDict, PyList, PyString, PyTuple};
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
@@ -19,6 +19,17 @@ use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
+
+/// A wrapper around Arc<Py<PyAny>> that is Send + Sync.
+/// This is safe because we only access the Python object when holding the GIL.
+#[derive(Clone)]
+struct SendablePyObject(Arc<Py<PyAny>>);
+
+// Safety: Py<PyAny> is not Send/Sync by default, but it's safe to send between threads
+// as long as we only access it when holding the GIL. The SendablePyObject wrapper
+// ensures we always use Python::with_gil before accessing the inner object.
+unsafe impl Send for SendablePyObject {}
+unsafe impl Sync for SendablePyObject {}
 
 /// DocxTemplate for rendering Word documents with Jinja2 templates
 ///
@@ -87,6 +98,7 @@ impl DocxTemplate {
     ///     autoescape: Whether to autoescape special characters (default: False)
     ///
     /// Example:
+    ///     ```ignore
     ///     from docxtplrs import DocxTemplate, JinjaEnv
     ///
     ///     def format_currency(value):
@@ -97,9 +109,11 @@ impl DocxTemplate {
     ///
     ///     doc = DocxTemplate("template.docx")
     ///     doc.render(context, jinja_env=env)
+    ///     ```
     #[pyo3(signature = (context, jinja_env=None, autoescape=false))]
     fn render(
         &mut self,
+        py: Python<'_>,
         context: &Bound<'_, PyDict>,
         jinja_env: Option<PyRef<'_, JinjaEnv>>,
         autoescape: bool,
@@ -108,8 +122,9 @@ impl DocxTemplate {
         let context_map = self.py_dict_to_context(context)?;
 
         // Convert JinjaEnv filters to an Arc so we can share them with the closure
-        let filters: Arc<HashMap<String, Arc<PyObject>>> = if let Some(je) = jinja_env {
-            je.get_filters_arc()
+        // We extract the filters into a HashMap with cloned Py<PyAny> references
+        let filters: Arc<HashMap<String, Py<PyAny>>> = if let Some(je) = jinja_env {
+            Arc::new(je.get_filters_cloned(py))
         } else {
             Arc::new(HashMap::new())
         };
@@ -129,6 +144,14 @@ impl DocxTemplate {
 
             let content = self.xml_parts.get(&part_path).unwrap().clone();
 
+            // Check if template is too large (may cause parser overflow)
+            if content.len() > 5_000_000 {
+                return Err(DocxTplError::Other(
+                    format!("Template part '{}' is too large ({} bytes). Try removing embedded images or using a smaller template.", 
+                        part_path, content.len())
+                ).into());
+            }
+
             // Preprocess XML
             let preprocessed = preprocess_xml_content(&content);
 
@@ -145,7 +168,7 @@ impl DocxTemplate {
             
             // Render with Jinja2
             let rendered =
-                self.render_template(&preprocessed, &context_map, autoescape, filters.clone())?;
+                self.render_template(py, &preprocessed, &context_map, autoescape, filters.clone())?;
 
             // Postprocess
             let postprocessed = postprocess_xml_content(&rendered);
@@ -484,24 +507,21 @@ impl DocxTemplate {
             }
         };
         
-        Python::with_gil(|py| {
-            for (key, value) in properties {
-                let key_str: String = key.extract()?;
-                let value_str: String = value.extract()?;
-                
-                match key_str.as_str() {
-                    "author" | "creator" => update_element("creator", "dc", &value_str),
-                    "title" => update_element("title", "dc", &value_str),
-                    "subject" => update_element("subject", "dc", &value_str),
-                    "description" => update_element("description", "dc", &value_str),
-                    "keywords" => update_element("keywords", "cp", &value_str),
-                    "last_modified_by" => update_element("lastModifiedBy", "cp", &value_str),
-                    "revision" => update_element("revision", "cp", &value_str),
-                    _ => {}
-                }
+        for (key, value) in properties {
+            let key_str: String = key.extract()?;
+            let value_str: String = value.extract()?;
+            
+            match key_str.as_str() {
+                "author" | "creator" => update_element("creator", "dc", &value_str),
+                "title" => update_element("title", "dc", &value_str),
+                "subject" => update_element("subject", "dc", &value_str),
+                "description" => update_element("description", "dc", &value_str),
+                "keywords" => update_element("keywords", "cp", &value_str),
+                "last_modified_by" => update_element("lastModifiedBy", "cp", &value_str),
+                "revision" => update_element("revision", "cp", &value_str),
+                _ => {}
             }
-            Ok::<(), PyErr>(())
-        })?;
+        }
         
         self.xml_parts.insert(core_path.to_string(), core_content);
         
@@ -835,10 +855,11 @@ impl DocxTemplate {
     /// Render template with Jinja2
     fn render_template(
         &mut self,
+        py: Python<'_>,
         template: &str,
         context: &HashMap<String, Value>,
         _autoescape: bool,
-        filters: Arc<HashMap<String, Arc<PyObject>>>,
+        filters: Arc<HashMap<String, Py<PyAny>>>,
     ) -> Result<String> {
         let mut env = minijinja::Environment::new();
 
@@ -851,43 +872,46 @@ impl DocxTemplate {
         env.add_filter("escape", |s: String| escape_xml(&s));
 
         // Add custom filters from JinjaEnv
-        // Clone the filters Arc for each filter to avoid lifetime issues
-        let filters_for_closure = Arc::clone(&filters);
-        if !filters_for_closure.is_empty() {
-            for (name, func) in filters_for_closure.iter() {
-                let filter_name = name.clone();
-                let func = Arc::clone(func);
-
-                // Create a wrapper function that calls the Python filter
-                env.add_filter(
-                    filter_name.clone(),
-                    move |value: minijinja::Value| -> minijinja::Value {
-                        Python::with_gil(|py| {
-                            // Convert value to Python
-                            let py_value =
-                                Self::minijinja_to_python(py, &value).unwrap_or_else(|_| py.None());
-
-                            // Call the Python filter function
-                            let result = func.call1(py, (py_value,));
-
-                            // Convert result back to minijinja Value
-                            match result {
-                                Ok(obj) => Self::python_to_minijinja(py, &obj)
-                                    .unwrap_or_else(|_| minijinja::Value::from(())),
-                                Err(_) => {
-                                    // Return original value on filter error
-                                    value
-                                }
-                            }
-                        })
-                    },
-                );
-            }
+        // We use SendablePyObject wrapper to safely pass Python objects to minijinja filters
+        for (name, func) in filters.iter() {
+            let filter_name = name.clone();
+            let func = SendablePyObject(Arc::new(func.clone_ref(py)));
+            
+            env.add_filter(
+                filter_name,
+                move |value: minijinja::Value| -> minijinja::Value {
+                    // SAFETY: We know GIL is held because we're called from Python code
+                    let py = unsafe { Python::assume_attached() };
+                    
+                    // Convert minijinja value to Python
+                    let py_value = match Self::minijinja_to_python(py, &value) {
+                        Ok(v) => v,
+                        Err(_) => return value,
+                    };
+                    
+                    // Call the Python filter function
+                    let result = func.0.call1(py, (py_value,));
+                    
+                    // Convert result back to minijinja Value
+                    match result {
+                        Ok(obj) => Self::python_to_minijinja(py, &obj)
+                            .unwrap_or(minijinja::Value::from(())),
+                        Err(_) => value,
+                    }
+                },
+            );
         }
 
         // Add template
         if let Err(e) = env.add_template("doc", template) {
-            return Err(e.into());
+            let err_str = e.to_string();
+            // Check if it's potentially a size-related error
+            if err_str.contains("overflow") || template.len() > 5_000_000 {
+                return Err(DocxTplError::Other(
+                    "Template is too large to parse. Try removing embedded images or using a smaller template.".to_string()
+                ).into());
+            }
+            return Err(DocxTplError::Template(err_str).into());
         }
 
         // Render
@@ -905,42 +929,44 @@ impl DocxTemplate {
     }
 
     /// Convert minijinja Value to Python object
-    fn minijinja_to_python(py: Python, value: &minijinja::Value) -> PyResult<PyObject> {
+    fn minijinja_to_python(py: Python<'_>, value: &minijinja::Value) -> PyResult<Py<PyAny>> {
         use minijinja::value::ValueKind;
 
         match value.kind() {
             ValueKind::Undefined | ValueKind::None => Ok(py.None()),
             ValueKind::String => Ok(value
                 .as_str()
-                .map(|s| s.to_string().into_py(py))
+                .map(|s| PyString::new(py, s).into_any().unbind())
                 .unwrap_or_else(|| py.None())),
             ValueKind::Number => {
                 // Try integer first, then float
                 if let Some(i) = value.as_i64() {
-                    Ok(i.into_py(py))
+                    Ok(i.into_pyobject(py)?.into_any().unbind())
                 } else {
                     // Try to get as f64 via string conversion
                     let s = value.to_string();
                     if let Ok(f) = s.parse::<f64>() {
-                        Ok(f.into_py(py))
+                        Ok(f.into_pyobject(py)?.into_any().unbind())
                     } else {
-                        Ok(s.into_py(py))
+                        Ok(PyString::new(py, &s).into_any().unbind())
                     }
                 }
             }
             ValueKind::Bool => {
                 // Boolean check via string representation for now
                 let s = value.to_string();
-                Ok(s.parse::<bool>().unwrap_or(false).into_py(py))
+                let b = s.parse::<bool>().unwrap_or(false);
+                let bool_obj = pyo3::types::PyBool::new(py, b);
+                Ok(bool_obj.to_owned().into_any().unbind())
             }
             ValueKind::Seq => {
                 // Convert sequence to list
                 if let Some(obj) = value.as_object() {
                     if let Some(iter) = obj.try_iter() {
-                        let items: Vec<PyObject> = iter
+                        let items: Vec<Py<PyAny>> = iter
                             .filter_map(|item| Self::minijinja_to_python(py, &item).ok())
                             .collect();
-                        return Ok(items.into_py(py));
+                        return Ok(items.into_pyobject(py)?.into_any().unbind());
                     }
                 }
                 Ok(py.None())
@@ -950,14 +976,14 @@ impl DocxTemplate {
                 // For now, just convert to string representation
                 // This could be enhanced to properly support map iteration
                 let s = value.to_string();
-                Ok(s.into_py(py))
+                Ok(PyString::new(py, &s).into_any().unbind())
             }
-            _ => Ok(value.to_string().into_py(py)),
+            _ => Ok(PyString::new(py, &value.to_string()).into_any().unbind()),
         }
     }
 
     /// Convert Python object to minijinja Value
-    fn python_to_minijinja(py: Python, obj: &PyObject) -> PyResult<minijinja::Value> {
+    fn python_to_minijinja(py: Python<'_>, obj: &Py<PyAny>) -> PyResult<minijinja::Value> {
         let bound = obj.bind(py);
 
         // Handle None
@@ -970,6 +996,11 @@ impl DocxTemplate {
             return Ok(minijinja::Value::from(s));
         }
 
+        // Handle booleans (must be before integers since bool is a subtype)
+        if let Ok(b) = bound.extract::<bool>() {
+            return Ok(minijinja::Value::from(b));
+        }
+
         // Handle integers
         if let Ok(i) = bound.extract::<i64>() {
             return Ok(minijinja::Value::from(i));
@@ -980,16 +1011,11 @@ impl DocxTemplate {
             return Ok(minijinja::Value::from(f));
         }
 
-        // Handle booleans (must be before integers since bool is a subtype)
-        if let Ok(b) = bound.extract::<bool>() {
-            return Ok(minijinja::Value::from(b));
-        }
-
         // Handle lists/tuples
         if let Ok(list) = bound.downcast::<PyList>() {
             let mut vec = Vec::new();
             for item in list {
-                let py_obj: PyObject = item.into_py(py);
+                let py_obj: Py<PyAny> = item.into_pyobject(py)?.into_any().unbind();
                 vec.push(Self::python_to_minijinja(py, &py_obj)?);
             }
             return Ok(minijinja::Value::from(vec));
@@ -999,7 +1025,7 @@ impl DocxTemplate {
         if let Ok(tuple) = bound.downcast::<PyTuple>() {
             let mut vec = Vec::new();
             for item in tuple {
-                let py_obj: PyObject = item.into_py(py);
+                let py_obj: Py<PyAny> = item.into_pyobject(py)?.into_any().unbind();
                 vec.push(Self::python_to_minijinja(py, &py_obj)?);
             }
             return Ok(minijinja::Value::from(vec));
@@ -1010,7 +1036,7 @@ impl DocxTemplate {
             let mut map = std::collections::HashMap::new();
             for (k, v) in dict {
                 let key: String = k.extract()?;
-                let py_obj: PyObject = v.into_py(py);
+                let py_obj: Py<PyAny> = v.into_pyobject(py)?.into_any().unbind();
                 let val = Self::python_to_minijinja(py, &py_obj)?;
                 map.insert(key, val);
             }
