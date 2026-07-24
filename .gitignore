@@ -1,0 +1,9 @@
+/target
+/.venv
+/tests/*
+/python/*
+/examples/*
+AGENTS.md
+__pycache__/
+.pytest_cache/
+*.pyc

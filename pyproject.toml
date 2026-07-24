@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.14.1"]
+build-backend = "maturin"
+
+[project]
+name = "docxtplrs"
+version = "0.1.0"
+description = "Rust implementation of python-docx-template (docxtpl) with Python bindings"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=9", "maturin>=1.14.1"]
+crosscheck = ["docxtpl>=0.20", "docxcompose>=1.4"]
+
+[tool.maturin]
+module-name = "docxtplrs.docxtplrs"
+python-source = "python"
+features = ["extension-module"]
