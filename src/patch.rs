@@ -1,15 +1,32 @@
 //! Port of docxtpl's patch_xml / resolve_listing logic (regex-based XML cleaning).
 
 use fancy_regex::{Captures, Regex};
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+thread_local! {
+    // Compiling a fancy_regex is expensive (~tens of µs) and all patterns used
+    // here are fixed literals, so cache them per thread. Without this cache,
+    // resolve_listing recompiles several regexes per paragraph/run, which
+    // dominates render time for table-row-heavy templates (~ms per row).
+    static RE_CACHE: RefCell<HashMap<String, Regex>> = RefCell::new(HashMap::new());
+}
 
 fn re(pattern: &str) -> Regex {
     if std::env::var("PATCH_DEBUG").is_ok() {
         eprintln!("[patch] running: {}", pattern);
     }
-    fancy_regex::RegexBuilder::new(pattern)
-        .backtrack_limit(50_000_000)
-        .build()
-        .unwrap_or_else(|e| panic!("invalid regex {}: {}", pattern, e))
+    RE_CACHE.with(|c| {
+        c.borrow_mut()
+            .entry(pattern.to_string())
+            .or_insert_with(|| {
+                fancy_regex::RegexBuilder::new(pattern)
+                    .backtrack_limit(50_000_000)
+                    .build()
+                    .unwrap_or_else(|e| panic!("invalid regex {}: {}", pattern, e))
+            })
+            .clone()
+    })
 }
 
 /// replace all matches of `pattern` in `text` using closure over captures
@@ -372,6 +389,12 @@ pub fn resolve_listing(xml: &str) -> String {
 
     fn resolve_paragraph(m: &Captures) -> String {
         let whole = m.get(0).unwrap().as_str();
+        // Fast path: resolve_text only rewrites \t, \n, \x07 and \x0c. A
+        // paragraph without any of them is returned unchanged, so skip the
+        // (expensive) per-paragraph/per-run regex scans entirely.
+        if !whole.contains(['\t', '\n', '\u{7}', '\u{c}']) {
+            return whole.to_string();
+        }
         let paragraph_properties = re(r"(?s)<w:pPr>.*?</w:pPr>")
             .find(whole)
             .ok()

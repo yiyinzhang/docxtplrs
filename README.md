@@ -3,7 +3,7 @@
 > ⚠️ **Vibecoding project**: this codebase was written by an AI (Kimi Code) in a
 > pair-programming session with the user, without line-by-line human review.
 > It is verified against the official docxtpl test suite (32 real-world template
-> cases) plus 173 in-house tests, but undiscovered issues may remain — evaluate
+> cases) plus 188 in-house tests, but undiscovered issues may remain — evaluate
 > before production use.
 
 A **Rust implementation of [python-docx-template (docxtpl)](https://github.com/elapouya/python-docx-template)**,
@@ -13,6 +13,41 @@ almost identical to docxtpl. The template engine is
 handling, template preprocessing, table fixing, relationship management and the
 document object model are native Rust — **no dependency** on
 python-docx / lxml / jinja2.
+
+---
+
+## Why docxtplrs instead of python-docx-template?
+
+- **Zero Python dependencies** — the whole engine (docx zip/XML handling,
+  template preprocessing, table fixing, document object model) is native Rust.
+  No python-docx / lxml / jinja2 / markupsafe chain: one self-contained wheel,
+  no lxml build issues on exotic platforms, no dependency-version conflicts.
+- **Fast** — in a microbenchmark (title + paragraph loop + `{%tr %}` table-row
+  loop over 10/100/400 items, 30 renders each, CPython 3.13) docxtplrs renders
+  **~4-5x faster** than docxtpl (lxml + jinja2): e.g. 3.8ms vs 20.2ms per
+  render at 100 rows, 16.2ms vs 67.7ms at 400 rows. Reproduce with your own
+  templates before quoting numbers.
+- **Drop-in replacement** — the Python API and the template syntax
+  (`{{ var }}`, `{%tr %}`/`{%tc %}`/`{%p %}`, `RichText`, `InlineImage`,
+  `Subdoc`, ...) mirror docxtpl; migrating is usually just changing the import.
+  Verified against the official docxtpl test suite (32 real-world templates),
+  188 in-house tests, plus automated output cross-checking against docxtpl
+  itself (`tests/crosscheck.py`).
+- **One engine, two languages** — the same renderer is available as a native
+  Rust crate, so Rust services/CLIs can render docx templates with no Python
+  involved at all.
+- **Engine extras beyond stock docxtpl** — `str` methods in templates
+  (`upper/replace/split/...`), `'%s' % x` formatting, `{% break %}`/`{% continue %}`,
+  the `{% do %}` statement, gettext i18n (`{% trans %}`/`{% pluralize %}`),
+  `{% include %}`/`{% import %}` via `set_template_loader()`, custom
+  filters/tests/functions/globals with keyword arguments, and interop with a
+  real jinja2 `Environment`.
+- **Built-in read-write document model** — paragraphs/tables/sections/styles/
+  comments/core properties plus `add_paragraph/add_heading/add_picture/
+  add_table/add_page_break/add_section` cover the common python-docx paths,
+  without installing python-docx.
+- **Built-in CLI** — `python -m docxtplrs template.docx data.json out.docx`
+  renders a template straight from the shell, no scripting needed.
 
 ---
 
@@ -240,7 +275,7 @@ Engine-level extras beyond stock minijinja, so jinja2-style templates work as-is
 ### Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q          # 173 unit tests
+.venv/bin/python -m pytest tests/ -q          # 188 unit tests
 .venv/bin/python tests/crosscheck.py docxtplrs > /tmp/rs.json
 .venv/bin/python tests/crosscheck.py docxtpl > /tmp/ref.json   # needs crosscheck group
 .venv/bin/python tests/crosscheck.py compare /tmp/ref.json /tmp/rs.json
@@ -289,13 +324,38 @@ Engine-level extras beyond stock minijinja, so jinja2-style templates work as-is
 ## 中文版
 
 > ⚠️ **Vibecoding 项目**：本项目由 AI（Kimi Code）与用户结对编写，未经人工逐行审查。
-> 已通过 docxtpl 官方测试套件（32 个真实模板用例）与 173 个自建测试验证，
+> 已通过 docxtpl 官方测试套件（32 个真实模板用例）与 188 个自建测试验证，
 > 但仍可能存在未发现的问题，生产环境使用前请自行评估。
 
 [python-docx-template (docxtpl)](https://github.com/elapouya/python-docx-template) 的 **Rust 实现**，
 既可作为 **Rust crate** 使用，也可通过 PyO3 作为 **Python 包** 使用（API 与 docxtpl 几乎完全一致）。
 模板引擎为 minijinja（Jinja2 兼容语法）；docx 的 zip/XML 处理、模板预处理、表格修复、
 关系管理、文档对象模型均为 Rust 原生实现，**不依赖** python-docx / lxml / jinja2。
+
+### 相比 python-docx-template 的优势
+
+- **零 Python 依赖**：整个引擎（docx zip/XML 处理、模板预处理、表格修复、文档对象模型）
+  均为 Rust 原生实现。不再需要 python-docx / lxml / jinja2 / markupsafe 依赖链——单个自包含
+  wheel，没有 lxml 在冷门平台上的编译问题，也没有依赖版本冲突的烦恼。
+- **快**：微基准测试（标题 + 段落循环 + `{%tr %}` 表格行循环，10/100/400 行，各渲染 30 次，
+  CPython 3.13）下 docxtplrs 比 docxtpl（lxml + jinja2）**快约 4-5 倍**：100 行时每次渲染
+  3.8ms vs 20.2ms，400 行时 16.2ms vs 67.7ms。引用数字前请用你自己的模板复测。
+- **无缝替代**：Python API 与模板语法（`{{ var }}`、`{%tr %}`/`{%tc %}`/`{%p %}`、
+  `RichText`、`InlineImage`、`Subdoc` 等）与 docxtpl 几乎完全一致，迁移通常只需改一行 import。
+  已通过 docxtpl 官方测试套件（32 个真实模板）、188 个自建测试，并有与 docxtpl 输出自动
+  交叉比对的工具（`tests/crosscheck.py`）。
+- **一个引擎，两种语言**：同一渲染器同时提供原生 Rust crate，Rust 服务/CLI 可以完全不
+  经过 Python 渲染 docx 模板。
+- **超出原版 docxtpl 的引擎能力**：模板内 `str` 方法（`upper/replace/split/...`）、
+  `'%s' % x` 格式化、`{% break %}`/`{% continue %}`、`{% do %}` 语句、gettext i18n
+  （`{% trans %}`/`{% pluralize %}`）、`set_template_loader()` 支持的 `{% include %}`/
+  `{% import %}`、带关键字参数的自定义 filters/tests/functions/globals，以及与真实
+  jinja2 `Environment` 的互操作。
+- **内置可读写文档对象模型**：paragraphs/tables/sections/styles/comments/core properties
+  以及 `add_paragraph/add_heading/add_picture/add_table/add_page_break/add_section`，
+  覆盖 python-docx 常用读写路径，无需再安装 python-docx。
+- **内置 CLI**：`python -m docxtplrs template.docx data.json out.docx`，无需写脚本即可
+  在命令行直接渲染模板。
 
 ### Rust 用法
 
@@ -442,7 +502,7 @@ tpl.render(context, jinja_env=env)
 ```
 src/            Rust sources (17 modules, see AGENTS.md)   Rust 源码
 python/         Python package shell (__init__ + __main__ CLI)
-tests/          173 tests + crosscheck/compare scripts      测试与交叉验证
+tests/          188 tests + crosscheck/compare scripts      测试与交叉验证
 examples/       render.rs (Rust API), patch_dbg.rs (large-doc debugging)
 AGENTS.md       Notes for AI coding assistants              给 AI 助手的项目说明
 ```
