@@ -1,9 +1,15 @@
+# ---- Rust ----
 /target
+
+# ---- Python ----
+# Virtualenv
 /.venv
-/tests/*
-/python/*
-/examples/*
-AGENTS.md
+# maturin develop 生成的扩展模块（构建产物，勿提交）
+/python/**/*.so
+# 字节码与缓存
 __pycache__/
+*.py[cod]
 .pytest_cache/
-*.pyc
+
+# ---- 本地个人配置 ----
+AGENTS.md
