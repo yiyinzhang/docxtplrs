@@ -24,8 +24,8 @@ python-docx / lxml / jinja2.
   no lxml build issues on exotic platforms, no dependency-version conflicts.
 - **Fast** — in a microbenchmark (title + paragraph loop + `{%tr %}` table-row
   loop over 10/100/400 items, 30 renders each, CPython 3.13) docxtplrs renders
-  **~4-5x faster** than docxtpl (lxml + jinja2): e.g. 3.8ms vs 20.2ms per
-  render at 100 rows, 16.2ms vs 67.7ms at 400 rows. Reproduce with your own
+  **~5-9x faster** than docxtpl (lxml + jinja2): e.g. 2.7ms vs 24.5ms per
+  render at 100 rows, 9.1ms vs 48.1ms at 400 rows. Reproduce with your own
   templates before quoting numbers.
 - **Drop-in replacement** — the Python API and the template syntax
   (`{{ var }}`, `{%tr %}`/`{%tc %}`/`{%p %}`, `RichText`, `InlineImage`,
@@ -338,8 +338,8 @@ Engine-level extras beyond stock minijinja, so jinja2-style templates work as-is
   均为 Rust 原生实现。不再需要 python-docx / lxml / jinja2 / markupsafe 依赖链——单个自包含
   wheel，没有 lxml 在冷门平台上的编译问题，也没有依赖版本冲突的烦恼。
 - **快**：微基准测试（标题 + 段落循环 + `{%tr %}` 表格行循环，10/100/400 行，各渲染 30 次，
-  CPython 3.13）下 docxtplrs 比 docxtpl（lxml + jinja2）**快约 4-5 倍**：100 行时每次渲染
-  3.8ms vs 20.2ms，400 行时 16.2ms vs 67.7ms。引用数字前请用你自己的模板复测。
+  CPython 3.13）下 docxtplrs 比 docxtpl（lxml + jinja2）**快约 5-9 倍**：100 行时每次渲染
+  2.7ms vs 24.5ms，400 行时 9.1ms vs 48.1ms。引用数字前请用你自己的模板复测。
 - **无缝替代**：Python API 与模板语法（`{{ var }}`、`{%tr %}`/`{%tc %}`/`{%p %}`、
   `RichText`、`InlineImage`、`Subdoc` 等）与 docxtpl 几乎完全一致，迁移通常只需改一行 import。
   已通过 docxtpl 官方测试套件（32 个真实模板）、188 个自建测试，并有与 docxtpl 输出自动

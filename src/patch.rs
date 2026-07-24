@@ -4,6 +4,18 @@ use fancy_regex::{Captures, Regex};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+/// Timing instrumentation, enabled with PATCH_TIMING=1.
+macro_rules! timed {
+    ($name:expr, $e:expr) => {{
+        let __t0 = std::time::Instant::now();
+        let __r = $e;
+        if std::env::var("PATCH_TIMING").is_ok() {
+            eprintln!("[patch-timing] {}: {:.3}ms", $name, __t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        __r
+    }};
+}
+
 thread_local! {
     // Compiling a fancy_regex is expensive (~tens of µs) and all patterns used
     // here are fixed literals, so cache them per thread. Without this cache,
@@ -68,6 +80,67 @@ where
 }
 
 /// simple literal replacement with $ group references
+/// True when `hay` contains at least one of `needles`.
+#[inline]
+fn contains_any(hay: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|n| hay.contains(n))
+}
+
+/// Hand-rolled equivalent of the docxtpl regex
+/// `(?<=\{)(?>(?:<[^>]*>)+)(?=[\{%\#])|(?<=[%\}\#])(?>(?:<[^>]*>)+)(?=\})`
+/// which strips XML tags that split a jinja tag across runs (`{<r></r>{` -> `{{`).
+/// The atomic group means: after a delimiter, consume as many whole `<...>`
+/// tags as possible, then the terminator check must hold (no backtracking).
+/// Linear time; the fancy_regex original costs ~20ms per 500KB even without
+/// any match.
+fn merge_split_braces_scan(xml: &str) -> String {
+    let b = xml.as_bytes();
+    let n = b.len();
+    let mut out = String::with_capacity(n);
+    let mut copied = 0usize; // xml[..copied] already flushed to out
+    let mut i = 0usize;
+    while i < n {
+        let c = b[i];
+        // open side: '{' ... one of '{','%','#' ; close side: one of '%','}','#' ... '}'
+        let open_side = match c {
+            b'{' => true,
+            b'%' | b'}' | b'#' => false,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // consume consecutive complete `<...>` tags starting at i+1
+        let mut j = i + 1;
+        while j < n && b[j] == b'<' {
+            match xml[j..].find('>') {
+                Some(k) => j += k + 1,
+                None => break,
+            }
+        }
+        let matched = if j > i + 1 && j < n {
+            if open_side {
+                matches!(b[j], b'{' | b'%' | b'#')
+            } else {
+                b[j] == b'}'
+            }
+        } else {
+            false
+        };
+        if matched {
+            // keep the delimiter char, drop the tags; the terminator (not
+            // consumed, like the regex lookahead) is re-examined next round
+            out.push_str(&xml[copied..=i]);
+            copied = j;
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&xml[copied..]);
+    out
+}
+
 pub fn sub_str(pattern: &str, replacement: &str, text: &str) -> String {
     // route through `sub` (fancy-regex's replace_all unwraps internally)
     let replacement = replacement.to_string();
@@ -155,21 +228,23 @@ fn keep_char(c: char) -> Option<String> {
 /// Port of DocxTemplate.patch_xml
 pub fn patch_xml(src_xml: &str) -> String {
     // replace {<something>{ by {{   ( works with {{ }} {% and %} {# and #})
-    let mut xml = sub_str(
-        r"(?s)(?<=\{)(?>(?:<[^>]*>)+)(?=[\{%\#])|(?<=[%\}\#])(?>(?:<[^>]*>)+)(?=\})",
-        "",
-        src_xml,
-    );
+    // (hand-rolled linear scan; fancy_regex spends ~20ms/500KB here even when
+    // nothing matches)
+    let mut xml = timed!("merge_split_braces", merge_split_braces_scan(src_xml));
 
     // replace {{<some tags>jinja2 stuff<some other tags>}} by {{jinja2 stuff}}
-    xml = sub(
+    // (gated: the pattern can only match where a jinja open marker exists)
+    if contains_any(&xml, &["{{", "{%", "{#"]) {
+        xml = timed!("strip_tags_in_jinja", sub(
         r"(?s)\{%(?:(?!%\}).)*|\{#(?:(?!#\}).)*|\{\{(?:(?!}\}).)*",
         |m| sub_str(r"(?s)</w:t>.*?(<w:t>|<w:t [^>]*>)", "", m.get(0).unwrap().as_str()),
         &xml,
-    );
+        ));
+    }
 
     // manage table cell colspan
-    xml = sub(
+    if xml.contains("colspan") {
+    xml = timed!("colspan", sub(
         r"(?s)(<w:tc[ >](?:(?!<w:tc[ >]).)*)\{%\s*colspan\s+([^%]*)\s*%\}(.*?</w:tc>)",
         |m| {
             let mut cell_xml = format!("{}{}", m.get(1).unwrap().as_str(), m.get(3).unwrap().as_str());
@@ -192,10 +267,12 @@ pub fn patch_xml(src_xml: &str) -> String {
             )
         },
         &xml,
-    );
+    ));
+    }
 
     // manage table cell background color
-    xml = sub(
+    if xml.contains("cellbg") {
+    xml = timed!("cellbg", sub(
         r"(?s)(<w:tc[ >](?:(?!<w:tc[ >]).)*)\{%\s*cellbg\s+([^%]*)\s*%\}(.*?</w:tc>)",
         |m| {
             let mut cell_xml = format!("{}{}", m.get(1).unwrap().as_str(), m.get(3).unwrap().as_str());
@@ -219,12 +296,13 @@ pub fn patch_xml(src_xml: &str) -> String {
             )
         },
         &xml,
-    );
+    ));
+    }
 
     // ensure space preservation (hand-rolled linear scan; the original
     // tempered-dot regex overflows the backtrack stack on large documents)
-    xml = space_preserve_scan(&xml);
-    xml = sub(
+    xml = timed!("space_preserve", space_preserve_scan(&xml));
+    xml = timed!("richtext_tag", sub(
         r"(?s)(\{\{r\s.*?\}\}|\{%r\s.*?\%\})",
         |m| {
             format!(
@@ -233,13 +311,13 @@ pub fn patch_xml(src_xml: &str) -> String {
             )
         },
         &xml,
-    );
+    ));
 
     // {%- will merge with previous paragraph text (hand-rolled; the
     // original regex spans paragraphs and overflows the backtrack stack)
-    xml = dash_merge_prev_scan(&xml);
+    xml = timed!("dash_merge_prev", dash_merge_prev_scan(&xml));
     // -%} will merge with next paragraph text
-    xml = dash_merge_next_scan(&xml);
+    xml = timed!("dash_merge_next", dash_merge_next_scan(&xml));
 
     // replace into xml code the row/paragraph/run containing
     // {%y xxx %} / {{y xxx}} / {#y xxx #} template tag by the tag alone
@@ -247,16 +325,17 @@ pub fn patch_xml(src_xml: &str) -> String {
     // original tempered-dot regex overflows the backtrack stack on large
     // documents)
     for y in ["tr", "tc", "p", "r"] {
-        xml = element_tag_scan(&xml, y, false);
+        xml = timed!("element_tag_scan", element_tag_scan(&xml, y, false));
     }
     for y in ["tr", "tc", "p"] {
-        xml = element_tag_scan(&xml, y, true);
+        xml = timed!("element_tag_scan", element_tag_scan(&xml, y, true));
     }
 
     // add vMerge
     // use {% vm %} to make this table cell and its copies
     // be vertically merged within a {% for %}
-    xml = sub(
+    if xml.contains("{%") && xml.contains("vm") {
+    xml = timed!("vmerge", sub(
         r"(?s)<w:tc[ >](?:(?!<w:tc[ >]).)*?\{%\s*vm\s*%\}.*?</w:tc[ >]",
         |m| {
             let whole = m.get(0).unwrap().as_str();
@@ -275,10 +354,12 @@ pub fn patch_xml(src_xml: &str) -> String {
             )
         },
         &xml,
-    );
+    ));
+    }
 
     // Use {% hm %} to make table cell become horizontally merged within a {% for %}.
-    xml = sub(
+    if xml.contains("{%") && xml.contains("hm") {
+    xml = timed!("hmerge", sub(
         r"(?s)<w:tc[ >](?:(?!<w:tc[ >]).)*?\{%\s*hm\s*%\}.*?</w:tc[ >]",
         |m| {
             let whole = m.get(0).unwrap().as_str().to_string();
@@ -318,10 +399,12 @@ pub fn patch_xml(src_xml: &str) -> String {
             format!("{{% if loop.first %}}{}{{% endif %}}", xml_patched)
         },
         &xml,
-    );
+    ));
+    }
 
     // clean tags: unescape entities and smart quotes inside jinja tags
-    xml = sub(r"(?<=\{[\{%])(.*?)(?=[\}%]\})", |m| {
+    if contains_any(&xml, &["{{", "{%"]) {
+    xml = timed!("clean_tags", sub(r"(?<=\{[\{%])(.*?)(?=[\}%]\})", |m| {
         m.get(0)
             .unwrap()
             .as_str()
@@ -332,7 +415,8 @@ pub fn patch_xml(src_xml: &str) -> String {
             .replace('\u{201d}', "\"")
             .replace('\u{2018}', "'")
             .replace('\u{2019}', "'")
-    }, &xml);
+    }, &xml));
+    }
 
     xml
 }
@@ -408,11 +492,11 @@ pub fn resolve_listing(xml: &str) -> String {
         )
     }
 
-    sub(
+    timed!("resolve_listing_scan", sub(
         r"(?s)<w:p(?: [^>]*)?>.*?</w:p>",
         |m| resolve_paragraph(m),
         xml,
-    )
+    ))
 }
 
 /// `<w:t>` -> `<w:t xml:space="preserve">` when a jinja tag follows before
