@@ -11,12 +11,34 @@ const NS_PIC: &str = "http://schemas.openxmlformats.org/drawingml/2006/picture";
 const NS_R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
 /// next available positive integer id in the part XML (like python-docx next_id)
+///
+/// Equivalent to scanning with the regex `\bid="(\d+)"`, but implemented as a
+/// plain linear string scan: the backtracking regex VM is far too slow on
+/// multi-megabyte part XML (it is evaluated once per InlineImage).
 fn next_shape_id(part_xml: &str) -> u32 {
-    let rex = fancy_regex::Regex::new(r#"\bid="(\d+)""#).unwrap();
+    let bytes = part_xml.as_bytes();
     let mut max = 0u32;
-    for cap in rex.captures_iter(part_xml).flatten() {
-        if let Ok(n) = cap[1].parse::<u32>() {
-            max = max.max(n);
+    let mut start = 0usize;
+    while let Some(rel) = part_xml[start..].find("id=\"") {
+        let i = start + rel;
+        start = i + 4;
+        // emulate the \b before `id`: previous char must be a non-word char
+        if i > 0 {
+            let prev = bytes[i - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' {
+                continue;
+            }
+        }
+        let ds = i + 4;
+        let mut de = ds;
+        while de < bytes.len() && bytes[de].is_ascii_digit() {
+            de += 1;
+        }
+        // the regex requires a closing quote right after the digits
+        if de > ds && de < bytes.len() && bytes[de] == b'"' {
+            if let Ok(n) = part_xml[ds..de].parse::<u32>() {
+                max = max.max(n);
+            }
         }
     }
     max + 1

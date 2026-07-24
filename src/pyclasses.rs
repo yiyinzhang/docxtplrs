@@ -133,11 +133,41 @@ impl PyDocxTemplate {
                     core.env_options.undefined_behavior = Some(behavior.to_string());
                 }
             }
+            // jinja2 ships default globals (namespace, range, dict, ...) that
+            // would shadow minijinja's native builtins. minijinja's own
+            // `namespace` object is required for `{% set ns.attr = ... %}`,
+            // so never let an env-provided global override these names.
+            const SKIP_GLOBALS: &[&str] =
+                &["namespace", "range", "dict", "cycler", "joiner", "lipsum"];
             for (attr, kind) in [("filters", 0u8), ("globals", 1u8), ("tests", 2u8)] {
                 if let Ok(d) = env.getattr(attr) {
                     if let Ok(d) = d.cast::<PyDict>() {
                         for (k, v) in d.iter() {
                             let name = k.str()?.to_string_lossy().to_string();
+                            if kind == 1 && SKIP_GLOBALS.contains(&name.as_str()) {
+                                continue;
+                            }
+                            if kind != 1 {
+                                // jinja2's own builtin filters/tests are either
+                                // @async_variant wrappers or @pass_environment /
+                                // @pass_eval_context / @pass_context bound; both
+                                // forms expect the jinja2 runtime as first arg
+                                // and break when invoked as plain callables.
+                                // minijinja provides native equivalents, so skip
+                                // them and only import user-registered plain
+                                // callables.
+                                let async_variant = v
+                                    .getattr("jinja_async_variant")
+                                    .map(|x| x.is_truthy().unwrap_or(false))
+                                    .unwrap_or(false);
+                                let pass_arg = v
+                                    .getattr("jinja_pass_arg")
+                                    .map(|x| !x.is_none())
+                                    .unwrap_or(false);
+                                if async_variant || pass_arg {
+                                    continue;
+                                }
+                            }
                             let list = match kind {
                                 0 => &mut core.custom_filters,
                                 1 => &mut core.custom_globals,
