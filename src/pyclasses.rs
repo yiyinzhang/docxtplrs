@@ -92,7 +92,9 @@ impl PyDocxTemplate {
     ///
     /// If jinja_env is provided, its `autoescape`, `filters`, `globals` and
     /// `tests` attributes are honored (duck-typed, works with real jinja2
-    /// environments).
+    /// environments). jinja2's own builtins (identity-matched against
+    /// jinja2.defaults) are left to minijinja's native implementations;
+    /// only user-added/overridden entries are imported.
     #[pyo3(signature = (context, jinja_env=None, autoescape=false))]
     fn render(
         &self,
@@ -139,6 +141,26 @@ impl PyDocxTemplate {
             // so never let an env-provided global override these names.
             const SKIP_GLOBALS: &[&str] =
                 &["namespace", "range", "dict", "cycler", "joiner", "lipsum"];
+            // jinja2's own builtin filters/tests/globals are best handled by
+            // minijinja's native implementations: importing them as plain
+            // python callables would both shadow the faster native versions
+            // and break undefined-value semantics (jinja2's builtins check
+            // `isinstance(v, jinja2.Undefined)`, which never matches values
+            // converted from minijinja). Detect builtins by object identity
+            // against jinja2.defaults; only entries the user actually added
+            // or overrode get imported. When jinja2 is not importable (e.g.
+            // duck-typed fake environments) fall back to importing everything.
+            let py = env.py();
+            let jinja_defaults = PyModule::import(py, "jinja2.defaults").ok();
+            let default_dict = |attr: &str| -> Option<Bound<'_, PyDict>> {
+                jinja_defaults
+                    .as_ref()
+                    .and_then(|m| m.getattr(attr).ok())
+                    .and_then(|d| d.cast_into::<PyDict>().ok())
+            };
+            let default_filters = default_dict("DEFAULT_FILTERS");
+            let default_globals = default_dict("DEFAULT_NAMESPACE");
+            let default_tests = default_dict("DEFAULT_TESTS");
             for (attr, kind) in [("filters", 0u8), ("globals", 1u8), ("tests", 2u8)] {
                 if let Ok(d) = env.getattr(attr) {
                     if let Ok(d) = d.cast::<PyDict>() {
@@ -146,6 +168,19 @@ impl PyDocxTemplate {
                             let name = k.str()?.to_string_lossy().to_string();
                             if kind == 1 && SKIP_GLOBALS.contains(&name.as_str()) {
                                 continue;
+                            }
+                            let defaults_dict = match kind {
+                                0 => &default_filters,
+                                1 => &default_globals,
+                                _ => &default_tests,
+                            };
+                            if let Some(dd) = defaults_dict {
+                                if let Ok(Some(dv)) = dd.get_item(&name) {
+                                    if dv.as_ptr() == v.as_ptr() {
+                                        // untouched jinja2 builtin -> native
+                                        continue;
+                                    }
+                                }
                             }
                             if kind != 1 {
                                 // jinja2's own builtin filters/tests are either

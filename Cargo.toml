@@ -13,7 +13,7 @@ extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 pyo3 = "0.29"
-minijinja = { version = "2", features = ["loader", "unicode"] }
+minijinja = { version = "2", features = ["loader", "unicode", "json", "urlencode"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 fancy-regex = "0.14"
 quick-xml = "0.36"

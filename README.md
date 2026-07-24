@@ -209,6 +209,19 @@ env.filters["usd"] = lambda v: f"${v:.2f}"
 tpl.render(context, jinja_env=env)
 ```
 
+Notes: jinja2's own builtin filters/tests/globals are **not** imported — they are
+detected by identity against `jinja2.defaults` and handled by minijinja's native
+implementations (so undefined-value semantics like `default`/`defined` stay
+correct); only entries you added or overrode are imported, and they take priority
+over same-named `register_filter/test/function/global()` registrations.
+
+```python
+import jinja2
+env = jinja2.Environment()
+env.filters["usd"] = lambda v: f"${v:.2f}"
+tpl.render(context, jinja_env=env)
+```
+
 Engine-level extras beyond stock minijinja, so jinja2-style templates work as-is:
 
 - **str methods**: `upper/capitalize/title/strip/replace/split/join/zfill/center/
@@ -361,7 +374,7 @@ tpl.save("out.docx")
 页眉/页脚/脚注/文档属性渲染。
 
 API 要点：`register_filter/test/function/global()`（支持 kwargs）、
-`render(ctx, jinja_env=真实 jinja2 Environment)`、文档对象模型（可读写：
+`render(ctx, jinja_env=真实 jinja2 Environment)`（jinja2 内建 filters/tests/globals 由 minijinja 原生实现接管，仅导入用户新增/覆盖的条目，且同名优先级高于 register_*）、文档对象模型（可读写：
 paragraphs/tables/sections/styles/settings/comments/core_properties、
 add_paragraph/add_heading/add_picture/add_table/add_page_break/add_section、
 run/单元格赋值）、替换类 API（replace_media/replace_pic/replace_embedded/replace_zipname）、
