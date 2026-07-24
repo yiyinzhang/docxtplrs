@@ -169,6 +169,61 @@ tpl.save("out.docx")                         # or io.BytesIO()
   generate_lorem_ipsum`; exception: `TemplateError` (with `docx_context`)
 - CLI: `python -m docxtplrs template.docx data.json output.docx [-o] [-q]`
 
+### Custom filters & engine extensions
+
+Register your own jinja filters, tests, functions and globals — plain Python
+callables, with positional **and keyword** arguments supported:
+
+```python
+tpl = DocxTemplate("template.docx")
+
+# filters: {{ price|rmb }}, {{ name|shout('!') }}, {{ rows|col(name='药物名称') }}
+tpl.register_filter("rmb", lambda v: f"¥{v:.2f}")
+tpl.register_filter("shout", lambda v, punct="?": str(v).upper() + punct)
+tpl.register_filter("col", lambda rows, name: [r[name] for r in rows])
+
+# tests: {% if v is even %}
+tpl.register_test("even", lambda v: v % 2 == 0)
+
+# functions & globals: {{ add(1, 2) }}, {{ company }}
+tpl.register_function("add", lambda a, b: a + b)
+tpl.register_global("company", "ACME")
+
+# template loader for {% include %}/{% import %}
+tpl.set_template_loader(lambda name: "included {{ v }}" if name == "part" else None)
+
+# gettext i18n for {% trans %}/{% pluralize %}
+tpl.install_gettext("messages.mo")
+
+tpl.render(context)
+```
+
+You can also pass a real **jinja2 Environment** — its `autoescape`, `filters`,
+`globals`, `tests`, `trim_blocks`, `lstrip_blocks`, `keep_trailing_newline` and
+`undefined` (Chainable/Strict) settings are honored (duck-typed):
+
+```python
+import jinja2
+env = jinja2.Environment()
+env.filters["usd"] = lambda v: f"${v:.2f}"
+tpl.render(context, jinja_env=env)
+```
+
+Engine-level extras beyond stock minijinja, so jinja2-style templates work as-is:
+
+- **str methods**: `upper/capitalize/title/strip/replace/split/join/zfill/center/
+  partition/splitlines/format(...)` etc., including format specs (`{:>8}`, `{:,}`,
+  `{:.2f}`, `{:#x}`, `{:.1%}`)
+- **printf operator**: `'%s-%d' % (a, 2)`
+- **extra filters**: `filesizeformat`, `wordcount`, `center`, `forceescape`,
+  `truncate`, `xmlattr`, `wordwrap`, `urlize`, `random`, `striptags`
+- **tests**: `true/false/boolean/none/callable/mapping/sequence` (Python-faithful),
+  `eq_true/eq_false` (exact `== True`/`== False` semantics)
+- **Python object interop**: attribute/item access, method calls, iteration,
+  `__len__` truthiness, `__eq__/__lt__` comparisons, `__html__()` protocol,
+  dict insertion-order iteration, i128 big integers, `True/False/None` rendered
+  Python-style, `in` containment on dicts/lists
+
 ### Tests
 
 ```bash
@@ -311,6 +366,53 @@ paragraphs/tables/sections/styles/settings/comments/core_properties、
 add_paragraph/add_heading/add_picture/add_table/add_page_break/add_section、
 run/单元格赋值）、替换类 API（replace_media/replace_pic/replace_embedded/replace_zipname）、
 CLI（`python -m docxtplrs tpl.docx data.json out.docx -o`）。
+
+### 自定义过滤器与引擎扩展
+
+```python
+tpl = DocxTemplate("template.docx")
+
+# 过滤器（支持位置参数和关键字参数）
+tpl.register_filter("rmb", lambda v: f"¥{v:.2f}")                    # {{ price|rmb }}
+tpl.register_filter("shout", lambda v, punct="?": str(v).upper() + punct)  # {{ name|shout('!') }}
+tpl.register_filter("col", lambda rows, name: [r[name] for r in rows])     # {{ rows|col(name='药物名称') }}
+
+# 测试器 / 函数 / 全局值
+tpl.register_test("even", lambda v: v % 2 == 0)          # {% if v is even %}
+tpl.register_function("add", lambda a, b: a + b)         # {{ add(1, 2) }}
+tpl.register_global("company", "ACME")                   # {{ company }}
+
+# 模板 loader（{% include %}/{% import %}）与 gettext i18n（{% trans %}/{% pluralize %}）
+tpl.set_template_loader(lambda name: "included {{ v }}" if name == "part" else None)
+tpl.install_gettext("messages.mo")
+
+tpl.render(context)
+```
+
+也可直接传真正的 **jinja2 Environment**（自动读取其 `autoescape` / `filters` /
+`globals` / `tests` / `trim_blocks` / `lstrip_blocks` / `keep_trailing_newline` /
+`undefined`（Chainable/Strict）设置）：
+
+```python
+import jinja2
+env = jinja2.Environment()
+env.filters["usd"] = lambda v: f"${v:.2f}"
+tpl.render(context, jinja_env=env)
+```
+
+引擎层对 jinja2 的补齐（模板无需改动即可使用）：
+
+- **str 方法**：`upper/capitalize/title/strip/replace/split/join/zfill/center/
+  partition/splitlines/format(...)` 等，含格式规格（`{:>8}`、`{:,}`、`{:.2f}`、
+  `{:#x}`、`{:.1%}`）
+- **printf 运算符**：`'%s-%d' % (a, 2)`
+- **增补过滤器**：`filesizeformat`、`wordcount`、`center`、`forceescape`、
+  `truncate`、`xmlattr`、`wordwrap`、`urlize`、`random`、`striptags`
+- **增补测试**：`true/false/boolean/none/callable/mapping/sequence`（Python 语义）、
+  `eq_true/eq_false`（精确的 `== True`/`== False` 语义）
+- **Python 对象互操作**：属性/下标访问、方法调用、迭代、`__len__` 真值、
+  `__eq__/__lt__` 比较、`__html__()` 协议、dict 插入序迭代、i128 大整数、
+  `True/False/None` 按 Python 风格渲染、`in` 包含运算
 
 ### 限制
 
