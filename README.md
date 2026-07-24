@@ -85,6 +85,35 @@ uv add --editable /path/to/docxtplrs
 The wheel is a native `cp313` build. For other Python versions either build under that
 version, or set pyo3 to `abi3-py312` in `Cargo.toml` for a single portable wheel.
 
+### Building the wheel yourself
+
+```bash
+# release wheel -> target/wheels/docxtplrs-<ver>-cp313-cp313-manylinux_2_34_x86_64.whl
+uv run maturin build --release
+
+# on machines that also have conda installed:
+env -u CONDA_PREFIX uv run maturin build --release
+```
+
+Variants:
+
+```bash
+# portable abi3 wheel (one file for all CPython >= 3.12):
+#   1. in Cargo.toml set  pyo3 = { version = "0.29", features = ["abi3-py312"] }
+#   2. build
+uv run maturin build --release        # -> docxtplrs-...-cp312-abi3-....whl
+
+# wheel for a specific Python version: point maturin at that interpreter
+uv run maturin build --release -i python3.12
+
+# also emit the sdist (source distribution) alongside the wheel
+uv run maturin build --release --sdist
+
+# then install / distribute
+uv pip install target/wheels/*.whl                     # local install
+# or upload to your index, e.g.: uv publish target/wheels/*   (or: twine upload)
+```
+
 ### Quick start
 
 ```python
@@ -232,6 +261,29 @@ std::fs::write("out.docx", tpl.save_bytes()?)?;
 uv sync                                   # 本仓库内构建安装
 uv add /path/to/docxtplrs-*.whl           # 其他项目装 wheel
 uv add --editable /path/to/docxtplrs      # 或本地开发模式
+```
+
+### 构建 wheel
+
+```bash
+# release 构建（产物在 target/wheels/，含 manylinux 分发包）
+uv run maturin build --release
+
+# 本机装有 conda 时
+env -u CONDA_PREFIX uv run maturin build --release
+
+# abi3 通用 wheel（一份通吃 CPython ≥ 3.12）：
+#   先把 Cargo.toml 的 pyo3 改为 features = ["abi3-py312"]，再构建
+
+# 指定 Python 版本构建
+uv run maturin build --release -i python3.12
+
+# 同时产出 sdist
+uv run maturin build --release --sdist
+
+# 安装 / 分发
+uv pip install target/wheels/*.whl        # 本地安装
+# 或上传到自有 PyPI 索引后 uv add docxtplrs --index-url ...
 ```
 
 ```python
