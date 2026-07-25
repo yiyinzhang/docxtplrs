@@ -212,10 +212,12 @@ fn parse_bmp(blob: &[u8]) -> Result<ImageInfo, String> {
         px_height = u16::from_le_bytes([blob[20], blob[21]]) as u32;
     } else {
         px_width = le_u32(blob, 18);
-        px_height = le_u32(blob, 22) & 0x7FFFFFFF; // height can be negative (top-down)
-        if blob.len() >= 38 {
-            let xppm = le_u32(blob, 30);
-            let yppm = le_u32(blob, 34);
+        // height is signed: negative means top-down row order
+        px_height = (le_u32(blob, 22) as i32).unsigned_abs();
+        // BITMAPINFOHEADER: biXPelsPerMeter @38, biYPelsPerMeter @42
+        if blob.len() >= 46 {
+            let xppm = le_u32(blob, 38);
+            let yppm = le_u32(blob, 42);
             if xppm > 0 && yppm > 0 {
                 horz_dpi = (xppm as f64 * 0.0254).round() as u32;
                 vert_dpi = (yppm as f64 * 0.0254).round() as u32;

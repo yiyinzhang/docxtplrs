@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "docxtplrs"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "crc32fast",
  "encoding_rs",
