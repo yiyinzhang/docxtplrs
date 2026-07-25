@@ -23,10 +23,10 @@ python-docx / lxml / jinja2.
   No python-docx / lxml / jinja2 / markupsafe chain: one self-contained wheel,
   no lxml build issues on exotic platforms, no dependency-version conflicts.
 - **Fast** — in a microbenchmark (title + paragraph loop + `{%tr %}` table-row
-  loop over 10/100/400 items, 30 renders each, CPython 3.13) docxtplrs renders
-  **~5-9x faster** than docxtpl (lxml + jinja2): e.g. 2.7ms vs 24.5ms per
-  render at 100 rows, 9.1ms vs 48.1ms at 400 rows. Reproduce with your own
-  templates before quoting numbers.
+  loop over 10/100/400 items, 30 renders each, CPython 3.13, release build)
+  docxtplrs renders **~6-14x faster** than docxtpl (lxml + jinja2): e.g.
+  0.4/0.8/2.3ms vs 5.4/6.9/13.9ms per render at 10/100/400 rows. Reproduce
+  with your own templates before quoting numbers.
 - **Drop-in replacement** — the Python API and the template syntax
   (`{{ var }}`, `{%tr %}`/`{%tc %}`/`{%p %}`, `RichText`, `InlineImage`,
   `Subdoc`, ...) mirror docxtpl; migrating is usually just changing the import.
@@ -48,6 +48,33 @@ python-docx / lxml / jinja2.
   without installing python-docx.
 - **Built-in CLI** — `python -m docxtplrs template.docx data.json out.docx`
   renders a template straight from the shell, no scripting needed.
+
+---
+
+## Performance
+
+Engine-vs-engine (docxtplrs vs docxtpl + lxml + jinja2, same templates):
+**~6-14x faster** per render (see the "Fast" bullet above).
+
+On top of that, a dedicated profiling round removed the remaining internal
+hotspots (measured with the `maturin develop` debug build, CPython 3.13 —
+release builds are faster still):
+
+- **Document object model (live proxies)** — paragraph/run/table/section
+  accessors used to re-parse the whole of `word/document.xml` on *every*
+  attribute read or write. The parsed DOM is now cached and only serialized
+  back at render/save time. Reading the text of 400 paragraphs:
+  **1253ms → 3.6ms (~350x)**; 200 × `add_paragraph`: **832ms → 7ms (~120x)**;
+  200 × run-text edits: **801ms → 0.4ms (~2000x)**.
+- **Render pipeline** — every XML patch pass is now gated (a zero-match pass
+  no longer copies the full document), `InlineImage`/`Subdoc` placeholders are
+  materialized in a single scan with `Arc`-shared blobs, and the
+  table/docPr fix skips its DOM round-trip when there is nothing to fix.
+  Rendering a 2MB / 20k-paragraph document: **3384ms → 1901ms (-44%)**.
+- **Images & subdoc merge** — image-dedup hashes are cached (per-insert cost
+  no longer re-hashes all media), `.rels` parts are parsed once per part
+  instead of once per relationship, and rId/style/numId remapping runs as a
+  single scan with a map lookup instead of one full-text regex per entry.
 
 ---
 
@@ -337,9 +364,10 @@ Engine-level extras beyond stock minijinja, so jinja2-style templates work as-is
 - **零 Python 依赖**：整个引擎（docx zip/XML 处理、模板预处理、表格修复、文档对象模型）
   均为 Rust 原生实现。不再需要 python-docx / lxml / jinja2 / markupsafe 依赖链——单个自包含
   wheel，没有 lxml 在冷门平台上的编译问题，也没有依赖版本冲突的烦恼。
-- **快**：微基准测试（标题 + 段落循环 + `{%tr %}` 表格行循环，10/100/400 行，各渲染 30 次，
-  CPython 3.13）下 docxtplrs 比 docxtpl（lxml + jinja2）**快约 5-9 倍**：100 行时每次渲染
-  2.7ms vs 24.5ms，400 行时 9.1ms vs 48.1ms。引用数字前请用你自己的模板复测。
+- **快**：微基准测试（标题 + 段落循环 + `{%tr %}` 表格行循环，10/100/400 行，
+  各渲染 30 次，CPython 3.13，release 构建）下 docxtplrs 比 docxtpl（lxml + jinja2）
+  **快约 6-14 倍**：10/100/400 行时每次渲染 0.4/0.8/2.3ms vs 5.4/6.9/13.9ms。
+  引用数字前请用你自己的模板复测。
 - **无缝替代**：Python API 与模板语法（`{{ var }}`、`{%tr %}`/`{%tc %}`/`{%p %}`、
   `RichText`、`InlineImage`、`Subdoc` 等）与 docxtpl 几乎完全一致，迁移通常只需改一行 import。
   已通过 docxtpl 官方测试套件（32 个真实模板）、188 个自建测试，并有与 docxtpl 输出自动
@@ -356,6 +384,25 @@ Engine-level extras beyond stock minijinja, so jinja2-style templates work as-is
   覆盖 python-docx 常用读写路径，无需再安装 python-docx。
 - **内置 CLI**：`python -m docxtplrs template.docx data.json out.docx`，无需写脚本即可
   在命令行直接渲染模板。
+
+### 性能
+
+引擎对引擎（docxtplrs vs docxtpl + lxml + jinja2，相同模板）：每次渲染**快约 6-14 倍**
+（见上方"快"一条）。
+
+在此之上，最近一轮专项 profiling 又清掉了剩余的内部热点（数据基于 `maturin develop`
+debug 构建 + CPython 3.13 实测，release 构建会更快）：
+
+- **文档对象模型（实时代理）**：段落/表格/节等代理此前**每次**属性读写都重新全量解析
+  `word/document.xml`；现在解析结果带脏标记缓存，仅在 render/save 时写回。读取 400 个
+  段落文本：**1253ms → 3.6ms（约 350 倍）**；200 次 `add_paragraph`：**832ms → 7ms
+  （约 120 倍）**；200 次 run 文本改写：**801ms → 0.4ms（约 2000 倍）**。
+- **渲染管线**：所有 XML patch pass 加了 gate（零匹配不再全量拷贝文档），
+  `InlineImage`/`Subdoc` 占位符单遍扫描实体化且 blob 用 `Arc` 共享，表格/docPr 修复
+  在无事可修时跳过整个 DOM 往返。渲染 2MB / 2 万段落文档：**3384ms → 1901ms（-44%）**。
+- **图片与 subdoc 合并**：图片去重哈希带缓存（插一张图不再重算全部媒体的 sha1），
+  `.rels` 每个 part 只解析一次（而非每条关系一次），rId/style/numId 重映射从
+  "每条目一次全文正则"改为单遍扫描 + map 查表。
 
 ### Rust 用法
 

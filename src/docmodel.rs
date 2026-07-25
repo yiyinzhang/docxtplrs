@@ -15,16 +15,6 @@ fn py_err(e: String) -> PyErr {
 
 // ---------------- parsing helpers ----------------
 
-pub(crate) fn load_document(core: &mut TplCore) -> Result<Document, String> {
-    core.init_docx(false)?;
-    let xml = core
-        .package
-        .as_ref()
-        .and_then(|p| p.get_string(DOCUMENT_PART))
-        .ok_or_else(|| "word/document.xml not found".to_string())?;
-    Document::parse(&xml)
-}
-
 pub(crate) fn element_text(el: &Element) -> String {
     let mut s = String::new();
     collect_wt(el, &mut s);
@@ -51,7 +41,7 @@ fn collect_wt(el: &Element, out: &mut String) {
 }
 
 pub(crate) fn read_body<R>(core: &mut TplCore, f: impl FnOnce(&Element) -> R) -> Option<R> {
-    let dom = load_document(core).ok()?;
+    let dom = core.document_dom().ok()?;
     let body = dom.root.find("w:body")?;
     Some(f(body))
 }
@@ -705,7 +695,7 @@ pub(crate) fn collect_sectprs_mut<'a>(el: &'a mut Element, out: &mut Vec<&'a mut
 impl PySection {
     fn read<R>(&self, py: Python<'_>, f: impl FnOnce(&Element) -> R) -> Option<R> {
         with_core(&self.tpl, py, |core| {
-            let dom = load_document(core).ok()?;
+            let dom = core.document_dom().ok()?;
             let mut sects: Vec<&Element> = Vec::new();
             dom.root.iter_descendants("w:sectPr", &mut sects);
             sects.get(self.index).map(|s| f(s))
@@ -937,32 +927,30 @@ fn find_hdrftr_part(
     kind: &str,
 ) -> Option<(String, String)> {
     // returns (rid, part_path)
-    let doc_xml = core
-        .package
-        .as_ref()
-        .and_then(|p| p.get_string(DOCUMENT_PART))?;
-    let dom = Document::parse(&doc_xml).ok()?;
-    let mut sects: Vec<&Element> = Vec::new();
-    dom.root.iter_descendants("w:sectPr", &mut sects);
-    let sect = sects.get(section_idx)?;
-    let want_tag = if kind == "header" {
-        "w:headerReference"
-    } else {
-        "w:footerReference"
-    };
-    // use the default-type reference
-    let mut rid: Option<String> = None;
-    for c in &sect.children {
-        if let Node::Elem(e) = c {
-            if e.name == want_tag {
-                let t = e.get_attr("w:type").unwrap_or("default");
-                if t == "default" && rid.is_none() {
-                    rid = e.get_attr("r:id").map(|s| s.to_string());
+    let rid = {
+        let dom = core.document_dom().ok()?;
+        let mut sects: Vec<&Element> = Vec::new();
+        dom.root.iter_descendants("w:sectPr", &mut sects);
+        let sect = sects.get(section_idx)?;
+        let want_tag = if kind == "header" {
+            "w:headerReference"
+        } else {
+            "w:footerReference"
+        };
+        // use the default-type reference
+        let mut rid: Option<String> = None;
+        for c in &sect.children {
+            if let Node::Elem(e) = c {
+                if e.name == want_tag {
+                    let t = e.get_attr("w:type").unwrap_or("default");
+                    if t == "default" && rid.is_none() {
+                        rid = e.get_attr("r:id").map(|s| s.to_string());
+                    }
                 }
             }
         }
-    }
-    let rid = rid?;
+        rid?
+    };
     let pkg = core.package.as_ref()?;
     let rels = pkg.rels(DOCUMENT_PART);
     let rel = rels.get(&rid)?;
@@ -1262,7 +1250,7 @@ impl PyDocument {
     #[getter]
     pub fn sections(&self, py: Python<'_>) -> Vec<PySection> {
         let n = with_core(&self.tpl, py, |core| {
-            load_document(core)
+            core.document_dom()
                 .map(|dom| {
                     let mut v: Vec<&Element> = Vec::new();
                     dom.root.iter_descendants("w:sectPr", &mut v);
@@ -1309,7 +1297,7 @@ impl PyDocument {
     #[getter]
     pub fn inline_shapes(&self, py: Python<'_>) -> Vec<PyInlineShape> {
         with_core(&self.tpl, py, |core| {
-            load_document(core)
+            core.document_dom()
                 .map(|doc| {
                     let mut out = Vec::new();
                     let mut inlines: Vec<&Element> = Vec::new();

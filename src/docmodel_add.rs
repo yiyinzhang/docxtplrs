@@ -17,56 +17,36 @@ fn py_err(e: String) -> PyErr {
 
 /// Append a body-level fragment before the trailing sectPr (or </w:body>).
 pub fn append_to_body(core: &mut TplCore, fragment: &str) -> Result<(), String> {
-    core.init_docx(false)?;
-    let pkg = core.package.as_mut().ok_or("package not loaded")?;
-    let mut xml = pkg
-        .get_string(DOCUMENT_PART)
-        .ok_or_else(|| "word/document.xml not found".to_string())?;
-    if let Some(sp) = xml.rfind("<w:sectPr") {
-        xml.insert_str(sp, fragment);
-    } else if let Some(b) = xml.rfind("</w:body>") {
-        xml.insert_str(b, fragment);
-    } else {
-        return Err("no w:body found".to_string());
-    }
-    let enc = pkg.encoding_of(DOCUMENT_PART);
-    pkg.set(DOCUMENT_PART, crate::package::encode_part(&xml, &enc));
-    Ok(())
+    // parse the fragment through a wrapper root; xmldom is name-agnostic
+    let wrap = Document::parse(&format!("<w:__wrap>{}</w:__wrap>", fragment))?;
+    let mut nodes = wrap.root.children;
+    mutate_document(core, |body| {
+        let pos = body
+            .children
+            .iter()
+            .rposition(|c| matches!(c, Node::Elem(e) if e.name == "w:sectPr"))
+            .unwrap_or(body.children.len());
+        for (i, child) in nodes.drain(..).enumerate() {
+            body.children.insert(pos + i, child);
+        }
+    })
 }
 
-/// Parse document.xml, mutate the body element, serialize back.
+/// Mutate the body element of the cached document DOM in place; the change
+/// is serialized back into the package on the next flush (render/save/etc).
 pub fn mutate_document(
     core: &mut TplCore,
     f: impl FnOnce(&mut Element),
 ) -> Result<(), String> {
-    core.init_docx(false)?;
-    let pkg = core.package.as_mut().ok_or("package not loaded")?;
-    let xml = pkg
-        .get_string(DOCUMENT_PART)
-        .ok_or_else(|| "word/document.xml not found".to_string())?;
-    let enc = pkg.encoding_of(DOCUMENT_PART);
-    let dom = Document::parse(&xml)?;
-    let mut body = dom
-        .root
-        .find("w:body")
-        .ok_or_else(|| "no w:body".to_string())?
-        .clone();
-    f(&mut body);
-    let mut new_dom = dom;
-    fn replace_body(el: &mut Element, body: &Element) {
-        for c in el.children.iter_mut() {
-            if let Node::Elem(e) = c {
-                if e.name == "w:body" {
-                    *e = body.clone();
-                    return;
-                }
-                replace_body(e, body);
-            }
-        }
+    {
+        let dom = core.document_dom()?;
+        let body = dom
+            .root
+            .find_mut("w:body")
+            .ok_or_else(|| "no w:body".to_string())?;
+        f(body);
     }
-    replace_body(&mut new_dom.root, &body);
-    let out = new_dom.serialize();
-    pkg.set(DOCUMENT_PART, crate::package::encode_part(&out, &enc));
+    core.mark_doc_dirty();
     Ok(())
 }
 
@@ -263,7 +243,7 @@ pub fn doc_add_section(doc: &PyDocument, py: Python<'_>, start_type: u32) -> PyR
         })?;
         // index of the new section = previous count
         let n = {
-            let dom = crate::docmodel::load_document(core)?;
+            let dom = core.document_dom()?;
             let mut v: Vec<&crate::xmldom::Element> = Vec::new();
             dom.root.iter_descendants("w:sectPr", &mut v);
             v.len()

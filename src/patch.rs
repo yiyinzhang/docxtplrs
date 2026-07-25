@@ -3,6 +3,7 @@
 use fancy_regex::{Captures, Regex};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// Timing instrumentation, enabled with PATCH_TIMING=1.
 macro_rules! timed {
@@ -21,23 +22,28 @@ thread_local! {
     // here are fixed literals, so cache them per thread. Without this cache,
     // resolve_listing recompiles several regexes per paragraph/run, which
     // dominates render time for table-row-heavy templates (~ms per row).
-    static RE_CACHE: RefCell<HashMap<String, Regex>> = RefCell::new(HashMap::new());
+    // Rc-shared: cloning a hit is a refcount bump, and callers may hold the
+    // value across re-entrant cache lookups (sub() callbacks recurse).
+    static RE_CACHE: RefCell<HashMap<String, Rc<Regex>>> = RefCell::new(HashMap::new());
 }
 
-fn re(pattern: &str) -> Regex {
+pub(crate) fn re(pattern: &str) -> Rc<Regex> {
     if std::env::var("PATCH_DEBUG").is_ok() {
         eprintln!("[patch] running: {}", pattern);
     }
     RE_CACHE.with(|c| {
-        c.borrow_mut()
-            .entry(pattern.to_string())
-            .or_insert_with(|| {
-                fancy_regex::RegexBuilder::new(pattern)
-                    .backtrack_limit(50_000_000)
-                    .build()
-                    .unwrap_or_else(|e| panic!("invalid regex {}: {}", pattern, e))
-            })
-            .clone()
+        let mut map = c.borrow_mut();
+        if let Some(r) = map.get(pattern) {
+            return r.clone();
+        }
+        let r = Rc::new(
+            fancy_regex::RegexBuilder::new(pattern)
+                .backtrack_limit(50_000_000)
+                .build()
+                .unwrap_or_else(|e| panic!("invalid regex {}: {}", pattern, e)),
+        );
+        map.insert(pattern.to_string(), r.clone());
+        r
     })
 }
 
@@ -163,6 +169,9 @@ pub fn sub_str(pattern: &str, replacement: &str, text: &str) -> String {
 /// tags work there). `&lt;` `&gt;` `&amp;` are intentionally kept escaped,
 /// matching lxml's serialization behavior.
 pub fn decode_text_entities(xml: &str) -> String {
+    if !xml.contains('&') {
+        return xml.to_string();
+    }
     sub(
         r"(?<=>)([^<>]*)(?=<)",
         |m| decode_entities_keep_markup(m.get(0).unwrap().as_str()),
@@ -230,7 +239,12 @@ pub fn patch_xml(src_xml: &str) -> String {
     // replace {<something>{ by {{   ( works with {{ }} {% and %} {# and #})
     // (hand-rolled linear scan; fancy_regex spends ~20ms/500KB here even when
     // nothing matches)
-    let mut xml = timed!("merge_split_braces", merge_split_braces_scan(src_xml));
+    // gate: a match requires a delimiter directly followed by a tag
+    let mut xml = if contains_any(src_xml, &["{<", "%<", "}<", "#<"]) {
+        timed!("merge_split_braces", merge_split_braces_scan(src_xml))
+    } else {
+        src_xml.to_string()
+    };
 
     // replace {{<some tags>jinja2 stuff<some other tags>}} by {{jinja2 stuff}}
     // (gated: the pattern can only match where a jinja open marker exists)
@@ -301,8 +315,11 @@ pub fn patch_xml(src_xml: &str) -> String {
 
     // ensure space preservation (hand-rolled linear scan; the original
     // tempered-dot regex overflows the backtrack stack on large documents)
-    xml = timed!("space_preserve", space_preserve_scan(&xml));
-    xml = timed!("richtext_tag", sub(
+    if xml.contains("<w:t>") && contains_any(&xml, &["{{", "{%"]) {
+        xml = timed!("space_preserve", space_preserve_scan(&xml));
+    }
+    if contains_any(&xml, &["{{r", "{%r"]) {
+        xml = timed!("richtext_tag", sub(
         r"(?s)(\{\{r\s.*?\}\}|\{%r\s.*?\%\})",
         |m| {
             format!(
@@ -311,13 +328,18 @@ pub fn patch_xml(src_xml: &str) -> String {
             )
         },
         &xml,
-    ));
+        ));
+    }
 
     // {%- will merge with previous paragraph text (hand-rolled; the
     // original regex spans paragraphs and overflows the backtrack stack)
-    xml = timed!("dash_merge_prev", dash_merge_prev_scan(&xml));
+    if xml.contains("{%-") {
+        xml = timed!("dash_merge_prev", dash_merge_prev_scan(&xml));
+    }
     // -%} will merge with next paragraph text
-    xml = timed!("dash_merge_next", dash_merge_next_scan(&xml));
+    if xml.contains("-%}") {
+        xml = timed!("dash_merge_next", dash_merge_next_scan(&xml));
+    }
 
     // replace into xml code the row/paragraph/run containing
     // {%y xxx %} / {{y xxx}} / {#y xxx #} template tag by the tag alone
@@ -325,10 +347,17 @@ pub fn patch_xml(src_xml: &str) -> String {
     // original tempered-dot regex overflows the backtrack stack on large
     // documents)
     for y in ["tr", "tc", "p", "r"] {
-        xml = timed!("element_tag_scan", element_tag_scan(&xml, y, false));
+        let m1 = format!("{{{{{} ", y);
+        let m2 = format!("{{%{} ", y);
+        if xml.contains(&m1) || xml.contains(&m2) {
+            xml = timed!("element_tag_scan", element_tag_scan(&xml, y, false));
+        }
     }
     for y in ["tr", "tc", "p"] {
-        xml = timed!("element_tag_scan", element_tag_scan(&xml, y, true));
+        let m = format!("{{#{} ", y);
+        if xml.contains(&m) {
+            xml = timed!("element_tag_scan", element_tag_scan(&xml, y, true));
+        }
     }
 
     // add vMerge
@@ -429,6 +458,11 @@ fn sub_first(pattern: &str, replacement: &str, text: &str) -> String {
 
 /// Port of DocxTemplate.resolve_listing
 pub fn resolve_listing(xml: &str) -> String {
+    // resolve_text only rewrites \t, \n, \x07 and \x0c; without any of them
+    // the whole pass is the identity, so skip the full-document copy
+    if !xml.contains(['\t', '\n', '\u{7}', '\u{c}']) {
+        return xml.to_string();
+    }
     fn resolve_text(run_properties: &str, paragraph_properties: &str, m: &Captures) -> String {
         let mut s = m.get(0).unwrap().as_str().to_string();
         s = s.replace(
@@ -596,13 +630,13 @@ pub fn element_tag_scan(xml: &str, y: &str, comment: bool) -> String {
     let mut i = 0usize;
 
     // markers to look for inside the element, e.g. "{%tr " / "{{tr " / "{#tr "
+    let m_var = format!("{{{{{} ", y);
+    let m_stmt = format!("{{%{} ", y);
+    let m_comment = format!("{{#{} ", y);
     let markers: Vec<(&str, &str)> = if comment {
-        vec![(Box::leak(format!("{{#{} ", y).into_boxed_str()), "#}")]
+        vec![(m_comment.as_str(), "#}")]
     } else {
-        vec![
-            (Box::leak(format!("{{{{{} ", y).into_boxed_str()), "}}"),
-            (Box::leak(format!("{{%{} ", y).into_boxed_str()), "%}"),
-        ]
+        vec![(m_var.as_str(), "}}"), (m_stmt.as_str(), "%}")]
     };
 
     while i < xml.len() {

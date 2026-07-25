@@ -89,16 +89,9 @@ pub fn subdoc_xml(tpl: &mut TplCore, subdoc_bytes: &[u8]) -> Result<String, Stri
         rid_map.insert(rel.id.clone(), new_rid);
     }
 
-    // apply rId remapping in the body xml
-    for (old, new) in &rid_map {
-        if old != new {
-            let pat = format!(
-                r#"((?:r|o):(?:embed|id|link|pict|dm|lo|qs|cs|relid|rel)="){}""#,
-                fancy_regex::escape(old)
-            );
-            body_xml = psub(&pat, |m| format!("{}{}\"", m.get(1).unwrap().as_str(), new), &body_xml);
-        }
-    }
+    // apply rId remapping in the body xml (single pass over the xml,
+    // independent of how many ids were remapped)
+    body_xml = remap_rids(&body_xml, &rid_map);
 
     // renumber bookmarks so ids don't collide with the master document
     body_xml = renumber_bookmarks(tpl, body_xml);
@@ -116,6 +109,26 @@ pub fn subdoc_xml(tpl: &mut TplCore, subdoc_bytes: &[u8]) -> Result<String, Stri
     body_xml = merge_footnotes(tpl, &sub_pkg, body_xml)?;
 
     Ok(body_xml)
+}
+
+/// Apply an rId remap with a single regex pass over the xml (previously one
+/// full scan per remapped id). Attribute values not present in the map are
+/// left untouched, which also preserves the old `old != new` skip.
+fn remap_rids(xml: &str, map: &HashMap<String, String>) -> String {
+    if map.is_empty() {
+        return xml.to_string();
+    }
+    psub(
+        r#"((?:r|o):(?:embed|id|link|pict|dm|lo|qs|cs|relid|rel)=")([^"]+)""#,
+        |m| {
+            let old = m.get(2).unwrap().as_str();
+            match map.get(old) {
+                Some(new) if new != old => format!("{}{}\"", m.get(1).unwrap().as_str(), new),
+                _ => m.get(0).unwrap().as_str().to_string(),
+            }
+        },
+        xml,
+    )
 }
 
 /// Wrap a body fragment in a root element for DOM parsing.
@@ -154,14 +167,18 @@ fn restart_first_numbering(tpl: &mut TplCore, body_xml: String) -> Result<String
     let styles_xml = pkg.get_string("word/styles.xml").unwrap_or_default();
     let styles_dom = Document::parse(&styles_xml).ok();
 
-    // helper: style element lookup in master styles
-    let find_style = |style_id: &str| -> Option<Element> {
-        let dom = styles_dom.as_ref()?;
-        let mut out: Vec<Element> = Vec::new();
-        collect_style_elems(&dom.root, &mut out);
-        out.into_iter()
-            .find(|e| e.get_attr("w:styleId") == Some(style_id))
-    };
+    // style lookup table, built once (was: re-collected and deep-cloned
+    // from the styles part for every paragraph)
+    let mut style_elems: Vec<&Element> = Vec::new();
+    if let Some(d) = styles_dom.as_ref() {
+        collect_style_elems(&d.root, &mut style_elems);
+    }
+    let mut style_by_id: HashMap<String, &Element> = HashMap::new();
+    for e in style_elems {
+        if let Some(id) = e.get_attr("w:styleId") {
+            style_by_id.entry(id.to_string()).or_insert(e);
+        }
+    }
 
     let mut restarted: HashSet<String> = HashSet::new();
     let mut new_nums: Vec<Element> = Vec::new();
@@ -178,6 +195,32 @@ fn restart_first_numbering(tpl: &mut TplCore, body_xml: String) -> Result<String
     let mut max_abs: i64 = -1;
     find_max_numbering(&numbering_dom.root, &mut max_abs, &mut max_num);
     let mut next_num_id = max_num + 1;
+
+    // num / abstractNum lookup tables, built once (first match wins, like
+    // the previous per-paragraph linear find)
+    let mut num_by_id: HashMap<i64, &Element> = HashMap::new();
+    let mut abs_by_id: HashMap<i64, &Element> = HashMap::new();
+    {
+        let mut nums: Vec<&Element> = Vec::new();
+        numbering_dom.root.iter_descendants("w:num", &mut nums);
+        for e in nums {
+            if let Some(id) = e.get_attr("w:numId").and_then(|v| v.parse::<i64>().ok()) {
+                num_by_id.entry(id).or_insert(e);
+            }
+        }
+        let mut abss: Vec<&Element> = Vec::new();
+        numbering_dom
+            .root
+            .iter_descendants("w:abstractNum", &mut abss);
+        for e in abss {
+            if let Some(id) = e
+                .get_attr("w:abstractNumId")
+                .and_then(|v| v.parse::<i64>().ok())
+            {
+                abs_by_id.entry(id).or_insert(e);
+            }
+        }
+    }
 
     let para_count = dom
         .root
@@ -204,7 +247,7 @@ fn restart_first_numbering(tpl: &mut TplCore, body_xml: String) -> Result<String
         if restarted.contains(&style_id) {
             continue;
         }
-        let Some(style_el) = find_style(&style_id) else {
+        let Some(style_el) = style_by_id.get(style_id.as_str()) else {
             continue;
         };
         if style_el.find("w:outlineLvl").is_some() {
@@ -223,7 +266,7 @@ fn restart_first_numbering(tpl: &mut TplCore, body_xml: String) -> Result<String
         let Some(num_id) = num_id else { continue };
 
         // locate the num + abstractNum in master numbering
-        let Some(num_el) = find_num_by_id(&numbering_dom.root, num_id) else {
+        let Some(num_el) = num_by_id.get(&num_id) else {
             continue;
         };
         let Some(anum_id) = num_el
@@ -232,7 +275,7 @@ fn restart_first_numbering(tpl: &mut TplCore, body_xml: String) -> Result<String
         else {
             continue;
         };
-        let Some(anum_el) = find_abstract_by_id(&numbering_dom.root, anum_id) else {
+        let Some(anum_el) = abs_by_id.get(&anum_id) else {
             continue;
         };
         // do not restart bullets
@@ -248,7 +291,7 @@ fn restart_first_numbering(tpl: &mut TplCore, body_xml: String) -> Result<String
         }
 
         // create the new num with startOverride=1
-        let mut new_num = num_el.clone();
+        let mut new_num = (*num_el).clone();
         new_num.set_attr("w:numId", &next_num_id.to_string());
         let mut lvl_override = Element::new("w:lvlOverride");
         lvl_override.set_attr("w:ilvl", "0");
@@ -336,30 +379,6 @@ fn nth_direct_para_mut(body: &mut Element, n: usize) -> Option<&mut Element> {
         .nth(n)
 }
 
-fn find_num_by_id(root: &Element, num_id: i64) -> Option<Element> {
-    let mut out: Vec<&Element> = Vec::new();
-    root.iter_descendants("w:num", &mut out);
-    out.into_iter()
-        .find(|e| {
-            e.get_attr("w:numId")
-                .and_then(|v| v.parse::<i64>().ok())
-                == Some(num_id)
-        })
-        .cloned()
-}
-
-fn find_abstract_by_id(root: &Element, id: i64) -> Option<Element> {
-    let mut out: Vec<&Element> = Vec::new();
-    root.iter_descendants("w:abstractNum", &mut out);
-    out.into_iter()
-        .find(|e| {
-            e.get_attr("w:abstractNumId")
-                .and_then(|v| v.parse::<i64>().ok())
-                == Some(id)
-        })
-        .cloned()
-}
-
 fn add_image_part(pkg: &mut Package, blob: &[u8], target_part: &str) -> (String, String) {
     let (ext, content_type) = match ImageInfo::parse(blob) {
         Ok(info) => (info.default_ext.to_string(), info.content_type.to_string()),
@@ -407,15 +426,7 @@ fn copy_part_recursive(master: &mut Package, sub: &Package, part: &str, depth: u
             };
             rid_map.insert(rel.id.clone(), new_rid);
         }
-        for (old, new) in &rid_map {
-            if old != new {
-                let pat = format!(
-                    r#"((?:r|o):(?:embed|id|link|pict|dm|lo|qs|cs|relid|rel)="){}""#,
-                    fancy_regex::escape(old)
-                );
-                xml = psub(&pat, |m| format!("{}{}\"", m.get(1).unwrap().as_str(), new), &xml);
-            }
-        }
+        xml = remap_rids(&xml, &rid_map);
     }
 
     master.set(part, xml.into_bytes());
@@ -452,12 +463,13 @@ fn dissolve_property_fields(mut xml: String) -> String {
 
 /// Renumber w:bookmarkStart/w:bookmarkEnd ids past the master's max id.
 fn renumber_bookmarks(tpl: &mut TplCore, mut body_xml: String) -> String {
+    let _ = tpl.flush_doc();
     let master_xml = tpl
         .package
         .as_ref()
         .and_then(|p| p.get_string(DOCUMENT_PART))
         .unwrap_or_default();
-    let id_re = fancy_regex::Regex::new(r#"<w:bookmarkStart[^>]* w:id="(\d+)""#).unwrap();
+    let id_re = crate::patch::re(r#"<w:bookmarkStart[^>]* w:id="(\d+)""#);
     let mut max_id: i64 = 0;
     for cap in id_re.captures_iter(&master_xml).flatten() {
         if let Ok(n) = cap[1].parse::<i64>() {
@@ -527,17 +539,16 @@ fn merge_styles(
 
     // collect style ids referenced from the subdoc body
     let mut referenced: HashSet<String> = HashSet::new();
-    let style_ref_re =
-        fancy_regex::Regex::new(r#"w:(?:pStyle|rStyle|tblStyle) w:val="([^"]+)""#).unwrap();
+    let style_ref_re = crate::patch::re(r#"w:(?:pStyle|rStyle|tblStyle) w:val="([^"]+)""#);
     for cap in style_ref_re.captures_iter(body_xml).flatten() {
         referenced.insert(cap[1].to_string());
     }
 
-    let mut sub_styles: Vec<Element> = Vec::new();
+    let mut sub_styles: Vec<&Element> = Vec::new();
     collect_style_elems(&sub_dom.root, &mut sub_styles);
     let style_by_id: HashMap<String, &Element> = sub_styles
         .iter()
-        .filter_map(|e| e.get_attr("w:styleId").map(|id| (id.to_string(), e)))
+        .filter_map(|e| e.get_attr("w:styleId").map(|id| (id.to_string(), *e)))
         .collect();
 
     // expand referenced set with basedOn / link / next chains
@@ -573,11 +584,11 @@ fn merge_styles(
         Err(_) => return Ok(renames),
     };
 
-    let mut master_styles: Vec<Element> = Vec::new();
+    let mut master_styles: Vec<&Element> = Vec::new();
     collect_style_elems(&master_dom.root, &mut master_styles);
     let master_by_id: HashMap<String, &Element> = master_styles
         .iter()
-        .filter_map(|e| e.get_attr("w:styleId").map(|id| (id.to_string(), e)))
+        .filter_map(|e| e.get_attr("w:styleId").map(|id| (id.to_string(), *e)))
         .collect();
 
     // decide renames for conflicting definitions
@@ -589,7 +600,7 @@ fn merge_styles(
         if !referenced.contains(&id) {
             continue;
         }
-        if let Some(master_st) = master_by_id.get(&id) {
+        if let Some(&master_st) = master_by_id.get(&id) {
             if !elements_equivalent(st, master_st) {
                 // conflict: rename like docxcompose (id_1, id_2, ...)
                 let mut n = 1;
@@ -603,15 +614,25 @@ fn merge_styles(
         }
     }
 
-    // apply renames to body xml and to merged styles' references
+    // apply renames to body xml and to merged styles' references (single
+    // pass; previously one full scan per renamed style)
     if !renames.is_empty() {
-        for (old, new) in &renames {
-            let pat = format!(
-                r#"(w:(?:pStyle|rStyle|tblStyle|basedOn|link|next) w:val="){}(")"#,
-                fancy_regex::escape(old)
-            );
-            *body_xml = psub(&pat, |m| format!("{}{}{}", m.get(1).unwrap().as_str(), new, m.get(2).unwrap().as_str()), body_xml);
-        }
+        *body_xml = psub(
+            r#"(w:(?:pStyle|rStyle|tblStyle|basedOn|link|next) w:val=")([^"]+)(")"#,
+            |m| {
+                let old = m.get(2).unwrap().as_str();
+                match renames.get(old) {
+                    Some(new) => format!(
+                        "{}{}{}",
+                        m.get(1).unwrap().as_str(),
+                        new,
+                        m.get(3).unwrap().as_str()
+                    ),
+                    None => m.get(0).unwrap().as_str().to_string(),
+                }
+            },
+            body_xml,
+        );
     }
 
     // append referenced styles that the master does not have (with renames applied)
@@ -623,10 +644,10 @@ fn merge_styles(
         if !referenced.contains(&id) {
             continue;
         }
-        if master_by_id.contains_key(&id) && !renames.contains_key(&id) {
+        if existing_ids.contains(&id) && !renames.contains_key(&id) {
             continue; // identical definition already present
         }
-        let mut st = st;
+        let mut st = (*st).clone();
         if let Some(new_id) = renames.get(&id) {
             st.set_attr("w:styleId", new_id);
             // remap internal references
@@ -661,11 +682,11 @@ fn elements_equivalent(a: &Element, b: &Element) -> bool {
     sa == sb
 }
 
-fn collect_style_elems(el: &Element, out: &mut Vec<Element>) {
+fn collect_style_elems<'a>(el: &'a Element, out: &mut Vec<&'a Element>) {
     for c in &el.children {
         if let Node::Elem(e) = c {
             if e.name == "w:style" {
-                out.push(e.clone());
+                out.push(e);
             }
         }
     }
@@ -748,10 +769,24 @@ fn merge_numbering(
     let xml = master_dom.serialize();
     pkg.set("word/numbering.xml", xml.into_bytes());
 
-    // remap numId references in the sub body xml
-    for (old, new) in &num_map {
-        let pat = format!(r#"(<w:numId w:val="){}(")"#, old);
-        body_xml = psub(&pat, |m: &fancy_regex::Captures| format!("{}{}{}", m.get(1).unwrap().as_str(), new, m.get(2).unwrap().as_str()), &body_xml);
+    // remap numId references in the sub body xml (single pass)
+    if !num_map.is_empty() {
+        body_xml = psub(
+            r#"(<w:numId w:val=")(\d+)(")"#,
+            |m| {
+                let old: i64 = m.get(2).unwrap().as_str().parse().unwrap_or(-1);
+                match num_map.get(&old) {
+                    Some(new) => format!(
+                        "{}{}{}",
+                        m.get(1).unwrap().as_str(),
+                        new,
+                        m.get(3).unwrap().as_str()
+                    ),
+                    None => m.get(0).unwrap().as_str().to_string(),
+                }
+            },
+            &body_xml,
+        );
     }
 
     Ok(body_xml)
@@ -856,33 +891,22 @@ fn merge_footnotes(
             };
             rid_map.insert(rel.id.clone(), new_rid);
         }
-        for (old, new) in &rid_map {
-            if old != new {
-                let pat = format!(
-                    r#"((?:r|o):(?:embed|id|link|pict|relid|rel)=\"){}\""#,
-                    fancy_regex::escape(old)
-                );
-                sub_fn_xml = psub(&pat, |m| format!("{}{}\"", m.get(1).unwrap().as_str(), new), &sub_fn_xml);
-            }
-        }
+        sub_fn_xml = remap_rids(&sub_fn_xml, &rid_map);
     }
     // quick check: are there real footnotes (id > 1)?
     let sub_dom = match Document::parse(&sub_fn_xml) {
         Ok(d) => d,
         Err(_) => return Ok(body_xml),
     };
-    let mut sub_notes: Vec<Element> = Vec::new();
+    let mut sub_notes: Vec<&Element> = Vec::new();
     collect_footnotes(&sub_dom.root, &mut sub_notes);
-    let real_notes: Vec<&Element> = sub_notes
-        .iter()
-        .filter(|e| {
-            e.get_attr("w:id")
-                .and_then(|v| v.parse::<i64>().ok())
-                .map(|id| id > 1)
-                .unwrap_or(false)
-        })
-        .collect();
-    if real_notes.is_empty() {
+    let has_real = sub_notes.iter().any(|e| {
+        e.get_attr("w:id")
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|id| id > 1)
+            .unwrap_or(false)
+    });
+    if !has_real {
         return Ok(body_xml);
     }
 
@@ -901,7 +925,7 @@ fn merge_footnotes(
         Ok(d) => d,
         Err(_) => return Ok(body_xml),
     };
-    let mut master_notes: Vec<Element> = Vec::new();
+    let mut master_notes: Vec<&Element> = Vec::new();
     collect_footnotes(&master_dom.root, &mut master_notes);
     let max_id = master_notes
         .iter()
@@ -915,7 +939,7 @@ fn merge_footnotes(
     for note in &sub_notes {
         if let Some(id) = note.get_attr("w:id").and_then(|v| v.parse::<i64>().ok()) {
             if id > 1 {
-                let mut n = note.clone();
+                let mut n = (*note).clone();
                 let new_id = id + offset;
                 n.set_attr("w:id", &new_id.to_string());
                 id_map.insert(id, new_id);
@@ -926,16 +950,30 @@ fn merge_footnotes(
     let xml = master_dom.serialize();
     pkg.set("word/footnotes.xml", xml.into_bytes());
 
-    for (old, new) in &id_map {
-        let pat = format!(r#"(<w:footnoteReference w:id="){}(")"#, old);
-        body_xml = psub(&pat, |m: &fancy_regex::Captures| format!("{}{}{}", m.get(1).unwrap().as_str(), new, m.get(2).unwrap().as_str()), &body_xml);
+    if !id_map.is_empty() {
+        body_xml = psub(
+            r#"(<w:footnoteReference w:id=")(\d+)(")"#,
+            |m| {
+                let old: i64 = m.get(2).unwrap().as_str().parse().unwrap_or(-1);
+                match id_map.get(&old) {
+                    Some(new) => format!(
+                        "{}{}{}",
+                        m.get(1).unwrap().as_str(),
+                        new,
+                        m.get(3).unwrap().as_str()
+                    ),
+                    None => m.get(0).unwrap().as_str().to_string(),
+                }
+            },
+            &body_xml,
+        );
     }
     Ok(body_xml)
 }
 
-fn collect_footnotes(el: &Element, out: &mut Vec<Element>) {
+fn collect_footnotes<'a>(el: &'a Element, out: &mut Vec<&'a Element>) {
     if el.name == "w:footnote" {
-        out.push(el.clone());
+        out.push(el);
         return;
     }
     for c in &el.children {

@@ -12,10 +12,11 @@ pub const DOCUMENT_PART: &str = "word/document.xml";
 
 /// A context value whose XML must be materialized lazily (only if actually
 /// printed by the template), like docxtpl's __str__-based InlineImage/Subdoc.
+/// Blob fields are Arc-shared so registering/cloning a Deferred is O(1).
 #[derive(Debug, Clone)]
 pub enum Deferred {
     Image {
-        blob: Vec<u8>,
+        blob: std::sync::Arc<[u8]>,
         filename: Option<String>,
         width: Option<i64>,
         height: Option<i64>,
@@ -24,10 +25,10 @@ pub enum Deferred {
         descr: Option<String>,
     },
     Subdoc {
-        bytes: Option<Vec<u8>>,
+        bytes: Option<std::sync::Arc<[u8]>>,
     },
     SubdocBlocks {
-        blocks: Vec<crate::subdocbuilder::Block>,
+        blocks: std::sync::Arc<Vec<crate::subdocbuilder::Block>>,
     },
 }
 
@@ -63,6 +64,13 @@ pub struct TplCore {
     pub gettext_catalog: Option<std::sync::Arc<crate::gettext::Catalog>>,
     /// context lines of the last template error (docx_context attribute)
     pub last_error_context: Vec<String>,
+    /// cached parse of word/document.xml for the docmodel facade
+    pub doc_cache: Option<crate::xmldom::Document>,
+    /// doc_cache has unpersisted mutations
+    pub doc_dirty: bool,
+    /// per-part next wp:docPr shape id (avoids rescanning the part xml for
+    /// every inserted image; seeded from the part's current max id)
+    pub next_shape_ids: HashMap<String, u32>,
 }
 
 /// jinja2 environment options supported via duck-typing.
@@ -94,8 +102,51 @@ impl TplCore {
         if self.package.is_none() || (self.is_rendered && reload) {
             self.package = Some(Package::from_bytes(&self.original_bytes)?);
             self.is_rendered = false;
+            self.invalidate_doc();
         }
         Ok(())
+    }
+
+    /// Parsed word/document.xml for the docmodel facade, parsed once and
+    /// cached; reparsed after invalidation, on parse failure retried per call.
+    pub fn document_dom(&mut self) -> Result<&mut crate::xmldom::Document, String> {
+        self.init_docx(false)?;
+        if self.doc_cache.is_none() {
+            let xml = self
+                .package
+                .as_ref()
+                .and_then(|p| p.get_string(DOCUMENT_PART))
+                .ok_or_else(|| "word/document.xml not found".to_string())?;
+            self.doc_cache = Some(crate::xmldom::Document::parse(&xml)?);
+        }
+        Ok(self.doc_cache.as_mut().unwrap())
+    }
+
+    pub fn mark_doc_dirty(&mut self) {
+        self.doc_dirty = true;
+    }
+
+    /// Serialize the cached document DOM back into the package if mutated.
+    pub fn flush_doc(&mut self) -> Result<(), String> {
+        if !self.doc_dirty {
+            return Ok(());
+        }
+        let Some(dom) = &self.doc_cache else {
+            self.doc_dirty = false;
+            return Ok(());
+        };
+        let out = dom.serialize();
+        let pkg = self.pkg()?;
+        let enc = pkg.encoding_of(DOCUMENT_PART);
+        pkg.set(DOCUMENT_PART, crate::package::encode_part(&out, &enc));
+        self.doc_dirty = false;
+        Ok(())
+    }
+
+    /// Drop the cached document DOM (external code replaced the part).
+    pub fn invalidate_doc(&mut self) {
+        self.doc_cache = None;
+        self.doc_dirty = false;
     }
 
     fn pkg(&mut self) -> Result<&mut Package, String> {
@@ -104,6 +155,7 @@ impl TplCore {
 
     pub fn get_xml(&mut self) -> Result<String, String> {
         self.init_docx(false)?;
+        self.flush_doc()?;
         self.pkg()?
             .get_string(DOCUMENT_PART)
             .ok_or_else(|| "word/document.xml not found".to_string())
@@ -113,6 +165,8 @@ impl TplCore {
 
     pub fn render(&mut self, autoescape: bool, make_ctx: &CtxFn) -> Result<(), String> {
         self.render_init()?;
+        // persist docmodel edits made since the last render/reload
+        self.flush_doc()?;
 
         // Body
         let src = self.pkg()?.get_string(DOCUMENT_PART)
@@ -174,6 +228,7 @@ impl TplCore {
         self.deferred_by_oid.clear();
         self.used_subdoc = false;
         self.last_error_context.clear();
+        self.next_shape_ids.clear();
         Ok(())
     }
 
@@ -209,49 +264,77 @@ impl TplCore {
     }
 
     /// Replace deferred-value placeholders actually printed by the template
-    /// with their materialized XML for the given part.
-    pub fn materialize_deferred(&mut self, part: &str, mut xml: String) -> Result<String, String> {
-        for idx in 0..self.deferred.len() {
-            let token = deferred_token(idx);
-            if !xml.contains(&token) {
-                continue;
-            }
-            let deferred = self.deferred[idx].clone();
-            let replacement = match deferred {
-                Deferred::Image {
-                    blob,
-                    filename,
-                    width,
-                    height,
-                    anchor,
-                    title,
-                    descr,
-                } => crate::inline_image::inline_image_xml(
-                    self,
-                    part,
-                    &blob,
-                    filename.as_deref(),
-                    width,
-                    height,
-                    anchor.as_deref(),
-                    title.as_deref(),
-                    descr.as_deref(),
-                )?,
-                Deferred::Subdoc { bytes } => {
-                    self.used_subdoc = true;
-                    match bytes {
-                        Some(b) => crate::subdoc::subdoc_xml(self, &b)?,
-                        None => String::new(),
-                    }
-                }
-                Deferred::SubdocBlocks { blocks } => {
-                    self.used_subdoc = true;
-                    crate::subdocbuilder::serialize_blocks(self, part, &blocks)?
-                }
-            };
-            xml = xml.replace(&token, &replacement);
+    /// with their materialized XML for the given part. Single pass over the
+    /// xml; each deferred value is materialized at most once per part.
+    pub fn materialize_deferred(&mut self, part: &str, xml: String) -> Result<String, String> {
+        if self.deferred.is_empty() || !xml.contains('\u{1}') {
+            return Ok(xml);
         }
-        Ok(xml)
+        let mut done: Vec<Option<String>> = (0..self.deferred.len()).map(|_| None).collect();
+        let mut out = String::with_capacity(xml.len());
+        let mut rest = xml.as_str();
+        while let Some(start) = rest.find('\u{1}') {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + 1..];
+            let parsed = after.find('\u{1}').and_then(|e| {
+                after[..e]
+                    .strip_prefix("DTPLD")
+                    .and_then(|d| d.parse::<usize>().ok())
+                    .map(|idx| (idx, e))
+            });
+            match parsed {
+                Some((idx, end)) if idx < self.deferred.len() => {
+                    if done[idx].is_none() {
+                        done[idx] = Some(self.materialize_one(part, idx)?);
+                    }
+                    out.push_str(done[idx].as_ref().unwrap());
+                    rest = &after[end + 1..];
+                }
+                _ => {
+                    out.push('\u{1}');
+                    rest = after;
+                }
+            }
+        }
+        out.push_str(rest);
+        Ok(out)
+    }
+
+    /// Materialize one deferred value (cheap to call: the Deferred clone only
+    /// bumps Arc refcounts).
+    fn materialize_one(&mut self, part: &str, idx: usize) -> Result<String, String> {
+        match self.deferred[idx].clone() {
+            Deferred::Image {
+                blob,
+                filename,
+                width,
+                height,
+                anchor,
+                title,
+                descr,
+            } => crate::inline_image::inline_image_xml(
+                self,
+                part,
+                &blob,
+                filename.as_deref(),
+                width,
+                height,
+                anchor.as_deref(),
+                title.as_deref(),
+                descr.as_deref(),
+            ),
+            Deferred::Subdoc { bytes } => {
+                self.used_subdoc = true;
+                match bytes {
+                    Some(b) => crate::subdoc::subdoc_xml(self, &b),
+                    None => Ok(String::new()),
+                }
+            }
+            Deferred::SubdocBlocks { blocks } => {
+                self.used_subdoc = true;
+                crate::subdocbuilder::serialize_blocks(self, part, &blocks)
+            }
+        }
     }
 
     fn render_properties(&mut self, make_ctx: &CtxFn) -> Result<(), String> {
@@ -334,6 +417,10 @@ impl TplCore {
         let pkg = self.package.as_mut().expect("package loaded");
         let enc = pkg.encoding_of(part);
         pkg.set(part, crate::package::encode_part(&content, &enc));
+        if part == DOCUMENT_PART {
+            // rendered xml replaces whatever the docmodel cache held
+            self.invalidate_doc();
+        }
     }
 
     // ---------------- variables ----------------
@@ -483,21 +570,22 @@ impl TplCore {
     // ---------------- save ----------------
 
     pub fn save_bytes(&mut self) -> Result<Vec<u8>, String> {
-        if !self.is_saved && !self.is_rendered {
-            self.package = Some(Package::from_bytes(&self.original_bytes)?);
-        }
+        self.flush_doc()?;
+        // load the package only if nothing has touched it yet; reloading
+        // unconditionally here would discard pre-render docmodel edits
+        self.init_docx(false)?;
         self.pre_processing()?;
 
-        let mut pkg = self
-            .package
-            .clone()
-            .ok_or_else(|| "package not loaded".to_string())?;
-
-        // post processing: zip-level replacements
-        if !self.crc_to_new_media.is_empty()
+        // post processing: zip-level replacements (rare path: only clone the
+        // whole package, media blobs included, when replacements are pending)
+        let out = if !self.crc_to_new_media.is_empty()
             || !self.crc_to_new_embedded.is_empty()
             || !self.zipname_to_replace.is_empty()
         {
+            let mut pkg = self
+                .package
+                .clone()
+                .ok_or_else(|| "package not loaded".to_string())?;
             for (name, data, _compression, _mtime) in pkg.entries.iter_mut() {
                 if let Some(new) = self.zipname_to_replace.get(name) {
                     *data = new.clone();
@@ -513,9 +601,14 @@ impl TplCore {
                     }
                 }
             }
-        }
+            pkg.to_bytes()?
+        } else {
+            self.package
+                .as_ref()
+                .ok_or_else(|| "package not loaded".to_string())?
+                .to_bytes()?
+        };
 
-        let out = pkg.to_bytes()?;
         self.is_saved = true;
         Ok(out)
     }
@@ -1605,10 +1698,7 @@ fn trans_rewrite(
     plural: Option<&str>,
 ) -> String {
     // parse k=v assignments; context="x" selects pgettext
-    let kv_re = fancy_regex::Regex::new(
-        r#"(\w+)\s*=\s*("(?:[^"]*)"|'(?:[^']*)'|[^,\s]+)"#,
-    )
-    .unwrap();
+    let kv_re = crate::patch::re(r#"(\w+)\s*=\s*("(?:[^"]*)"|'(?:[^']*)'|[^,\s]+)"#);
     let mut sets = String::new();
     let mut context: Option<String> = None;
     let mut first_var: Option<String> = None;
@@ -2130,17 +2220,55 @@ pub fn render_xml_str(src_xml: &str, ctx: Value, autoescape: bool, core: &mut Tp
     };
 
     let dst = sub_str(r"\n<w:p([ >])", "<w:p$1", &rendered);
-    let dst = dst
-        .replace("{_{", "{{")
-        .replace("}_}", "}}")
-        .replace("{_%", "{%")
-        .replace("%_}", "%}");
-    Ok(dst)
+    Ok(restore_escaped_delims(dst))
+}
+
+/// Single-pass equivalent of the four chained replaces
+/// `{_{`→`{{`, `}_}`→`}}`, `{%`←`{_%`, `%}`←`%_}`; returns the input
+/// unchanged (no copy) when none of the escape sequences are present.
+fn restore_escaped_delims(s: String) -> String {
+    if !s.contains("{_") && !s.contains("}_") && !s.contains("%_") {
+        return s;
+    }
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i + 2 < b.len() {
+        // all marker bytes are ascii, so slicing at i / i+3 is char-safe
+        let rep = if b[i + 1] == b'_' {
+            match (b[i], b[i + 2]) {
+                (b'{', b'{') => Some("{{"),
+                (b'}', b'}') => Some("}}"),
+                (b'{', b'%') => Some("{%"),
+                (b'%', b'}') => Some("%}"),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        match rep {
+            Some(r) => {
+                out.push_str(&s[last..i]);
+                out.push_str(r);
+                i += 3;
+                last = i;
+            }
+            None => i += 1,
+        }
+    }
+    out.push_str(&s[last..]);
+    out
 }
 
 // ---------------- fix tables & docPr ids ----------------
 
 pub fn fix_tables_and_docpr(xml: &str, docx_ids_index: &mut u32) -> Result<String, String> {
+    // nothing to fix without any table or drawing: skip the full DOM
+    // parse+serialize round-trip
+    if !xml.contains("<w:tbl") && !xml.contains("wp:docPr") {
+        return Ok(xml.to_string());
+    }
     // If the rendered xml is not well-formed (e.g. unescaped values without
     // autoescape), attempt recovery first (docxtpl uses an lxml recover-mode
     // parser). As a last resort, apply regex-based fixes so table grids and
@@ -2163,6 +2291,9 @@ pub fn fix_tables_and_docpr(xml: &str, docx_ids_index: &mut u32) -> Result<Strin
 
 /// Renumber pic:cNvPr ids sequentially (docxcompose renumber_nvpicpr_ids).
 fn renumber_cnvpr(xml: &str, next_id: &mut u32) -> Option<String> {
+    if !xml.contains("pic:cNvPr") {
+        return None;
+    }
     let mut doc = Document::parse(xml).ok()?;
     fn walk(el: &mut Element, next_id: &mut u32) {
         if el.name == "pic:cNvPr" {
@@ -2198,7 +2329,7 @@ fn regex_fix_tables(xml: &str) -> String {
     // find top-level table regions by nesting depth
     let mut regions: Vec<(usize, usize)> = Vec::new();
     {
-        let re_tbl = fancy_regex::Regex::new(r"<w:tbl[ >]|</w:tbl>").unwrap();
+        let re_tbl = crate::patch::re(r"<w:tbl[ >]|</w:tbl>");
         let mut depth = 0i32;
         let mut start = 0usize;
         for m in re_tbl.find_iter(xml).flatten() {
@@ -2219,7 +2350,7 @@ fn regex_fix_tables(xml: &str) -> String {
         return xml.to_string();
     }
 
-    let gridcol_re = fancy_regex::Regex::new(r#"<w:gridCol w:w="(\d+)"/>"#).unwrap();
+    let gridcol_re = crate::patch::re(r#"<w:gridCol w:w="(\d+)"/>"#);
     let mut out = String::with_capacity(xml.len());
     let mut last = 0usize;
     for (rs, re) in regions {

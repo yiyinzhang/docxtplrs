@@ -83,10 +83,16 @@ pub fn py_to_value(
         return Ok(Value::from_safe_string(l.borrow().xml.borrow().clone()));
     }
     if let Ok(img) = obj.cast::<PyInlineImage>() {
+        let oid = obj.as_ptr() as usize;
+        // cheap path: already registered for this render — don't rebuild
+        // (and re-clone) the Deferred
+        if let Some(&i) = tpl.deferred_by_oid.get(&oid) {
+            return Ok(Value::from_safe_string(crate::template::deferred_token(i)));
+        }
         let d = {
             let b = img.borrow();
             crate::template::Deferred::Image {
-                blob: b.blob.clone(),
+                blob: std::sync::Arc::from(&b.blob[..]),
                 filename: b.filename.clone(),
                 width: b.width,
                 height: b.height,
@@ -95,27 +101,23 @@ pub fn py_to_value(
                 descr: b.descr.clone(),
             }
         };
-        return Ok(Value::from_safe_string(register_deferred(
-            tpl,
-            obj.as_ptr() as usize,
-            d,
-        )));
+        return Ok(Value::from_safe_string(register_deferred(tpl, oid, d)));
     }
     if let Ok(sd) = obj.cast::<PySubdoc>() {
+        let oid = obj.as_ptr() as usize;
+        if let Some(&i) = tpl.deferred_by_oid.get(&oid) {
+            return Ok(Value::from_safe_string(crate::template::deferred_token(i)));
+        }
         let b = sd.borrow();
         let d = match &b.bytes {
             Some(bytes) => crate::template::Deferred::Subdoc {
-                bytes: Some(bytes.clone()),
+                bytes: Some(std::sync::Arc::from(&bytes[..])),
             },
             None => crate::template::Deferred::SubdocBlocks {
-                blocks: b.blocks.borrow().clone(),
+                blocks: std::sync::Arc::new(b.blocks.borrow().clone()),
             },
         };
-        return Ok(Value::from_safe_string(register_deferred(
-            tpl,
-            obj.as_ptr() as usize,
-            d,
-        )));
+        return Ok(Value::from_safe_string(register_deferred(tpl, oid, d)));
     }
     if obj.is_instance_of::<PyBool>() {
         // jinja2 renders booleans as True/False

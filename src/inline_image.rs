@@ -86,15 +86,29 @@ pub fn drawing_xml(
         .map(|f| f.to_string())
         .unwrap_or_else(|| format!("image.{}", info.default_ext));
 
+    let (cx, cy) = info.scaled_dimensions(width, height);
+
+    // per-part monotonic shape ids: seed once from the part's current max
+    // id, then bump in memory (avoids rescanning the whole part per image)
+    let shape_id = match tpl.next_shape_ids.get_mut(part) {
+        Some(n) => {
+            let id = *n;
+            *n += 1;
+            id
+        }
+        None => {
+            let pkg = tpl.package.as_ref().ok_or("package not loaded")?;
+            let part_xml = pkg.get_string(part).unwrap_or_default();
+            let id = next_shape_id(&part_xml);
+            tpl.next_shape_ids.insert(part.to_string(), id + 1);
+            id
+        }
+    };
+
     let pkg = tpl.package.as_mut().ok_or("package not loaded")?;
     let partname = pkg.get_or_add_image(blob, &ext, info.content_type);
     let target = relative_target(part, &partname);
     let rid = pkg.add_rel(part, rel_type::IMAGE, &target, false);
-
-    let (cx, cy) = info.scaled_dimensions(width, height);
-
-    let part_xml = pkg.get_string(part).unwrap_or_default();
-    let shape_id = next_shape_id(&part_xml);
 
     let hlink = if let Some(url) = anchor {
         let hrid = pkg.add_rel(part, rel_type::HYPERLINK, url, true);

@@ -41,7 +41,14 @@ pub fn sha1_hex(data: &[u8]) -> String {
 
 mod hex {
     pub fn encode(bytes: impl AsRef<[u8]>) -> String {
-        bytes.as_ref().iter().map(|b| format!("{:02x}", b)).collect()
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let b = bytes.as_ref();
+        let mut s = String::with_capacity(b.len() * 2);
+        for &x in b {
+            s.push(HEX[(x >> 4) as usize] as char);
+            s.push(HEX[(x & 0x0f) as usize] as char);
+        }
+        s
     }
 }
 
@@ -227,6 +234,12 @@ pub struct Package {
     /// ordered zip entries (name, bytes, original compression method, mtime)
     pub entries: Vec<(String, Vec<u8>, zip::CompressionMethod, Option<zip::DateTime>)>,
     pub index: HashMap<String, usize>,
+    /// lazily built sha1 hex per word/media/* entry (image dedup); kept in
+    /// sync by `set`
+    media_sha1: HashMap<String, String>,
+    /// parsed .rels per part (parse once per part; write-through on
+    /// save_rels, invalidated by direct `set` of the .rels entry)
+    rels_cache: std::cell::RefCell<HashMap<String, Rels>>,
 }
 
 /// Detect the encoding of an XML part from BOM / xml declaration.
@@ -267,7 +280,7 @@ pub fn decode_part(blob: &[u8]) -> String {
     let encoding = encoding_rs::Encoding::for_label(enc.as_bytes())
         .unwrap_or(encoding_rs::UTF_8);
     let (cow, _, _) = encoding.decode(blob);
-    cow.to_string()
+    cow.into_owned()
 }
 
 /// Encode a string for storage, honoring the part's declared encoding.
@@ -309,7 +322,12 @@ impl Package {
             index.insert(name.clone(), entries.len());
             entries.push((name, buf, compression, mtime));
         }
-        Ok(Package { entries, index })
+        Ok(Package {
+            entries,
+            index,
+            media_sha1: HashMap::new(),
+            rels_cache: std::cell::RefCell::new(HashMap::new()),
+        })
     }
 
     pub fn get(&self, name: &str) -> Option<&[u8]> {
@@ -326,6 +344,14 @@ impl Package {
     }
 
     pub fn set(&mut self, name: &str, data: Vec<u8>) {
+        if name.starts_with("word/media/") {
+            // keep the dedup cache consistent (cheap: one hash per set)
+            self.media_sha1
+                .insert(name.to_string(), sha1_hex(&data));
+        }
+        if name.ends_with(".rels") {
+            self.rels_cache.borrow_mut().remove(name);
+        }
         if let Some(&i) = self.index.get(name) {
             self.entries[i].1 = data;
         } else {
@@ -344,7 +370,10 @@ impl Package {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
-        let mut cursor = Cursor::new(Vec::new());
+        // rough output estimate: compressed sizes are unknown, but total
+        // uncompressed size is a safe upper bound for most docx
+        let est: usize = self.entries.iter().map(|(_, d, _, _)| d.len()).sum();
+        let mut cursor = Cursor::new(Vec::with_capacity(est));
         {
             let mut writer = zip::ZipWriter::new(&mut cursor);
             let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
@@ -365,16 +394,31 @@ impl Package {
         Ok(cursor.into_inner())
     }
 
-    /// Load rels for a part (empty if no .rels entry)
+    /// Load rels for a part (empty if no .rels entry); parsed once per part
+    /// and cached until `save_rels`/`set` touch the underlying entry.
     pub fn rels(&self, part: &str) -> Rels {
-        match self.get_string(&rels_path_for(part)) {
+        let path = rels_path_for(part);
+        if let Some(r) = self.rels_cache.borrow().get(&path) {
+            return r.clone();
+        }
+        let rels = match self.get_string(&path) {
             Some(xml) => Rels::from_xml(&xml),
             None => Rels::default(),
-        }
+        };
+        self.rels_cache
+            .borrow_mut()
+            .insert(path, rels.clone());
+        rels
     }
 
     pub fn save_rels(&mut self, part: &str, rels: &Rels) {
-        self.set(&rels_path_for(part), rels.to_xml().into_bytes());
+        let path = rels_path_for(part);
+        self.set(&path, rels.to_xml().into_bytes());
+        // set() invalidates the cache for .rels entries; repopulate so the
+        // next rels() on this part skips re-parsing
+        self.rels_cache
+            .borrow_mut()
+            .insert(path, rels.clone());
     }
 
     /// Add a relationship to a part, returning the new rId
@@ -424,24 +468,30 @@ impl Package {
 
     // ---- image parts ----
 
-    /// Find existing image part path by sha1, if any
-    pub fn find_image_by_sha1(&self, sha1: &str) -> Option<String> {
+    /// Find existing image part path by sha1, if any. Hashes of media
+    /// entries are computed once and cached (updated by `set`), so inserting
+    /// N images costs N blob hashes instead of N × all-media hashing.
+    pub fn find_image_by_sha1(&mut self, sha1: &str) -> Option<String> {
         for (name, data, _, _) in &self.entries {
-            if name.starts_with("word/media/") && sha1_hex(data) == sha1 {
-                return Some(name.clone());
+            if name.starts_with("word/media/") && !self.media_sha1.contains_key(name) {
+                let h = sha1_hex(data);
+                self.media_sha1.insert(name.clone(), h);
             }
         }
-        None
+        self.media_sha1
+            .iter()
+            .find(|(_, h)| h.as_str() == sha1)
+            .map(|(name, _)| name.clone())
     }
 
     /// Next available /word/media/imageN.<ext> partname
     pub fn next_image_partname(&self, ext: &str) -> String {
-        let mut used: Vec<u32> = Vec::new();
+        let mut used: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for (name, _, _, _) in &self.entries {
             if let Some(rest) = name.strip_prefix("word/media/image") {
                 let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                 if let Ok(n) = num_str.parse::<u32>() {
-                    used.push(n);
+                    used.insert(n);
                 }
             }
         }

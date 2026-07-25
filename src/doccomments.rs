@@ -62,7 +62,7 @@ fn ensure_comments_part(core: &mut TplCore) -> Result<i64, String> {
     let pkg = core.package.as_ref().ok_or("package not loaded")?;
     let xml = pkg.get_string("word/comments.xml").unwrap_or_default();
     let mut max_id: i64 = -1;
-    let re = fancy_regex::Regex::new(r#"<w:comment [^>]*w:id="(\d+)""#).unwrap();
+    let re = crate::patch::re(r#"<w:comment [^>]*w:id="(\d+)""#);
     for cap in re.captures_iter(&xml).flatten() {
         if let Ok(n) = cap[1].parse::<i64>() {
             max_id = max_id.max(n);

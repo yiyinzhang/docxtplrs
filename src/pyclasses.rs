@@ -56,6 +56,8 @@ fn py_truthy(obj: &Bound<'_, PyAny>) -> bool {
 #[pyclass(name = "DocxTemplate", unsendable)]
 pub struct PyDocxTemplate {
     pub core: RefCell<TplCore>,
+    /// cached document facade for __getattr__ delegation
+    doc: RefCell<Option<Py<crate::docmodel::PyDocument>>>,
 }
 
 #[pymethods]
@@ -65,6 +67,7 @@ impl PyDocxTemplate {
         let bytes = read_bytes_source(template_file)?;
         Ok(PyDocxTemplate {
             core: RefCell::new(TplCore::new(bytes)),
+            doc: RefCell::new(None),
         })
     }
 
@@ -236,9 +239,21 @@ impl PyDocxTemplate {
     /// Unknown attributes are delegated to the document facade
     /// (like docxtpl's __getattr__ delegating to the python-docx Document).
     fn __getattr__(slf: Py<Self>, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
-        let doc = crate::docmodel::PyDocument { tpl: slf };
-        let obj = Py::new(py, doc)?;
-        obj.bind(py).getattr(name).map(|o| o.unbind())
+        let cached = slf.bind(py).borrow().doc.borrow().as_ref().map(|d| d.clone_ref(py));
+        let doc = match cached {
+            Some(d) => d,
+            None => {
+                let d = Py::new(
+                    py,
+                    crate::docmodel::PyDocument {
+                        tpl: slf.clone_ref(py),
+                    },
+                )?;
+                slf.bind(py).borrow().doc.replace(Some(d.clone_ref(py)));
+                d
+            }
+        };
+        doc.bind(py).getattr(name).map(|o| o.unbind())
     }
 
     /// Register a custom jinja filter (python callable).
