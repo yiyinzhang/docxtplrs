@@ -2,6 +2,27 @@
 name = "docxtplrs"
 version = "0.1.0"
 edition = "2021"
+description = "Rust implementation of python-docx-template (docxtpl): render docx templates with Jinja2 syntax (minijinja), native zip/XML handling, plus optional Python bindings via PyO3"
+license = "LGPL-2.1-or-later"
+repository = "https://github.com/yiyinzhang/docxtplrs"
+homepage = "https://github.com/yiyinzhang/docxtplrs"
+readme = "README.md"
+keywords = ["docx", "template", "jinja2", "word", "office"]
+categories = ["text-processing", "rendering", "parser-implementations"]
+exclude = [
+    ".venv/",
+    ".pytest_cache/",
+    "target/",
+    "tests/",
+    "python/",
+    "main.py",
+    "uv.lock",
+    ".python-version",
+    "__pycache__/",
+]
+
+[package.metadata.docs.rs]
+features = []
 
 [lib]
 name = "docxtplrs"
