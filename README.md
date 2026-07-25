@@ -1,10 +1,21 @@
 # docxtplrs
 
+[![crates.io](https://img.shields.io/crates/v/docxtplrs.svg)](https://crates.io/crates/docxtplrs)
+[![docs.rs](https://docs.rs/docxtplrs/badge.svg)](https://docs.rs/docxtplrs)
+[![license](https://img.shields.io/badge/license-LGPL--2.1--or--later-blue.svg)](https://github.com/yiyinzhang/docxtplrs)
+[![tests](https://img.shields.io/badge/tests-188%20passed-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
+[![coverage](https://img.shields.io/badge/coverage-77%25-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
+[![crosscheck](https://img.shields.io/badge/crosscheck-ALL%20MATCH-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
+
 > ⚠️ **Vibecoding project**: this codebase was written by an AI (Kimi Code) in a
 > pair-programming session with the user, without line-by-line human review.
 > It is verified against the official docxtpl test suite (32 real-world template
 > cases) plus 188 in-house tests, but undiscovered issues may remain — evaluate
 > before production use.
+>
+> ⚠️ **Vibecoding 项目**：本项目由 AI（Kimi Code）与用户结对编写，未经人工逐行审查。
+> 已通过 docxtpl 官方测试套件（32 个真实模板用例）与 188 个自建测试验证，
+> 但仍可能存在未发现的问题，生产环境使用前请自行评估。
 
 A **Rust implementation of [python-docx-template (docxtpl)](https://github.com/elapouya/python-docx-template)**,
 usable both as a **Rust crate** and as a **Python package** (via PyO3) with an API
@@ -14,9 +25,58 @@ handling, template preprocessing, table fixing, relationship management and the
 document object model are native Rust — **no dependency** on
 python-docx / lxml / jinja2.
 
+[python-docx-template (docxtpl)](https://github.com/elapouya/python-docx-template) 的 **Rust 实现**，
+既可作为 **Rust crate** 使用，也可通过 PyO3 作为 **Python 包** 使用（API 与 docxtpl 几乎完全一致）。
+模板引擎为 minijinja（Jinja2 兼容语法）；docx 的 zip/XML 处理、模板预处理、表格修复、
+关系管理、文档对象模型均为 Rust 原生实现，**不依赖** python-docx / lxml / jinja2。
+
 ---
 
-## Why docxtplrs instead of python-docx-template?
+## Quick start / 快速开始
+
+**Rust** (`cargo add docxtplrs`, [crates.io](https://crates.io/crates/docxtplrs)):
+
+```rust
+use docxtplrs::template::TplCore;
+use minijinja::Value;
+use std::collections::BTreeMap;
+
+let mut ctx = BTreeMap::new();
+ctx.insert("title".to_string(), Value::from("Quarterly Report"));
+ctx.insert("items".to_string(), Value::from_serialize(&vec!["alpha", "beta"]));
+
+let mut tpl = TplCore::new(std::fs::read("template.docx")?);
+tpl.render(false, &|_core, _part| Ok(Value::from_serialize(&ctx)))?;
+std::fs::write("out.docx", tpl.save_bytes()?)?;
+```
+
+**Python** (build the wheel with maturin / 用 maturin 构建 wheel):
+
+```bash
+uv sync                      # in this repo / 本仓库内
+uv add --editable .          # or as a dependency of another project / 或作为其他项目的依赖
+```
+
+```python
+from docxtplrs import DocxTemplate
+
+tpl = DocxTemplate("template.docx")
+tpl.render({"title": "Quarterly Report", "rows": ["East", "South"]})
+tpl.save("out.docx")
+```
+
+---
+
+## English
+
+- [Why docxtplrs instead of python-docx-template?](#why-docxtplrs-instead-of-python-docx-template)
+- [Performance](#performance)
+- [Usage as a Rust crate](#1-usage-as-a-rust-crate)
+- [Usage as a Python package](#2-usage-as-a-python-package)
+- [Limitations](#3-limitations)
+- [中文版](#中文版)
+
+### Why docxtplrs instead of python-docx-template?
 
 - **Zero Python dependencies** — the whole engine (docx zip/XML handling,
   template preprocessing, table fixing, document object model) is native Rust.
@@ -49,9 +109,7 @@ python-docx / lxml / jinja2.
 - **Built-in CLI** — `python -m docxtplrs template.docx data.json out.docx`
   renders a template straight from the shell, no scripting needed.
 
----
-
-## Performance
+### Performance
 
 Engine-vs-engine (docxtplrs vs docxtpl + lxml + jinja2, same templates):
 **~6-14x faster** per render (see the "Fast" bullet above).
@@ -76,15 +134,13 @@ release builds are faster still):
   instead of once per relationship, and rId/style/numId remapping runs as a
   single scan with a map lookup instead of one full-text regex per entry.
 
----
+### 1. Usage as a Rust crate
 
-## 1. Usage as a Rust crate
-
-Add to your `Cargo.toml` (path dependency for now):
+Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-docxtplrs = { path = "../docxtplrs" }
+docxtplrs = "0.1"
 minijinja = "2"
 ```
 
@@ -128,11 +184,9 @@ cargo run --example render --release -- template.docx out.docx
 > `LD_LIBRARY_PATH=$(python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")`.
 > The `extension-module` cargo feature is only enabled by maturin for the Python wheel build.
 
----
+### 2. Usage as a Python package
 
-## 2. Usage as a Python package
-
-### Install
+#### Install
 
 ```bash
 # in this repo: build & install into the uv venv
@@ -147,7 +201,7 @@ uv add --editable /path/to/docxtplrs
 The wheel is a native `cp313` build. For other Python versions either build under that
 version, or set pyo3 to `abi3-py312` in `Cargo.toml` for a single portable wheel.
 
-### Building the wheel yourself
+#### Building the wheel yourself
 
 ```bash
 # release wheel -> target/wheels/docxtplrs-<ver>-cp313-cp313-manylinux_2_34_x86_64.whl
@@ -176,7 +230,7 @@ uv pip install target/wheels/*.whl                     # local install
 # or upload to your index, e.g.: uv publish target/wheels/*   (or: twine upload)
 ```
 
-### Quick start
+#### Quick start
 
 ```python
 from docxtplrs import DocxTemplate, R, RichText, Listing, InlineImage, Mm
@@ -195,7 +249,7 @@ tpl.render({
 tpl.save("out.docx")                         # or io.BytesIO()
 ```
 
-### Template syntax (same as docxtpl)
+#### Template syntax (same as docxtpl)
 
 | Syntax | Purpose |
 |---|---|
@@ -211,7 +265,7 @@ tpl.save("out.docx")                         # or io.BytesIO()
 | `{% include %}` / `{% import %}` | includes (after `tpl.set_template_loader(fn)`) |
 | headers / footers / footnotes / doc properties | rendered as well (images can be inserted into headers) |
 
-### Python API summary
+#### Python API summary
 
 - `DocxTemplate(f)`: `render()`, `save()`, `get_docx_bytes()`, `get_xml()`,
   `get_undeclared_template_variables()`, `new_subdoc()`, `build_url_id()`,
@@ -231,7 +285,7 @@ tpl.save("out.docx")                         # or io.BytesIO()
   generate_lorem_ipsum`; exception: `TemplateError` (with `docx_context`)
 - CLI: `python -m docxtplrs template.docx data.json output.docx [-o] [-q]`
 
-### Custom filters & engine extensions
+#### Custom filters & engine extensions
 
 Register your own jinja filters, tests, functions and globals — plain Python
 callables, with positional **and keyword** arguments supported:
@@ -277,13 +331,6 @@ implementations (so undefined-value semantics like `default`/`defined` stay
 correct); only entries you added or overrode are imported, and they take priority
 over same-named `register_filter/test/function/global()` registrations.
 
-```python
-import jinja2
-env = jinja2.Environment()
-env.filters["usd"] = lambda v: f"${v:.2f}"
-tpl.render(context, jinja_env=env)
-```
-
 Engine-level extras beyond stock minijinja, so jinja2-style templates work as-is:
 
 - **str methods**: `upper/capitalize/title/strip/replace/split/join/zfill/center/
@@ -299,7 +346,7 @@ Engine-level extras beyond stock minijinja, so jinja2-style templates work as-is
   dict insertion-order iteration, i128 big integers, `True/False/None` rendered
   Python-style, `in` containment on dicts/lists
 
-### Tests
+#### Tests
 
 ```bash
 .venv/bin/python -m pytest tests/ -q          # 188 unit tests
@@ -308,9 +355,11 @@ Engine-level extras beyond stock minijinja, so jinja2-style templates work as-is
 .venv/bin/python tests/crosscheck.py compare /tmp/ref.json /tmp/rs.json
 ```
 
----
+Coverage badge: line coverage of `src/` measured by rebuilding with
+`RUSTFLAGS="-Cinstrument-coverage"`, running the pytest suite and reporting
+with `llvm-cov` (see `AGENTS.md` toolchain notes).
 
-## 3. Limitations
+### 3. Limitations
 
 **Architectural**
 
@@ -350,14 +399,11 @@ Engine-level extras beyond stock minijinja, so jinja2-style templates work as-is
 
 ## 中文版
 
-> ⚠️ **Vibecoding 项目**：本项目由 AI（Kimi Code）与用户结对编写，未经人工逐行审查。
-> 已通过 docxtpl 官方测试套件（32 个真实模板用例）与 188 个自建测试验证，
-> 但仍可能存在未发现的问题，生产环境使用前请自行评估。
-
-[python-docx-template (docxtpl)](https://github.com/elapouya/python-docx-template) 的 **Rust 实现**，
-既可作为 **Rust crate** 使用，也可通过 PyO3 作为 **Python 包** 使用（API 与 docxtpl 几乎完全一致）。
-模板引擎为 minijinja（Jinja2 兼容语法）；docx 的 zip/XML 处理、模板预处理、表格修复、
-关系管理、文档对象模型均为 Rust 原生实现，**不依赖** python-docx / lxml / jinja2。
+- [相比 python-docx-template 的优势](#相比-python-docx-template-的优势)
+- [性能](#性能)
+- [Rust 用法](#1-rust-用法)
+- [Python 用法](#2-python-用法)
+- [限制](#3-限制)
 
 ### 相比 python-docx-template 的优势
 
@@ -404,114 +450,189 @@ debug 构建 + CPython 3.13 实测，release 构建会更快）：
   `.rels` 每个 part 只解析一次（而非每条关系一次），rId/style/numId 重映射从
   "每条目一次全文正则"改为单遍扫描 + map 查表。
 
-### Rust 用法
+### 1. Rust 用法
+
+在 `Cargo.toml` 中添加：
 
 ```toml
 [dependencies]
-docxtplrs = { path = "../docxtplrs" }
+docxtplrs = "0.1"
 minijinja = "2"
 ```
+
+渲染模板：
 
 ```rust
 use docxtplrs::template::TplCore;
 use minijinja::Value;
 use std::collections::BTreeMap;
 
+// 构建渲染上下文
 let mut ctx = BTreeMap::new();
 ctx.insert("title".to_string(), Value::from("季度报告"));
 ctx.insert("items".to_string(), Value::from_serialize(&vec!["甲", "乙"]));
 
+// 加载、渲染（autoescape = false）、保存
 let mut tpl = TplCore::new(std::fs::read("template.docx")?);
 tpl.render(false, &|_core, _part| Ok(Value::from_serialize(&ctx)))?;
 std::fs::write("out.docx", tpl.save_bytes()?)?;
 ```
 
-主要模块：`template`（TplCore 渲染管线）、`package`（docx 包/关系/内容类型）、
-`patch`（patch_xml 预处理）、`richtext`、`image`（图片尺寸/DPI）、`gettext`、
-`xmldom`。可运行示例：`cargo run --example render --release -- template.docx out.docx`。
+主要 Rust API（均在 `docxtplrs::` 下）：
 
-### Python 用法
+| 模块 | 要点 |
+|---|---|
+| `template` | `TplCore`：`new/render/save_bytes/get_xml/undeclared_variables/build_url_id`、`Deferred`、替换映射（`crc_to_new_media`、`pics_to_replace` 等） |
+| `package` | `Package`（docx zip 条目、`.rels`、内容类型）、`Rels`、CRC32/SHA1 工具 |
+| `patch` | `patch_xml`、`resolve_listing`、`decode_text_entities`（docxtpl 的 XML 预处理） |
+| `richtext` | `richtext_run`、`richtext_paragraph`、`listing_xml`、`TextProps` |
+| `image` | `ImageInfo`（PNG/JPEG/GIF/BMP/TIFF 尺寸与 DPI）、EMU 换算 |
+| `gettext` | `Catalog`（.mo 解析、复数规则求值） |
+| `xmldom` | 用于结构化修改的极简 XML DOM |
+
+内置可运行示例：
 
 ```bash
-uv sync                                   # 本仓库内构建安装
-uv add /path/to/docxtplrs-*.whl           # 其他项目装 wheel
-uv add --editable /path/to/docxtplrs      # 或本地开发模式
+cargo run --example render --release -- template.docx out.docx
 ```
 
-### 构建 wheel
+> 注意：示例会链接 `libpython`（PyO3）。若 Python 由 uv 管理，请用
+> `LD_LIBRARY_PATH=$(python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")` 运行。
+> `extension-module` cargo feature 仅在 maturin 构建 Python wheel 时启用。
+
+### 2. Python 用法
+
+#### 安装
 
 ```bash
-# release 构建（产物在 target/wheels/，含 manylinux 分发包）
+# 本仓库内：构建并安装到 uv venv
+uv sync
+
+# 在其他 uv 项目中
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.0-cp313-cp313-manylinux_2_34_x86_64.whl
+# 或本地开发模式（editable）
+uv add --editable /path/to/docxtplrs
+```
+
+wheel 为原生 `cp313` 构建。其他 Python 版本需在对应版本下构建，或把 `Cargo.toml`
+中 pyo3 改为 `abi3-py312` 以产出单个通用 wheel。
+
+#### 自行构建 wheel
+
+```bash
+# release wheel -> target/wheels/docxtplrs-<ver>-cp313-cp313-manylinux_2_34_x86_64.whl
 uv run maturin build --release
 
-# 本机装有 conda 时
+# 本机同时装有 conda 时：
 env -u CONDA_PREFIX uv run maturin build --release
+```
 
-# abi3 通用 wheel（一份通吃 CPython ≥ 3.12）：
-#   先把 Cargo.toml 的 pyo3 改为 features = ["abi3-py312"]，再构建
+其他变体：
 
-# 指定 Python 版本构建
+```bash
+# abi3 通用 wheel（一份通吃 CPython >= 3.12）：
+#   1. 把 Cargo.toml 的 pyo3 改为 features = ["abi3-py312"]
+#   2. 构建
+uv run maturin build --release        # -> docxtplrs-...-cp312-abi3-....whl
+
+# 指定 Python 版本构建：把 maturin 指向对应解释器
 uv run maturin build --release -i python3.12
 
-# 同时产出 sdist
+# 同时产出 sdist（源码分发包）
 uv run maturin build --release --sdist
 
 # 安装 / 分发
-uv pip install target/wheels/*.whl        # 本地安装
-# 或上传到自有 PyPI 索引后 uv add docxtplrs --index-url ...
+uv pip install target/wheels/*.whl                     # 本地安装
+# 或上传到自有索引，例如：uv publish target/wheels/*   （或 twine upload）
 ```
 
-```python
-from docxtplrs import DocxTemplate, R, InlineImage, Mm
+#### 快速上手
 
-tpl = DocxTemplate("template.docx")
+```python
+from docxtplrs import DocxTemplate, R, RichText, Listing, InlineImage, Mm
+
+tpl = DocxTemplate("template.docx")          # 路径 / 文件对象 / bytes
+
 tpl.render({
     "title": "季度报告",
-    "rows": ["华东", "华南"],
-    "rt": R("重点", bold=True, color="#C00000"),   # 模板写 {{r rt }}
-    "img": InlineImage(tpl, "logo.png", width=Mm(15)),
-    "sub": tpl.new_subdoc("chapter.docx"),
+    "rows": ["华东", "华南"],                 # {%p for r in rows %} 段落循环
+    "items": [{"name": "甲", "price": 12.5}],  # {%tr for x in items %} 表格行循环
+    "rt": R("重点", bold=True, color="#C00000"),  # 模板里写 {{r rt }}
+    "img": InlineImage(tpl, "logo.png", width=Mm(15)),  # {{ img }}
+    "sub": tpl.new_subdoc("chapter.docx"),                # {{p sub }}
 }, autoescape=True)
-tpl.save("out.docx")
+
+tpl.save("out.docx")                         # 或 io.BytesIO()
 ```
 
-模板语法与 docxtpl 一致：`{{ var }}`、`{% if/for %}`、`{%tr %}`、`{%tc %}`、
-`{%p %}`、`{{r }}`/`{{p }}`、`{% colspan %}`、`{% cellbg %}`、`{% vm %}`/`{% hm %}`、
-`{% trans %}`（`tpl.install_gettext("zh.mo")`）、`{% include %}`（`tpl.set_template_loader`）、
-页眉/页脚/脚注/文档属性渲染。
+#### 模板语法（与 docxtpl 一致）
 
-API 要点：`register_filter/test/function/global()`（支持 kwargs）、
-`render(ctx, jinja_env=真实 jinja2 Environment)`（jinja2 内建 filters/tests/globals 由 minijinja 原生实现接管，仅导入用户新增/覆盖的条目，且同名优先级高于 register_*）、文档对象模型（可读写：
-paragraphs/tables/sections/styles/settings/comments/core_properties、
-add_paragraph/add_heading/add_picture/add_table/add_page_break/add_section、
-run/单元格赋值）、替换类 API（replace_media/replace_pic/replace_embedded/replace_zipname）、
-CLI（`python -m docxtplrs tpl.docx data.json out.docx -o`）。
+| 语法 | 用途 |
+|---|---|
+| `{{ var }}` | 变量（过滤器、属性/下标访问、方法调用、str 方法、`'%s' % x`、Unicode 标识符） |
+| `{% if %}` `{% for %}` `{% set %}` `{% macro %}` | 语句（支持 break/continue/do） |
+| `{%tr for x in items %}` | 表格行循环 |
+| `{%tc for x in items %}` | 单元格循环（自动修复 `tblGrid` 列数/宽度） |
+| `{%p if x %}` / `{{p var }}` | 段落级语句 / 替换 |
+| `{{r var }}` | run 级替换（配合 `RichText`） |
+| `{% colspan x %}` `{% cellbg c %}` `{% vm %}` `{% hm %}` | 跨列 / 单元格底色 / 垂直与水平合并 |
+| `{%- ... -%}` / `{_{ ... }_}` | 段落文本合并 / 字面花括号转义 |
+| `{% trans %}` / `{% pluralize %}` | i18n（先 `tpl.install_gettext("zh.mo")`） |
+| `{% include %}` / `{% import %}` | 包含（先 `tpl.set_template_loader(fn)`） |
+| 页眉 / 页脚 / 脚注 / 文档属性 | 同样会被渲染（图片可插入页眉） |
 
-### 自定义过滤器与引擎扩展
+#### Python API 概览
+
+- `DocxTemplate(f)`：`render()`、`save()`、`get_docx_bytes()`、`get_xml()`、
+  `get_undeclared_template_variables()`、`new_subdoc()`、`build_url_id()`、
+  `replace_media()` / `replace_embedded()` / `replace_pic()` / `replace_zipname()`、
+  `reset_replacements()`、`allow_missing_pics`、`get_pic_map()`
+- 自定义：`register_filter/test/function/global()`、`set_template_loader()`、
+  `install_gettext()`；`render(ctx, jinja_env=...)` 接受真实 jinja2
+  `Environment`（读取 `autoescape/filters/globals/tests/trim_blocks/lstrip_blocks/
+  keep_trailing_newline/undefined`）
+- 文档对象模型（可读写）：`get_docx()`、`paragraphs/tables/sections/
+  styles/settings/comments/core_properties/inline_shapes`、
+  `add_paragraph/add_heading/add_picture/add_table/add_page_break/add_section`、
+  run/单元格格式赋值、`__getattr__` 委托
+- `RichText`/`R`、`RichTextParagraph`/`RP`、`Listing`、`InlineImage`、`Subdoc`
+  （文件合并 + 编程式 `add_paragraph/add_picture/add_table`）
+- 单位：`Length/Emu/Inches/Cm/Mm/Pt/Twips`；jinja2.utils：`Cycler/Joiner/
+  generate_lorem_ipsum`；异常：`TemplateError`（含 `docx_context`）
+- CLI：`python -m docxtplrs template.docx data.json output.docx [-o] [-q]`
+
+#### 自定义过滤器与引擎扩展
+
+注册自己的 jinja 过滤器、测试器、函数与全局值——普通 Python 可调用对象，
+位置参数**和关键字参数**均支持：
 
 ```python
 tpl = DocxTemplate("template.docx")
 
-# 过滤器（支持位置参数和关键字参数）
-tpl.register_filter("rmb", lambda v: f"¥{v:.2f}")                    # {{ price|rmb }}
-tpl.register_filter("shout", lambda v, punct="?": str(v).upper() + punct)  # {{ name|shout('!') }}
-tpl.register_filter("col", lambda rows, name: [r[name] for r in rows])     # {{ rows|col(name='药物名称') }}
+# 过滤器：{{ price|rmb }}、{{ name|shout('!') }}、{{ rows|col(name='药物名称') }}
+tpl.register_filter("rmb", lambda v: f"¥{v:.2f}")
+tpl.register_filter("shout", lambda v, punct="?": str(v).upper() + punct)
+tpl.register_filter("col", lambda rows, name: [r[name] for r in rows])
 
-# 测试器 / 函数 / 全局值
-tpl.register_test("even", lambda v: v % 2 == 0)          # {% if v is even %}
-tpl.register_function("add", lambda a, b: a + b)         # {{ add(1, 2) }}
-tpl.register_global("company", "ACME")                   # {{ company }}
+# 测试器：{% if v is even %}
+tpl.register_test("even", lambda v: v % 2 == 0)
 
-# 模板 loader（{% include %}/{% import %}）与 gettext i18n（{% trans %}/{% pluralize %}）
+# 函数与全局值：{{ add(1, 2) }}、{{ company }}
+tpl.register_function("add", lambda a, b: a + b)
+tpl.register_global("company", "ACME")
+
+# 模板 loader（{% include %}/{% import %}）
 tpl.set_template_loader(lambda name: "included {{ v }}" if name == "part" else None)
+
+# gettext i18n（{% trans %}/{% pluralize %}）
 tpl.install_gettext("messages.mo")
 
 tpl.render(context)
 ```
 
-也可直接传真正的 **jinja2 Environment**（自动读取其 `autoescape` / `filters` /
-`globals` / `tests` / `trim_blocks` / `lstrip_blocks` / `keep_trailing_newline` /
-`undefined`（Chainable/Strict）设置）：
+也可以直接传真正的 **jinja2 Environment**——其 `autoescape`、`filters`、
+`globals`、`tests`、`trim_blocks`、`lstrip_blocks`、`keep_trailing_newline` 与
+`undefined`（Chainable/Strict）设置均会被读取（鸭子类型）：
 
 ```python
 import jinja2
@@ -520,7 +641,12 @@ env.filters["usd"] = lambda v: f"${v:.2f}"
 tpl.render(context, jinja_env=env)
 ```
 
-引擎层对 jinja2 的补齐（模板无需改动即可使用）：
+注意：jinja2 自带的内建 filters/tests/globals **不会**被导入——它们通过与
+`jinja2.defaults` 的同一性判断识别，并交由 minijinja 原生实现处理（因此
+`default`/`defined` 等 undefined 语义保持正确）；只有你新增或覆盖的条目会被导入，
+且同名时优先于 `register_filter/test/function/global()` 的注册。
+
+引擎层相对原生 minijinja 的补齐，jinja2 风格模板开箱即用：
 
 - **str 方法**：`upper/capitalize/title/strip/replace/split/join/zfill/center/
   partition/splitlines/format(...)` 等，含格式规格（`{:>8}`、`{:,}`、`{:.2f}`、
@@ -534,15 +660,49 @@ tpl.render(context, jinja_env=env)
   `__eq__/__lt__` 比较、`__html__()` 协议、dict 插入序迭代、i128 大整数、
   `True/False/None` 按 Python 风格渲染、`in` 包含运算
 
-### 限制
+#### 测试
 
-- 引擎为 minijinja：常见差异已补齐，极端 jinja2 边角不保证一致。
-- 文档对象模型覆盖常用读写路径但非完整重写；`get_docx()` 返回本库外观对象，
-  与 python-docx 类型不兼容。
-- 非法 XML 容错策略与 lxml 不同但结果更好（产出 schema 合法文档）。
-- `== true`/`== none` 编译前转换为等义自定义测试（语义一致）。
-- 大文档上 6 处正则改为线性扫描器（避免栈溢出，输出已与官方套件比对一致）。
-- 不支持自定义界定符（docxtpl 亦不支持）、部分 jinja2 扩展、WMF。
+```bash
+.venv/bin/python -m pytest tests/ -q          # 188 个单元测试
+.venv/bin/python tests/crosscheck.py docxtplrs > /tmp/rs.json
+.venv/bin/python tests/crosscheck.py docxtpl > /tmp/ref.json   # 需要 crosscheck 依赖组
+.venv/bin/python tests/crosscheck.py compare /tmp/ref.json /tmp/rs.json
+```
+
+覆盖率徽章：`src/` 的行覆盖率，测量方式为 `RUSTFLAGS="-Cinstrument-coverage"` 重新
+构建后跑 pytest 套件，再用 `llvm-cov` 出报告（工具链说明见 `AGENTS.md`）。
+
+### 3. 限制
+
+**架构层面**
+
+- 引擎为 minijinja 而非 jinja2：总体兼容，但不保证极端 jinja2 边角行为一致
+  （常见差异已通过自定义测试/过滤器、loader、Unicode 标识符、kwargs 支持等补齐）。
+- 文档对象模型覆盖 python-docx 常用读写路径，但**不是完整重写**：节写入、样式编辑、
+  settings、comments 已支持；更深的 API（精确的段落格式对象、域代码编辑、OLE 编辑等）
+  未覆盖。
+- `get_docx()` 返回本库的外观对象，**不是** python-docx 的 `Document`——不能传给
+  期望 python-docx 类型的第三方代码。
+
+**行为差异（结果相当或更好）**
+
+- 非法 XML 容错：非命名空间的 `<` 会被转义为文本（产出 schema 合法的文档），而 lxml
+  recover 会把文本吞进未知元素；`a<b` 这类文本两边都按标签处理。
+- `== true` / `== none` 比较在编译前改写为等义的自定义测试（精确的 Python 相等语义，
+  仅限标签内，字符串字面量不受影响）。
+- `{% trans %}` 是完整的 gettext 实现（.mo 解析 + 复数规则），但不覆盖 jinja2 newstyle
+  i18n 的所有角落。
+- MB 级大文档上，docxtpl 的 6 处正则被替换为线性扫描器以避免回溯栈溢出；输出已与官方
+  测试套件逐字节比对，但极端畸形的模板可能有差异。
+- zip 输出保留压缩方式与时间戳，但不保证与 python-docx 输出逐字节一致。
+
+**不支持**
+
+- 通过 `jinja_env` 自定义 jinja 界定符（docxtpl 本身也不支持）。
+- i18n / do / loopcontrols / debug 之外的 jinja2 扩展。
+- WMF 图片（上游 python-docx 1.2 同样已放弃）。
+
+---
 
 ## Project structure / 项目结构
 
@@ -558,3 +718,5 @@ AGENTS.md       Notes for AI coding assistants              给 AI 助手的项�
 
 Same as the reference implementation python-docx-template: LGPL-2.1-or-later
 (please verify compliance yourself before redistribution).
+
+与参考实现 python-docx-template 相同：LGPL-2.1-or-later（再分发前请自行确认合规）。

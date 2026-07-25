@@ -13,3 +13,4 @@ __pycache__/
 
 # ---- 本地个人配置 ----
 AGENTS.md
+*.profraw
