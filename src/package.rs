@@ -289,21 +289,23 @@ pub fn encode_part(content: &str, encoding: &str) -> Vec<u8> {
     if enc == "utf-8" || enc == "utf8" || enc.is_empty() {
         return content.as_bytes().to_vec();
     }
+    if enc == "utf-16le" || enc == "utf-16" || enc == "utf-16be" {
+        // encoding_rs follows the WHATWG spec where UTF-16 encoders emit UTF-8,
+        // so encode UTF-16 manually (BOM + real UTF-16 payload).
+        let little = enc != "utf-16be";
+        let mut out = Vec::with_capacity(2 + content.len() * 2);
+        let bom: [u8; 2] = if little { [0xFF, 0xFE] } else { [0xFE, 0xFF] };
+        out.extend_from_slice(&bom);
+        for unit in content.encode_utf16() {
+            let bytes = if little { unit.to_le_bytes() } else { unit.to_be_bytes() };
+            out.extend_from_slice(&bytes);
+        }
+        return out;
+    }
     let encoding = encoding_rs::Encoding::for_label(enc.as_bytes())
         .unwrap_or(encoding_rs::UTF_8);
     let (cow, _, _) = encoding.encode(content);
-    let bytes = cow.to_vec();
-    if enc == "utf-16le" || enc == "utf-16" {
-        let mut out = vec![0xFF, 0xFE];
-        out.extend_from_slice(&bytes);
-        out
-    } else if enc == "utf-16be" {
-        let mut out = vec![0xFE, 0xFF];
-        out.extend_from_slice(&bytes);
-        out
-    } else {
-        bytes
-    }
+    cow.to_vec()
 }
 
 impl Package {
@@ -512,5 +514,537 @@ impl Package {
         self.set(&partname, blob.to_vec());
         self.ensure_content_type_default(ext, content_type);
         partname
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CT_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+        <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+        <Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+        </Types>";
+
+    fn build_zip(entries: &[(&str, &[u8], zip::CompressionMethod)]) -> Vec<u8> {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut cursor);
+            for (name, data, method) in entries {
+                let opts =
+                    zip::write::SimpleFileOptions::default().compression_method(*method);
+                w.start_file(name, opts).unwrap();
+                w.write_all(data).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    fn rels_pkg(rels_xml: &str) -> Package {
+        let zip = build_zip(&[(
+            "word/_rels/document.xml.rels",
+            rels_xml.as_bytes(),
+            zip::CompressionMethod::Deflated,
+        )]);
+        Package::from_bytes(&zip).unwrap()
+    }
+
+    // ---- hashes ----
+
+    #[test]
+    fn test_crc32_known_vector() {
+        assert_eq!(crc32(b"123456789"), 0xCBF43926);
+        assert_eq!(crc32(b""), 0);
+    }
+
+    #[test]
+    fn test_sha1_hex_known_vector() {
+        assert_eq!(
+            sha1_hex(b"abc"),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+    }
+
+    // ---- Rels ----
+
+    #[test]
+    fn test_rels_add_dedup_same_triple_reuses_rid() {
+        let mut rels = Rels::default();
+        let first = rels.add(rel_type::IMAGE, "media/a.png", false);
+        let second = rels.add(rel_type::IMAGE, "media/a.png", false);
+        assert_eq!(first, "rId1");
+        assert_eq!(second, "rId1");
+        assert_eq!(rels.rels.len(), 1);
+    }
+
+    #[test]
+    fn test_rels_add_different_target_gets_new_rid() {
+        let mut rels = Rels::default();
+        rels.add(rel_type::IMAGE, "media/a.png", false);
+        let id = rels.add(rel_type::IMAGE, "media/b.png", false);
+        assert_eq!(id, "rId2");
+        assert_eq!(rels.rels.len(), 2);
+    }
+
+    #[test]
+    fn test_rels_add_different_type_same_target_gets_new_rid() {
+        let mut rels = Rels::default();
+        rels.add(rel_type::IMAGE, "media/a.png", false);
+        let id = rels.add(rel_type::HEADER, "media/a.png", false);
+        assert_eq!(id, "rId2");
+    }
+
+    #[test]
+    fn test_rels_add_different_external_flag_gets_new_rid() {
+        let mut rels = Rels::default();
+        rels.add(rel_type::HYPERLINK, "https://example.com", false);
+        let id = rels.add(rel_type::HYPERLINK, "https://example.com", true);
+        assert_eq!(id, "rId2");
+        // same triple with external=true now dedups against the second entry
+        let again = rels.add(rel_type::HYPERLINK, "https://example.com", true);
+        assert_eq!(again, "rId2");
+    }
+
+    #[test]
+    fn test_rels_next_rid_uses_max_numeric_suffix() {
+        let mut rels = Rels::default();
+        for id in ["rId1", "rId7", "plain", "rIdX", "rId3x"] {
+            rels.rels.push(Rel {
+                id: id.to_string(),
+                rel_type: String::new(),
+                target: String::new(),
+                is_external: false,
+            });
+        }
+        assert_eq!(rels.next_rid(), "rId8");
+        assert_eq!(Rels::default().next_rid(), "rId1");
+    }
+
+    #[test]
+    fn test_rels_from_xml_parses_fields_and_external() {
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+            <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+            <Relationship Id=\"rId1\" Type=\"http://x/image\" Target=\"media/a.png\"/>\
+            <Relationship Id=\"rId2\" Type=\"http://x/hyperlink\" Target=\"https://e.com?a=1&amp;b=2\" TargetMode=\"External\"/>\
+            </Relationships>";
+        let rels = Rels::from_xml(xml);
+        assert_eq!(rels.rels.len(), 2);
+        assert_eq!(rels.rels[0].id, "rId1");
+        assert_eq!(rels.rels[0].rel_type, "http://x/image");
+        assert_eq!(rels.rels[0].target, "media/a.png");
+        assert!(!rels.rels[0].is_external);
+        assert!(rels.rels[1].is_external);
+        // attribute entities are decoded on parse
+        assert_eq!(rels.rels[1].target, "https://e.com?a=1&b=2");
+    }
+
+    #[test]
+    fn test_rels_from_xml_invalid_xml_yields_empty() {
+        assert!(Rels::from_xml("not xml at all").rels.is_empty());
+    }
+
+    #[test]
+    fn test_rels_to_xml_escapes_target_and_roundtrips() {
+        let mut rels = Rels::default();
+        let id = rels.add(rel_type::HYPERLINK, "https://e.com/?a=1&b=\"2\"", true);
+        let xml = rels.to_xml();
+        assert!(xml.contains("Target=\"https://e.com/?a=1&amp;b=&quot;2&quot;\""));
+        assert!(xml.contains("TargetMode=\"External\""));
+        let parsed = Rels::from_xml(&xml);
+        assert_eq!(parsed.rels.len(), 1);
+        assert_eq!(parsed.rels[0].id, id);
+        assert_eq!(parsed.rels[0].target, "https://e.com/?a=1&b=\"2\"");
+        assert!(parsed.rels[0].is_external);
+    }
+
+    #[test]
+    fn test_rels_by_type_and_get() {
+        let mut rels = Rels::default();
+        let img = rels.add(rel_type::IMAGE, "media/a.png", false);
+        rels.add(rel_type::HYPERLINK, "https://e.com", true);
+        let images: Vec<&Rel> = rels.by_type(rel_type::IMAGE).collect();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].id, img);
+        assert_eq!(rels.get(&img).unwrap().target, "media/a.png");
+        assert!(rels.get("rId99").is_none());
+    }
+
+    // ---- escaping ----
+
+    #[test]
+    fn test_escape_xml_attr_escapes_amp_lt_quote() {
+        assert_eq!(escape_xml_attr("a&b<c\"d'>e"), "a&amp;b&lt;c&quot;d'>e");
+    }
+
+    #[test]
+    fn test_escape_xml_text_escapes_amp_lt_gt() {
+        assert_eq!(escape_xml_text("a&b<c>\"d\""), "a&amp;b&lt;c&gt;\"d\"");
+    }
+
+    // ---- path helpers ----
+
+    #[test]
+    fn test_rels_path_for_nested_and_root() {
+        assert_eq!(
+            rels_path_for("word/document.xml"),
+            "word/_rels/document.xml.rels"
+        );
+        assert_eq!(rels_path_for("document.xml"), "_rels/document.xml.rels");
+    }
+
+    #[test]
+    fn test_part_dir_nested_and_root() {
+        assert_eq!(part_dir("word/document.xml"), "word");
+        assert_eq!(part_dir("a/b/c.xml"), "a/b");
+        assert_eq!(part_dir("document.xml"), "");
+    }
+
+    #[test]
+    fn test_resolve_target_relative_dotdot_and_absolute() {
+        assert_eq!(
+            resolve_target("word/document.xml", "media/image1.png"),
+            "word/media/image1.png"
+        );
+        assert_eq!(
+            resolve_target("word/document.xml", "../docProps/core.xml"),
+            "docProps/core.xml"
+        );
+        assert_eq!(
+            resolve_target("word/document.xml", "/word/media/a.png"),
+            "word/media/a.png"
+        );
+        assert_eq!(resolve_target("document.xml", "media/a.png"), "media/a.png");
+    }
+
+    #[test]
+    fn test_relative_target_common_and_parent_dirs() {
+        assert_eq!(
+            relative_target("word/document.xml", "word/media/image1.png"),
+            "media/image1.png"
+        );
+        assert_eq!(
+            relative_target("word/document.xml", "docProps/core.xml"),
+            "../docProps/core.xml"
+        );
+        assert_eq!(
+            relative_target("docProps/core.xml", "docProps/thumbnail.jpeg"),
+            "thumbnail.jpeg"
+        );
+        // root-level part: no directory, absolute path returned as-is
+        assert_eq!(relative_target("document.xml", "word/media/a.png"), "word/media/a.png");
+    }
+
+    // ---- encoding detection / transcoding ----
+
+    #[test]
+    fn test_detect_encoding_boms() {
+        assert_eq!(detect_encoding(b"\xEF\xBB\xBF<a/>"), "utf-8");
+        assert_eq!(detect_encoding(b"\xFF\xFE<\x00"), "utf-16le");
+        assert_eq!(detect_encoding(b"\xFE\xFF\x00<"), "utf-16be");
+    }
+
+    #[test]
+    fn test_detect_encoding_declaration_double_and_single_quotes() {
+        assert_eq!(
+            detect_encoding(b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r/>"),
+            "iso-8859-1"
+        );
+        assert_eq!(
+            detect_encoding(b"<?xml version=\"1.0\" encoding='Windows-1252'?><r/>"),
+            "windows-1252"
+        );
+    }
+
+    #[test]
+    fn test_detect_encoding_defaults_to_utf8() {
+        assert_eq!(detect_encoding(b"<?xml version=\"1.0\"?><r/>"), "utf-8");
+        assert_eq!(detect_encoding(b""), "utf-8");
+        assert_eq!(detect_encoding(b"<no-declaration/>"), "utf-8");
+    }
+
+    #[test]
+    fn test_decode_part_strips_utf8_bom() {
+        assert_eq!(decode_part(b"\xEF\xBB\xBF<a>hi</a>"), "<a>hi</a>");
+    }
+
+    #[test]
+    fn test_decode_part_latin1_declared() {
+        let blob = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a>caf\xE9</a>";
+        assert_eq!(decode_part(blob), "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a>caf\u{E9}</a>");
+    }
+
+    fn utf16le_bytes(s: &str) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xFE];
+        for u in s.encode_utf16() {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        out
+    }
+
+    fn utf16be_bytes(s: &str) -> Vec<u8> {
+        let mut out = vec![0xFE, 0xFF];
+        for u in s.encode_utf16() {
+            out.extend_from_slice(&u.to_be_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn test_decode_part_utf16le_with_bom_and_cjk() {
+        let text = "<a>\u{4E2D}\u{6587}</a>";
+        assert_eq!(detect_encoding(&utf16le_bytes(text)), "utf-16le");
+        assert_eq!(decode_part(&utf16le_bytes(text)), text);
+    }
+
+    #[test]
+    fn test_decode_part_utf16be_with_bom() {
+        let text = "<a>hi</a>";
+        assert_eq!(detect_encoding(&utf16be_bytes(text)), "utf-16be");
+        assert_eq!(decode_part(&utf16be_bytes(text)), text);
+    }
+
+    #[test]
+    fn test_encode_part_utf8_passthrough() {
+        assert_eq!(encode_part("héllo", "utf-8"), "héllo".as_bytes());
+        assert_eq!(encode_part("héllo", ""), "héllo".as_bytes());
+    }
+
+    // encoding_rs's `encode` for the UTF-16 labels follows the WHATWG spec and
+    // emits *UTF-8* payload bytes, so encode_part encodes UTF-16 manually:
+    // BOM + real UTF-16 payload, which decode_part reads back correctly.
+    #[test]
+    fn test_encode_part_utf16_roundtrip() {
+        let text = "<a>\u{4E2D}\u{6587} héllo</a>";
+        assert_eq!(encode_part(text, "utf-16le"), utf16le_bytes(text));
+        assert_eq!(encode_part(text, "utf-16"), utf16le_bytes(text));
+        assert_eq!(encode_part(text, "utf-16be"), utf16be_bytes(text));
+        assert_eq!(decode_part(&encode_part(text, "utf-16le")), text);
+        assert_eq!(decode_part(&encode_part(text, "utf-16be")), text);
+    }
+
+    #[test]
+    fn test_encode_part_unknown_label_falls_back_to_utf8() {
+        assert_eq!(encode_part("abc", "klingon"), b"abc");
+    }
+
+    // ---- Package zip I/O ----
+
+    #[test]
+    fn test_package_roundtrip_preserves_entries_and_compression() {
+        let zip = build_zip(&[
+            ("word/document.xml", b"<doc/>", zip::CompressionMethod::Stored),
+            ("word/styles.xml", b"<styles/>", zip::CompressionMethod::Deflated),
+        ]);
+        let pkg = Package::from_bytes(&zip).unwrap();
+        assert_eq!(pkg.get("word/document.xml"), Some(&b"<doc/>"[..]));
+        assert!(pkg.contains("word/styles.xml"));
+        assert!(!pkg.contains("word/missing.xml"));
+        assert!(pkg.get("word/missing.xml").is_none());
+        assert_eq!(pkg.entries[0].2, zip::CompressionMethod::Stored);
+        assert_eq!(pkg.entries[1].2, zip::CompressionMethod::Deflated);
+
+        let out = pkg.to_bytes().unwrap();
+        let mut za = zip::ZipArchive::new(Cursor::new(&out)).unwrap();
+        let mut names: Vec<String> = (0..za.len()).map(|i| za.by_index(i).unwrap().name().to_string()).collect();
+        names.sort();
+        assert_eq!(names, ["word/document.xml", "word/styles.xml"]);
+        assert_eq!(za.by_name("word/document.xml").unwrap().compression(), zip::CompressionMethod::Stored);
+        assert_eq!(za.by_name("word/styles.xml").unwrap().compression(), zip::CompressionMethod::Deflated);
+        let mut buf = Vec::new();
+        za.by_name("word/document.xml").unwrap().read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"<doc/>");
+    }
+
+    #[test]
+    fn test_package_to_bytes_skips_directory_entries() {
+        let zip = build_zip(&[
+            ("word/", b"", zip::CompressionMethod::Stored),
+            ("word/document.xml", b"<doc/>", zip::CompressionMethod::Deflated),
+        ]);
+        let pkg = Package::from_bytes(&zip).unwrap();
+        let out = pkg.to_bytes().unwrap();
+        let mut za = zip::ZipArchive::new(Cursor::new(&out)).unwrap();
+        let names: Vec<String> = (0..za.len()).map(|i| za.by_index(i).unwrap().name().to_string()).collect();
+        assert_eq!(names, ["word/document.xml"]);
+    }
+
+    #[test]
+    fn test_package_to_bytes_preserves_mtime() {
+        let dt = zip::DateTime::from_date_and_time(2020, 1, 2, 3, 4, 6).unwrap();
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut cursor);
+            let opts = zip::write::SimpleFileOptions::default().last_modified_time(dt);
+            w.start_file("word/document.xml", opts).unwrap();
+            w.write_all(b"<doc/>").unwrap();
+            w.finish().unwrap();
+        }
+        let pkg = Package::from_bytes(&cursor.into_inner()).unwrap();
+        let out = pkg.to_bytes().unwrap();
+        let mut za = zip::ZipArchive::new(Cursor::new(&out)).unwrap();
+        assert_eq!(za.by_index(0).unwrap().last_modified(), Some(dt));
+    }
+
+    #[test]
+    fn test_package_set_appends_deflated_and_overwrite_keeps_method() {
+        let zip = build_zip(&[("a.xml", b"old", zip::CompressionMethod::Stored)]);
+        let mut pkg = Package::from_bytes(&zip).unwrap();
+        // overwrite: data changes, compression method and entry order kept
+        pkg.set("a.xml", b"new".to_vec());
+        assert_eq!(pkg.get("a.xml"), Some(&b"new"[..]));
+        assert_eq!(pkg.entries.len(), 1);
+        assert_eq!(pkg.entries[0].2, zip::CompressionMethod::Stored);
+        // new entry: appended at the end with Deflated
+        pkg.set("b.xml", b"x".to_vec());
+        assert_eq!(pkg.entries.len(), 2);
+        assert_eq!(pkg.entries[1].0, "b.xml");
+        assert_eq!(pkg.entries[1].2, zip::CompressionMethod::Deflated);
+        assert_eq!(pkg.get("b.xml"), Some(&b"x"[..]));
+    }
+
+    #[test]
+    fn test_package_get_string_decodes_declared_encoding() {
+        let latin1 = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a>caf\xE9</a>";
+        let zip = build_zip(&[("a.xml", latin1, zip::CompressionMethod::Deflated)]);
+        let pkg = Package::from_bytes(&zip).unwrap();
+        assert!(pkg.get_string("a.xml").unwrap().ends_with("caf\u{E9}</a>"));
+        assert!(pkg.get_string("missing.xml").is_none());
+    }
+
+    #[test]
+    fn test_package_encoding_of_declared_and_missing() {
+        let latin1 = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a/>";
+        let zip = build_zip(&[("a.xml", latin1, zip::CompressionMethod::Deflated)]);
+        let pkg = Package::from_bytes(&zip).unwrap();
+        assert_eq!(pkg.encoding_of("a.xml"), "iso-8859-1");
+        assert_eq!(pkg.encoding_of("missing.xml"), "utf-8");
+    }
+
+    // ---- Package rels ----
+
+    #[test]
+    fn test_package_add_rel_writes_rels_entry_and_dedups() {
+        let zip = build_zip(&[("word/document.xml", b"<doc/>", zip::CompressionMethod::Deflated)]);
+        let mut pkg = Package::from_bytes(&zip).unwrap();
+        let id1 = pkg.add_rel("word/document.xml", rel_type::IMAGE, "media/a.png", false);
+        let id2 = pkg.add_rel("word/document.xml", rel_type::IMAGE, "media/a.png", false);
+        assert_eq!(id1, "rId1");
+        assert_eq!(id2, "rId1"); // dedup across save/load cycle
+        let xml = pkg.get_string("word/_rels/document.xml.rels").unwrap();
+        assert!(xml.contains("Id=\"rId1\""));
+        assert!(xml.contains("Target=\"media/a.png\""));
+        assert_eq!(xml.matches("<Relationship ").count(), 1);
+    }
+
+    #[test]
+    fn test_package_rels_cache_invalidated_by_direct_set() {
+        let xml_a = Rels::from_xml("<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId5\" Type=\"http://x/image\" Target=\"a.png\"/></Relationships>");
+        let mut pkg = rels_pkg(&xml_a.to_xml());
+        assert!(pkg.rels("word/document.xml").get("rId5").is_some());
+        // direct set of the .rels entry must drop the cached parse
+        let xml_b = "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId9\" Type=\"http://x/image\" Target=\"b.png\"/></Relationships>";
+        pkg.set("word/_rels/document.xml.rels", xml_b.as_bytes().to_vec());
+        let rels = pkg.rels("word/document.xml");
+        assert!(rels.get("rId5").is_none());
+        assert!(rels.get("rId9").is_some());
+    }
+
+    #[test]
+    fn test_package_rels_missing_entry_yields_empty() {
+        let zip = build_zip(&[("word/document.xml", b"<doc/>", zip::CompressionMethod::Deflated)]);
+        let pkg = Package::from_bytes(&zip).unwrap();
+        assert!(pkg.rels("word/document.xml").rels.is_empty());
+    }
+
+    // ---- content types ----
+
+    #[test]
+    fn test_ensure_content_type_default_inserts_before_closing_tag() {
+        let zip = build_zip(&[("[Content_Types].xml", CT_XML.as_bytes(), zip::CompressionMethod::Deflated)]);
+        let mut pkg = Package::from_bytes(&zip).unwrap();
+        pkg.ensure_content_type_default("png", "image/png");
+        let xml = pkg.get_string("[Content_Types].xml").unwrap();
+        assert!(xml.contains("<Default Extension=\"png\" ContentType=\"image/png\"/></Types>"));
+    }
+
+    #[test]
+    fn test_ensure_content_type_default_idempotent_for_existing_ext() {
+        let zip = build_zip(&[("[Content_Types].xml", CT_XML.as_bytes(), zip::CompressionMethod::Deflated)]);
+        let mut pkg = Package::from_bytes(&zip).unwrap();
+        pkg.ensure_content_type_default("xml", "something/else");
+        let xml = pkg.get_string("[Content_Types].xml").unwrap();
+        assert!(!xml.contains("something/else"));
+        assert_eq!(xml.matches("Extension=\"xml\"").count(), 1);
+    }
+
+    #[test]
+    fn test_ensure_content_type_default_noop_without_content_types_part() {
+        let zip = build_zip(&[("word/document.xml", b"<doc/>", zip::CompressionMethod::Deflated)]);
+        let mut pkg = Package::from_bytes(&zip).unwrap();
+        pkg.ensure_content_type_default("png", "image/png");
+        assert!(!pkg.contains("[Content_Types].xml"));
+    }
+
+    #[test]
+    fn test_ensure_content_type_override_inserts_and_is_idempotent() {
+        let zip = build_zip(&[("[Content_Types].xml", CT_XML.as_bytes(), zip::CompressionMethod::Deflated)]);
+        let mut pkg = Package::from_bytes(&zip).unwrap();
+        pkg.ensure_content_type_override(
+            "word/comments.xml",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml",
+        );
+        pkg.ensure_content_type_override("word/comments.xml", "other/type");
+        let xml = pkg.get_string("[Content_Types].xml").unwrap();
+        assert!(xml.contains("<Override PartName=\"/word/comments.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml\"/></Types>"));
+        assert!(!xml.contains("other/type"));
+    }
+
+    // ---- image parts ----
+
+    #[test]
+    fn test_next_image_partname_picks_lowest_free_number() {
+        let zip = build_zip(&[
+            ("word/media/image1.png", b"a", zip::CompressionMethod::Deflated),
+            ("word/media/image3.png", b"b", zip::CompressionMethod::Deflated),
+            ("word/media/image10.jpeg", b"c", zip::CompressionMethod::Deflated),
+            ("word/media/imagesmith.png", b"d", zip::CompressionMethod::Deflated),
+        ]);
+        let pkg = Package::from_bytes(&zip).unwrap();
+        assert_eq!(pkg.next_image_partname("png"), "word/media/image2.png");
+    }
+
+    #[test]
+    fn test_find_image_by_sha1_hit_and_miss() {
+        let blob = b"\x89PNG fake";
+        let zip = build_zip(&[("word/media/image1.png", blob, zip::CompressionMethod::Deflated)]);
+        let mut pkg = Package::from_bytes(&zip).unwrap();
+        assert_eq!(
+            pkg.find_image_by_sha1(&sha1_hex(blob)),
+            Some("word/media/image1.png".to_string())
+        );
+        assert_eq!(pkg.find_image_by_sha1(&sha1_hex(b"other")), None);
+    }
+
+    #[test]
+    fn test_get_or_add_image_dedups_by_sha1() {
+        let zip = build_zip(&[("[Content_Types].xml", CT_XML.as_bytes(), zip::CompressionMethod::Deflated)]);
+        let mut pkg = Package::from_bytes(&zip).unwrap();
+        let p1 = pkg.get_or_add_image(b"img-bytes", "png", "image/png");
+        let p2 = pkg.get_or_add_image(b"img-bytes", "png", "image/png");
+        let p3 = pkg.get_or_add_image(b"different", "png", "image/png");
+        assert_eq!(p1, "word/media/image1.png");
+        assert_eq!(p2, p1); // dedup: same blob reused, no new part
+        assert_eq!(p3, "word/media/image2.png");
+        let media: Vec<&String> = pkg
+            .entries
+            .iter()
+            .map(|(n, _, _, _)| n)
+            .filter(|n| n.starts_with("word/media/"))
+            .collect();
+        assert_eq!(media.len(), 2);
+        // content type default registered exactly once
+        let ct = pkg.get_string("[Content_Types].xml").unwrap();
+        assert_eq!(ct.matches("Extension=\"png\"").count(), 1);
     }
 }

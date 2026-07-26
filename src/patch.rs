@@ -704,3 +704,310 @@ pub fn element_tag_scan(xml: &str, y: &str, comment: bool) -> String {
     out.push_str(&xml[i.min(xml.len())..]);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ------------------------------------------------------------------
+    // 手写线性扫描器（AGENTS.md 第 9 条：替代会溢出回退栈的跨段正则）
+    // ------------------------------------------------------------------
+
+    /// merge_split_braces_scan：拆开成多段 run 的 jinja 定界符合并，
+    /// 等价 docxtpl 的 `(?<=\{)(?>(?:<[^>]*>)+)(?=[\{%\#])|(?<=[%\}\#])(?>(?:<[^>]*>)+)(?=\})`
+    #[test]
+    fn test_merge_split_braces_cross_paragraph() {
+        // 开侧 `{<tags>{` -> `{{`（跨 run）
+        assert_eq!(merge_split_braces_scan("{</w:t></w:r><w:r><w:t>{"), "{{");
+        // 跨整个段落
+        let xml = "<w:p><w:r><w:t>{</w:t></w:r></w:p><w:p><w:r><w:t>{ x }}</w:t></w:r></w:p>";
+        assert_eq!(
+            merge_split_braces_scan(xml),
+            "<w:p><w:r><w:t>{{ x }}</w:t></w:r></w:p>"
+        );
+        // 闭侧 `%<tags>}` -> `%}`；开侧终止符也可以是 % 或 #
+        assert_eq!(merge_split_braces_scan("%</w:t><w:t>}"), "%}");
+        assert_eq!(merge_split_braces_scan("{<a></a>%"), "{%");
+    }
+
+    #[test]
+    fn test_merge_split_braces_no_match() {
+        // 无终止符：标签后不是定界符，原样保留
+        assert_eq!(merge_split_braces_scan("{<a></a>x"), "{<a></a>x");
+        // 闭侧只认 `}`，其它定界符不匹配
+        assert_eq!(merge_split_braces_scan("%<a>{"), "%<a>{");
+        // 原子组语义：标签之间夹了非标签字符即失败，不回退
+        assert_eq!(merge_split_braces_scan("{<a>x{"), "{<a>x{");
+        // 没有 `>` 的不完整标签不算标签；空输入
+        assert_eq!(merge_split_braces_scan("{<a"), "{<a");
+        assert_eq!(merge_split_braces_scan(""), "");
+    }
+
+    /// space_preserve_scan：区域内（到下一个裸 `<w:t>` 为止）出现
+    /// `{{`/`{%` 时把 `<w:t>` 改写为 `<w:t xml:space="preserve">`
+    #[test]
+    fn test_space_preserve_scan() {
+        assert_eq!(
+            space_preserve_scan("<w:t>{{ x }}</w:t>"),
+            "<w:t xml:space=\"preserve\">{{ x }}</w:t>"
+        );
+        assert_eq!(
+            space_preserve_scan("<w:t>{% if x %}</w:t>"),
+            "<w:t xml:space=\"preserve\">{% if x %}</w:t>"
+        );
+        // 纯文本不改；多个 run 只改含 jinja 标签的那个
+        assert_eq!(
+            space_preserve_scan("<w:t>a</w:t><w:t>{{b}}</w:t>"),
+            "<w:t>a</w:t><w:t xml:space=\"preserve\">{{b}}</w:t>"
+        );
+        // 扫描区域延伸到下一个 `<w:t>` 开头（可越过 `</w:t>`，
+        // 与 docxtpl 的 tempered-dot 正则一致）
+        assert_eq!(
+            space_preserve_scan("<w:t>a</w:t>{{ x }}<w:t>b</w:t>"),
+            "<w:t xml:space=\"preserve\">a</w:t>{{ x }}<w:t>b</w:t>"
+        );
+        // 只匹配裸 `<w:t>`，已带属性的不动；空输入
+        assert_eq!(
+            space_preserve_scan("<w:t xml:space=\"preserve\">{{x}}</w:t>"),
+            "<w:t xml:space=\"preserve\">{{x}}</w:t>"
+        );
+        assert_eq!(space_preserve_scan(""), "");
+    }
+
+    /// dash_merge_prev_scan：`{%-` 向前合并：删去最近一个 `</w:t>`
+    /// 到 `{%-` 之间的全部内容，留下 `{%`
+    #[test]
+    fn test_dash_merge_prev_scan() {
+        assert_eq!(dash_merge_prev_scan("a</w:t>junk{%- x %}"), "a{% x %}");
+        // 跨段落合并（docxtpl 的典型用途）
+        let xml = "<w:p><w:r><w:t>text</w:t></w:r></w:p><w:p><w:r><w:t>{%- if x %}</w:t></w:r></w:p>";
+        assert_eq!(
+            dash_merge_prev_scan(xml),
+            "<w:p><w:r><w:t>text{% if x %}</w:t></w:r></w:p>"
+        );
+        // 多处出现逐一处理
+        assert_eq!(
+            dash_merge_prev_scan("a</w:t>{%- x %}b</w:t>{%- y"),
+            "a{% x %}b{% y"
+        );
+        // 边界：前面没有 `</w:t>` 时保持原样；空输入
+        assert_eq!(dash_merge_prev_scan("x{%- y"), "x{%- y");
+        assert_eq!(dash_merge_prev_scan(""), "");
+    }
+
+    /// dash_merge_next_scan：`-%}` 向后合并：删去 `-%}` 到下一个
+    /// `<w:t>`/`<w:t ` 开标签（含）之间的内容，留下 `%}`
+    #[test]
+    fn test_dash_merge_next_scan() {
+        assert_eq!(dash_merge_next_scan("-%}junk<w:t>text"), "%}text");
+        // 带属性的 `<w:t ` 也是合法目标
+        assert_eq!(
+            dash_merge_next_scan("-%}junk<w:t xml:space=\"preserve\">x"),
+            "%}x"
+        );
+        // 跨段落合并
+        let xml = "{% endif -%}</w:t></w:r></w:p><w:p><w:r><w:t>next</w:t></w:r></w:p>";
+        assert_eq!(dash_merge_next_scan(xml), "{% endif %}next</w:t></w:r></w:p>");
+    }
+
+    #[test]
+    fn test_dash_merge_next_blocked() {
+        // `-%}` 与下一个 `<w:t>` 之间出现 jinja 标签则放弃合并
+        assert_eq!(dash_merge_next_scan("-%}{{ x }}<w:t>t"), "-%}{{ x }}<w:t>t");
+        assert_eq!(dash_merge_next_scan("-%}{% y %}<w:t>t"), "-%}{% y %}<w:t>t");
+        // `<w:tc>` 虽以 `<w:t` 开头但不是 `<w:t>`/`<w:t `，不匹配
+        assert_eq!(dash_merge_next_scan("-%}<w:tc>x"), "-%}<w:tc>x");
+        // 后面根本没有 `<w:t>`；空输入
+        assert_eq!(dash_merge_next_scan("-%}junk"), "-%}junk");
+        assert_eq!(dash_merge_next_scan(""), "");
+    }
+
+    /// element_tag_scan：含 `{%y `/`{{y `/`{#y ` 标签的 `<w:y>` 元素
+    /// 整体替换为裸标签（y = tr/tc/p/r）
+    #[test]
+    fn test_element_tag_scan_basic() {
+        assert_eq!(
+            element_tag_scan("<w:p><w:r><w:t>{%p if x %}</w:t></w:r></w:p>", "p", false),
+            "{% if x %}"
+        );
+        let xml = "<w:tr><w:tc><w:p><w:r><w:t>{{tr row }}</w:t></w:r></w:p></w:tc></w:tr>";
+        assert_eq!(element_tag_scan(xml, "tr", false), "{{ row }}");
+        assert_eq!(
+            element_tag_scan("<w:r><w:t>{%r rt %}</w:t></w:r>", "r", false),
+            "{% rt %}"
+        );
+        // comment 模式只认 `{#y #}`
+        assert_eq!(
+            element_tag_scan("<w:p><w:r><w:t>{#p note #}</w:t></w:r></w:p>", "p", true),
+            "{# note #}"
+        );
+        assert_eq!(
+            element_tag_scan("<w:p>{%p x %}</w:p>", "p", true),
+            "<w:p>{%p x %}</w:p>"
+        );
+    }
+
+    #[test]
+    fn test_element_tag_scan_boundaries() {
+        // 无标签的元素原样保留；继续扫描后续兄弟元素
+        assert_eq!(
+            element_tag_scan("<w:p>a</w:p><w:p>{%p x %}</w:p>", "p", false),
+            "<w:p>a</w:p>{% x %}"
+        );
+        // 标签体含 `%`/`}`（docxtpl 的 [^}%]*）则不替换
+        assert_eq!(
+            element_tag_scan("<w:p>{%p a } b %}</w:p>", "p", false),
+            "<w:p>{%p a } b %}</w:p>"
+        );
+        // `<w:px` 不是 `<w:p` 元素（开标签后必须是空格或 `>`）
+        assert_eq!(
+            element_tag_scan("<w:px>{%p x %}</w:px>", "p", false),
+            "<w:px>{%p x %}</w:px>"
+        );
+        // 元素未闭合时区域延伸到输入末尾，仍可替换
+        assert_eq!(element_tag_scan("<w:p>{%p x %}", "p", false), "{% x %}");
+        // 闭合符 `%}` 落在元素区域之外则不替换
+        assert_eq!(
+            element_tag_scan("<w:p>{%p x </w:p>%}", "p", false),
+            "<w:p>{%p x </w:p>%}"
+        );
+        assert_eq!(element_tag_scan("", "p", false), "");
+    }
+
+    // ------------------------------------------------------------------
+    // patch_xml 端到端核心规则。期望值均对照 docxtpl 0.20.2
+    // DocxTemplate.patch_xml 在相同输入下的实际输出验证过。
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_patch_xml_split_braces_and_strip_tags() {
+        // jinja 标签被 run 边界拆开：先合并定界符，再剥掉标签内部的 XML
+        let xml = "<w:p><w:r><w:t>{{ x </w:t></w:r><w:r><w:t>+ y }}</w:t></w:r></w:p>";
+        assert_eq!(
+            patch_xml(xml),
+            "<w:p><w:r><w:t xml:space=\"preserve\">{{ x + y }}</w:t></w:r></w:p>"
+        );
+        // 定界符合并出的是不完整标签（只有 `{{ x }`）。
+        // 注意：docxtpl 0.20.2 的 space-preserve 正则要求完整的 {{...}}，
+        // 这里不会加 preserve；Rust 版 space_preserve_scan 只看开侧 `{{`，
+        // 会多加 xml:space="preserve" —— 与 docxtpl 有出入（疑似 bug，见汇报）
+        let xml2 = "<w:p><w:r><w:t>{</w:t></w:r><w:r><w:t>{ x }</w:t></w:r></w:p>";
+        assert_eq!(
+            patch_xml(xml2),
+            "<w:p><w:r><w:t xml:space=\"preserve\">{{ x }</w:t></w:r></w:p>"
+        );
+    }
+
+    #[test]
+    fn test_patch_xml_colspan_cellbg() {
+        // colspan：删掉空 <w:t></w:t> run 与已有 gridSpan，注入新的
+        let xml = "<w:tc><w:tcPr><w:gridSpan w:val=\"9\"/></w:tcPr><w:r><w:t>{% colspan span %}</w:t></w:r></w:tc>";
+        assert_eq!(
+            patch_xml(xml),
+            "<w:tc><w:tcPr><w:gridSpan w:val=\"{{span }}\"/></w:tcPr></w:tc>"
+        );
+        // cellbg：删掉已有 <w:shd>，注入带 jinja fill 的新 <w:shd>
+        let xml = "<w:tc><w:tcPr><w:shd w:val=\"clear\" w:fill=\"FF0000\"/></w:tcPr><w:r><w:t>{% cellbg color %}</w:t></w:r></w:tc>";
+        assert_eq!(
+            patch_xml(xml),
+            "<w:tc><w:tcPr><w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"{{color }}\"/></w:tcPr></w:tc>"
+        );
+    }
+
+    #[test]
+    fn test_patch_xml_richtext_and_dash_merge() {
+        // {{r ...}} 先被包进独立 run 对，随后 y-loop（y="r"）又把该 run
+        // 整体改写成普通 {{ ... }}（已确认与 docxtpl 0.20.2 行为一致）
+        let xml = "<w:body><w:p><w:r><w:t>{{r rt }}</w:t></w:r></w:p></w:body>";
+        assert_eq!(
+            patch_xml(xml),
+            "<w:body><w:p><w:r><w:t xml:space=\"preserve\"></w:t></w:r>{{ rt }}<w:r><w:t xml:space=\"preserve\"></w:t></w:r></w:p></w:body>"
+        );
+        // {%- 跨段落向前合并
+        let xml = "<w:p><w:r><w:t>text</w:t></w:r></w:p><w:p><w:r><w:t>{%- if x %}</w:t></w:r></w:p>";
+        assert_eq!(
+            patch_xml(xml),
+            "<w:p><w:r><w:t>text{% if x %}</w:t></w:r></w:p>"
+        );
+        // -%} 跨段落向后合并
+        let xml = "<w:p><w:r><w:t>{% endif -%}</w:t></w:r></w:p><w:p><w:r><w:t>next</w:t></w:r></w:p>";
+        assert_eq!(
+            patch_xml(xml),
+            "<w:p><w:r><w:t xml:space=\"preserve\">{% endif %}next</w:t></w:r></w:p>"
+        );
+    }
+
+    #[test]
+    fn test_patch_xml_element_tags() {
+        assert_eq!(
+            patch_xml("<w:p><w:r><w:t>{%p if x %}</w:t></w:r></w:p>"),
+            "{% if x %}"
+        );
+        let xml = "<w:tr><w:tc><w:p><w:r><w:t>{{tr row }}</w:t></w:r></w:p></w:tc></w:tr>";
+        assert_eq!(patch_xml(xml), "{{ row }}");
+        assert_eq!(
+            patch_xml("<w:p><w:r><w:t>{#p note #}</w:t></w:r></w:p>"),
+            "{# note #}"
+        );
+    }
+
+    #[test]
+    fn test_patch_xml_vmerge_hmerge() {
+        // {% vm %}：注入 vMerge，内容包进 {% if loop.first %}
+        let xml = "<w:tc><w:tcPr></w:tcPr><w:r><w:t>{% vm %}content</w:t></w:r></w:tc>";
+        assert_eq!(
+            patch_xml(xml),
+            "<w:tc><w:tcPr><w:vMerge w:val=\"{% if loop.first %}restart{% else %}continue{% endif %}\"/></w:tcPr><w:r><w:t xml:space=\"preserve\">{% if loop.first %}content{% endif %}</w:t></w:r></w:tc>"
+        );
+        // {% hm %} 无 gridSpan：新增 gridSpan = loop.length
+        let xml = "<w:tc><w:tcPr></w:tcPr><w:r><w:t>a{% hm %}b</w:t></w:r></w:tc>";
+        assert_eq!(
+            patch_xml(xml),
+            "{% if loop.first %}<w:tc><w:tcPr><w:gridSpan w:val=\"{{ loop.length }}\"/></w:tcPr><w:r><w:t xml:space=\"preserve\">ab</w:t></w:r></w:tc>{% endif %}"
+        );
+        // {% hm %} 已有 gridSpan：值乘以 loop.length
+        let xml = "<w:tc><w:tcPr><w:gridSpan w:val=\"3\"/></w:tcPr><w:r><w:t>{% hm %}</w:t></w:r></w:tc>";
+        assert_eq!(
+            patch_xml(xml),
+            "{% if loop.first %}<w:tc><w:tcPr><w:gridSpan w:val=\"{{ 3 * loop.length }}\"/></w:tcPr><w:r><w:t xml:space=\"preserve\"></w:t></w:r></w:tc>{% endif %}"
+        );
+    }
+
+    #[test]
+    fn test_patch_xml_clean_tags_and_identity() {
+        // jinja 标签内的 &lt;/&gt; 与智能引号被还原
+        assert_eq!(
+            patch_xml("<w:p><w:r><w:t>{{ x &lt; y }}</w:t></w:r></w:p>"),
+            "<w:p><w:r><w:t xml:space=\"preserve\">{{ x < y }}</w:t></w:r></w:p>"
+        );
+        assert_eq!(
+            patch_xml("<w:p><w:r><w:t>{{ \u{201c}s\u{201d} }}</w:t></w:r></w:p>"),
+            "<w:p><w:r><w:t xml:space=\"preserve\">{{ \"s\" }}</w:t></w:r></w:p>"
+        );
+        // 无任何触发内容时恒等；空输入
+        let xml = "<w:p><w:r><w:t>plain</w:t></w:r></w:p>";
+        assert_eq!(patch_xml(xml), xml);
+        assert_eq!(patch_xml(""), "");
+    }
+
+    /// 长输入（约 700KB）：线性扫描器在无匹配时保持恒等、在末尾有
+    /// 匹配时正确跨段删除 —— 正是 AGENTS.md 第 9 条防回退栈溢出的场景
+    #[test]
+    fn test_scanners_long_input() {
+        let mut long = String::new();
+        for _ in 0..20_000 {
+            long.push_str("<w:p><w:r><w:t>t</w:t></w:r></w:p>");
+        }
+        assert_eq!(merge_split_braces_scan(&long), long);
+        assert_eq!(space_preserve_scan(&long), long);
+        assert_eq!(dash_merge_next_scan(&long), long);
+        assert_eq!(element_tag_scan(&long, "p", false), long);
+        // `{%-` 在大文档末尾：从最后一个 `</w:t>` 起跨段删除
+        let input = format!("{}<w:p><w:r><w:t>{{%- x %}}</w:t></w:r></w:p>", long);
+        let expected = format!(
+            "{}{{% x %}}</w:t></w:r></w:p>",
+            &long[..long.len() - "</w:t></w:r></w:p>".len()]
+        );
+        assert_eq!(dash_merge_prev_scan(&input), expected);
+    }
+}

@@ -275,3 +275,349 @@ pub fn decl(version: &str, encoding: &str, standalone: bool) -> String {
     let d = BytesDecl::new(version, Some(encoding), if standalone { Some("yes") } else { None });
     format!("<?{}?>", String::from_utf8_lossy(d.as_ref()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn el(name: &str) -> Element {
+        Element::new(name)
+    }
+
+    // ---------- Element::new / get_attr / set_attr ----------
+
+    #[test]
+    fn test_new_element_has_no_attrs_or_children() {
+        let e = el("w:p");
+        assert_eq!(e.name, "w:p");
+        assert!(e.attrs.is_empty());
+        assert!(e.children.is_empty());
+    }
+
+    #[test]
+    fn test_get_attr_returns_none_for_missing() {
+        let e = el("a");
+        assert_eq!(e.get_attr("nope"), None);
+    }
+
+    #[test]
+    fn test_set_attr_appends_new_attribute() {
+        let mut e = el("a");
+        e.set_attr("x", "1");
+        e.set_attr("y", "2");
+        assert_eq!(e.get_attr("x"), Some("1"));
+        assert_eq!(e.get_attr("y"), Some("2"));
+        // insertion order is preserved
+        assert_eq!(
+            e.attrs,
+            vec![("x".to_string(), "1".to_string()), ("y".to_string(), "2".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_set_attr_replaces_existing_in_place() {
+        let mut e = el("a");
+        e.set_attr("x", "1");
+        e.set_attr("y", "2");
+        e.set_attr("x", "3");
+        assert_eq!(e.get_attr("x"), Some("3"));
+        // no duplicate key added, order unchanged
+        assert_eq!(e.attrs.len(), 2);
+        assert_eq!(e.attrs[0].0, "x");
+        assert_eq!(e.attrs[1].0, "y");
+    }
+
+    // ---------- find / find_mut / find_all / iter_descendants ----------
+
+    #[test]
+    fn test_find_returns_first_direct_child_only() {
+        let mut root = el("root");
+        let mut first = el("item");
+        first.set_attr("id", "1");
+        let mut second = el("item");
+        second.set_attr("id", "2");
+        root.children.push(Node::Text("text".into()));
+        root.children.push(Node::Elem(first));
+        root.children.push(Node::Elem(second));
+
+        let found = root.find("item").expect("should find first item");
+        assert_eq!(found.get_attr("id"), Some("1"));
+        // text nodes are skipped, missing name returns None
+        assert!(root.find("text").is_none());
+    }
+
+    #[test]
+    fn test_find_does_not_recurse_into_grandchildren() {
+        let mut root = el("root");
+        let mut child = el("child");
+        child.children.push(Node::Elem(el("item")));
+        root.children.push(Node::Elem(child));
+        assert!(root.find("item").is_none());
+    }
+
+    #[test]
+    fn test_find_mut_allows_in_place_mutation() {
+        let mut root = el("root");
+        root.children.push(Node::Elem(el("item")));
+        root.find_mut("item").unwrap().set_attr("id", "9");
+        assert_eq!(root.find("item").unwrap().get_attr("id"), Some("9"));
+        assert!(root.find_mut("missing").is_none());
+    }
+
+    #[test]
+    fn test_find_all_returns_all_direct_matches_in_order() {
+        let mut root = el("root");
+        for id in ["a", "b", "c"] {
+            let mut item = el("item");
+            item.set_attr("id", id);
+            root.children.push(Node::Elem(item));
+        }
+        root.children.push(Node::Elem(el("other")));
+        let ids: Vec<&str> = root
+            .find_all("item")
+            .iter()
+            .map(|e| e.get_attr("id").unwrap())
+            .collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        assert!(root.find_all("nope").is_empty());
+    }
+
+    #[test]
+    fn test_iter_descendants_collects_nested_matches() {
+        let doc = Document::parse("<root><a><b/><a><b/></a></a><b/></root>").unwrap();
+        let mut out = Vec::new();
+        doc.root.iter_descendants("b", &mut out);
+        assert_eq!(out.len(), 3);
+        // self is not included even if the name matches
+        let mut out = Vec::new();
+        doc.root.iter_descendants("root", &mut out);
+        assert!(out.is_empty());
+    }
+
+    // ---------- Element::serialize escaping ----------
+
+    #[test]
+    fn test_serialize_escapes_text_special_chars() {
+        let mut e = el("t");
+        e.children.push(Node::Text(r#"a<b>c&d"e'f"#.into()));
+        let mut out = String::new();
+        e.serialize(&mut out);
+        // text escapes & < >, but not quotes
+        assert_eq!(out, r#"<t>a&lt;b&gt;c&amp;d"e'f</t>"#);
+    }
+
+    #[test]
+    fn test_serialize_escapes_attr_special_chars() {
+        let mut e = el("t");
+        e.set_attr("v", r#"a<b&c"d>e'f"#);
+        let mut out = String::new();
+        e.serialize(&mut out);
+        // attrs escape & < ", but not > or '
+        assert_eq!(out, r#"<t v="a&lt;b&amp;c&quot;d>e'f"/>"#);
+    }
+
+    #[test]
+    fn test_serialize_empty_element_is_self_closing() {
+        let e = el("w:br");
+        let mut out = String::new();
+        e.serialize(&mut out);
+        assert_eq!(out, "<w:br/>");
+    }
+
+    #[test]
+    fn test_serialize_nested_structure_and_attr_order() {
+        let mut root = el("w:tc");
+        root.set_attr("w:val", "x");
+        let mut p = el("w:p");
+        p.children.push(Node::Text("hi".into()));
+        root.children.push(Node::Elem(p));
+        let mut out = String::new();
+        root.serialize(&mut out);
+        assert_eq!(out, r#"<w:tc w:val="x"><w:p>hi</w:p></w:tc>"#);
+    }
+
+    // ---------- Document::parse / serialize round-trip ----------
+
+    #[test]
+    fn test_parse_roundtrip_simple_document() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><root a="1"><child>text</child></root>"#;
+        let doc = Document::parse(xml).unwrap();
+        assert_eq!(
+            doc.prolog,
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#
+        );
+        assert_eq!(doc.root.name, "root");
+        assert_eq!(doc.serialize(), xml);
+    }
+
+    #[test]
+    fn test_parse_text_entities_are_decoded() {
+        let doc = Document::parse("<t>a&lt;b&gt;c&amp;d&quot;e&apos;f</t>").unwrap();
+        assert_eq!(doc.root.text_content(), "a<b>c&d\"e'f");
+    }
+
+    #[test]
+    fn test_parse_numeric_char_references_are_decoded() {
+        let doc = Document::parse("<t>&#65;&#x42;</t>").unwrap();
+        assert_eq!(doc.root.text_content(), "AB");
+    }
+
+    #[test]
+    fn test_parse_entity_roundtrip_in_text() {
+        let xml = "<t>a&lt;b&amp;c</t>";
+        let doc = Document::parse(xml).unwrap();
+        assert_eq!(doc.serialize(), xml);
+    }
+
+    #[test]
+    fn test_parse_attr_entities_are_decoded_and_reescaped() {
+        let doc = Document::parse(r#"<t a="&lt;&amp;&quot;&gt;&apos;"/>"#).unwrap();
+        assert_eq!(doc.root.get_attr("a"), Some("<&\">'"));
+        // serialize re-escapes " as &quot;, but ' and > stay literal
+        assert_eq!(doc.serialize(), r#"<t a="&lt;&amp;&quot;>'"/>"#);
+    }
+
+    #[test]
+    fn test_parse_namespace_prefixes_treated_literally() {
+        let xml = r#"<w:document xmlns:w="urn:x"><w:body w:rsidR="00AB"/></w:document>"#;
+        let doc = Document::parse(xml).unwrap();
+        assert_eq!(doc.root.name, "w:document");
+        assert_eq!(doc.root.get_attr("xmlns:w"), Some("urn:x"));
+        let body = doc.root.find("w:body").unwrap();
+        assert_eq!(body.get_attr("w:rsidR"), Some("00AB"));
+        assert_eq!(doc.serialize(), xml);
+    }
+
+    #[test]
+    fn test_parse_self_closing_and_explicit_empty_tags() {
+        let doc = Document::parse("<root><a/><b></b></root>").unwrap();
+        assert!(doc.root.find("a").unwrap().children.is_empty());
+        assert!(doc.root.find("b").unwrap().children.is_empty());
+        // <b></b> has no children, so it serializes back self-closed
+        assert_eq!(doc.serialize(), "<root><a/><b/></root>");
+    }
+
+    #[test]
+    fn test_parse_deeply_nested_structure() {
+        let xml = "<a><b><c><d>deep</d></c></b></a>";
+        let doc = Document::parse(xml).unwrap();
+        let d = doc
+            .root
+            .find("b")
+            .and_then(|b| b.find("c"))
+            .and_then(|c| c.find("d"))
+            .unwrap();
+        assert_eq!(d.text_content(), "deep");
+        assert_eq!(doc.serialize(), xml);
+    }
+
+    #[test]
+    fn test_parse_cdata_content_kept_as_raw_text() {
+        let doc = Document::parse("<t><![CDATA[a<b&c]]></t>").unwrap();
+        assert_eq!(doc.root.text_content(), "a<b&c");
+        // CDATA markers are lost; content re-serializes as escaped text
+        assert_eq!(doc.serialize(), "<t>a&lt;b&amp;c</t>");
+    }
+
+    #[test]
+    fn test_parse_comment_before_root_goes_to_prolog() {
+        let doc = Document::parse("<!--note--><root/>").unwrap();
+        assert_eq!(doc.prolog, "<!--note-->");
+        assert_eq!(doc.serialize(), "<!--note--><root/>");
+    }
+
+    #[test]
+    fn test_parse_comment_inside_root_is_dropped() {
+        let doc = Document::parse("<root><!--note--><a/></root>").unwrap();
+        // comment inside root becomes an empty text node
+        assert_eq!(doc.serialize(), "<root><a/></root>");
+    }
+
+    #[test]
+    fn test_parse_pi_before_root_goes_to_prolog() {
+        let doc = Document::parse("<?xml-stylesheet href=\"x\"?><root/>").unwrap();
+        assert_eq!(doc.prolog, r#"<?xml-stylesheet href="x"?>"#);
+        assert_eq!(doc.serialize(), r#"<?xml-stylesheet href="x"?><root/>"#);
+    }
+
+    #[test]
+    fn test_parse_doctype_goes_to_prolog() {
+        let doc = Document::parse("<!DOCTYPE html><root/>").unwrap();
+        // NOTE: quick-xml strips the leading whitespace of the doctype content and
+        // parse() rejoins without a space, so "<!DOCTYPE html>" does not round-trip
+        assert_eq!(doc.prolog, "<!DOCTYPEhtml>");
+        assert_eq!(doc.serialize(), "<!DOCTYPEhtml><root/>");
+    }
+
+    #[test]
+    fn test_parse_whitespace_text_between_elements_preserved() {
+        let xml = "<root> <a/> </root>";
+        let doc = Document::parse(xml).unwrap();
+        assert_eq!(doc.serialize(), xml);
+    }
+
+    #[test]
+    fn test_text_content_concatenates_all_descendants() {
+        let doc = Document::parse("<r>x<a>y</a>z<b><c>w</c></b></r>").unwrap();
+        assert_eq!(doc.root.text_content(), "xyzw");
+    }
+
+    // ---------- error / edge paths ----------
+
+    #[test]
+    fn test_parse_mismatched_end_tag_errors() {
+        let err = Document::parse("<a></b>").unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn test_parse_unclosed_tag_errors_or_no_root() {
+        // either quick-xml reports ill-formed, or the stack is never popped
+        assert!(Document::parse("<a>").is_err());
+    }
+
+    #[test]
+    fn test_parse_empty_input_errors_no_root() {
+        let err = Document::parse("").unwrap_err();
+        assert_eq!(err, "no root element found");
+    }
+
+    #[test]
+    fn test_parse_prolog_only_errors_no_root() {
+        let err = Document::parse(r#"<?xml version="1.0"?>"#).unwrap_err();
+        assert_eq!(err, "no root element found");
+    }
+
+    #[test]
+    fn test_parse_bare_text_errors_no_root() {
+        assert!(Document::parse("not xml").is_err());
+    }
+
+    #[test]
+    fn test_parse_unterminated_attr_value_errors() {
+        assert!(Document::parse("<a x=\"1>").is_err());
+    }
+
+    #[test]
+    fn test_parse_second_root_is_silently_dropped() {
+        // documents current lenient behavior: only the first root is kept
+        let doc = Document::parse("<a/><b/>").unwrap();
+        assert_eq!(doc.root.name, "a");
+        assert_eq!(doc.serialize(), "<a/>");
+    }
+
+    // ---------- decl helper ----------
+
+    #[test]
+    fn test_decl_standalone_yes() {
+        assert_eq!(
+            decl("1.0", "UTF-8", true),
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#
+        );
+    }
+
+    #[test]
+    fn test_decl_without_standalone() {
+        assert_eq!(decl("1.0", "UTF-8", false), r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+    }
+}
