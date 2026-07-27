@@ -26,25 +26,49 @@ pub struct Document {
 }
 
 fn escape_text(s: &str, out: &mut String) {
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            _ => out.push(c),
-        }
+    // bulk-copy runs without special chars; all escaped chars are ASCII, so
+    // byte indexing is char-safe
+    let b = s.as_bytes();
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        let rep = match b[i] {
+            b'&' => "&amp;",
+            b'<' => "&lt;",
+            b'>' => "&gt;",
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        out.push_str(&s[last..i]);
+        out.push_str(rep);
+        i += 1;
+        last = i;
     }
+    out.push_str(&s[last..]);
 }
 
 fn escape_attr(s: &str, out: &mut String) {
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(c),
-        }
+    let b = s.as_bytes();
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        let rep = match b[i] {
+            b'&' => "&amp;",
+            b'<' => "&lt;",
+            b'"' => "&quot;",
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        out.push_str(&s[last..i]);
+        out.push_str(rep);
+        i += 1;
+        last = i;
     }
+    out.push_str(&s[last..]);
 }
 
 impl Element {
@@ -158,15 +182,15 @@ impl Document {
         loop {
             match reader.read_event().map_err(|e| e.to_string())? {
                 Event::Start(e) => {
-                    let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                     let mut attrs = Vec::new();
                     for a in e.attributes() {
                         let a = a.map_err(|e| e.to_string())?;
-                        let key = String::from_utf8_lossy(a.key.as_ref()).to_string();
+                        let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
                         let val = a
                             .decode_and_unescape_value(reader.decoder())
                             .map_err(|e| e.to_string())?
-                            .to_string();
+                            .into_owned();
                         attrs.push((key, val));
                     }
                     stack.push(Element {
@@ -176,15 +200,15 @@ impl Document {
                     });
                 }
                 Event::Empty(e) => {
-                    let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                     let mut attrs = Vec::new();
                     for a in e.attributes() {
                         let a = a.map_err(|e| e.to_string())?;
-                        let key = String::from_utf8_lossy(a.key.as_ref()).to_string();
+                        let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
                         let val = a
                             .decode_and_unescape_value(reader.decoder())
                             .map_err(|e| e.to_string())?
-                            .to_string();
+                            .into_owned();
                         attrs.push((key, val));
                     }
                     let el = Element {
@@ -208,10 +232,17 @@ impl Document {
                     }
                 }
                 Event::Text(e) => {
-                    let raw = String::from_utf8_lossy(e.as_ref()).to_string();
-                    let t = quick_xml::escape::unescape(&raw)
-                        .map(|c| c.to_string())
-                        .unwrap_or(raw);
+                    let raw = String::from_utf8_lossy(e.as_ref());
+                    // fast path: no '&' => nothing to unescape, keep the single
+                    // allocation instead of copy + re-copy
+                    let t = if raw.contains('&') {
+                        match quick_xml::escape::unescape(&raw) {
+                            Ok(c) => c.into_owned(),
+                            Err(_) => raw.into_owned(),
+                        }
+                    } else {
+                        raw.into_owned()
+                    };
                     if let Some(parent) = stack.last_mut() {
                         parent.children.push(Node::Text(t));
                     } else {
@@ -263,7 +294,15 @@ impl Document {
     }
 
     pub fn serialize(&self) -> String {
-        let mut out = self.prolog.clone();
+        self.serialize_with_capacity(0)
+    }
+
+    /// Serialize with a preallocated output capacity. Pass the source xml
+    /// length when known: a parse→serialize round-trip stays close in size,
+    /// so this avoids the doubling-growth reallocs on multi-MB documents.
+    pub fn serialize_with_capacity(&self, cap: usize) -> String {
+        let mut out = String::with_capacity(cap);
+        out.push_str(&self.prolog);
         self.root.serialize(&mut out);
         out
     }

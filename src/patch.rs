@@ -1,6 +1,7 @@
 //! Port of docxtpl's patch_xml / resolve_listing logic (regex-based XML cleaning).
 
 use fancy_regex::{Captures, Regex};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -168,15 +169,48 @@ pub fn sub_str(pattern: &str, replacement: &str, text: &str) -> String {
 /// containing `&quot;`, `&apos;` or numeric character references inside jinja
 /// tags work there). `&lt;` `&gt;` `&amp;` are intentionally kept escaped,
 /// matching lxml's serialization behavior.
-pub fn decode_text_entities(xml: &str) -> String {
+pub fn decode_text_entities(xml: &str) -> Cow<'_, str> {
     if !xml.contains('&') {
-        return xml.to_string();
+        return Cow::Borrowed(xml);
     }
-    sub(
-        r"(?<=>)([^<>]*)(?=<)",
-        |m| decode_entities_keep_markup(m.get(0).unwrap().as_str()),
-        xml,
-    )
+    // hand-rolled equivalent of the `(?<=>)([^<>]*)(?=<)` pass: decode
+    // entities in text nodes only; borrowed when nothing actually changed
+    // (e.g. only `&lt;`/`&amp;` which are kept escaped)
+    let b = xml.as_bytes();
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'>' {
+            let text_start = i + 1;
+            let mut j = text_start;
+            while j < b.len() && b[j] != b'<' && b[j] != b'>' {
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'<' && j > text_start {
+                let text = &xml[text_start..j];
+                if text.contains('&') {
+                    let decoded = decode_entities_keep_markup(text);
+                    if decoded != text {
+                        let o = out.get_or_insert_with(|| String::with_capacity(xml.len()));
+                        o.push_str(&xml[copied..text_start]);
+                        o.push_str(&decoded);
+                        copied = j;
+                    }
+                }
+            }
+            i = j; // j >= text_start > i, always forward
+            continue;
+        }
+        i += 1;
+    }
+    match out {
+        Some(mut o) => {
+            o.push_str(&xml[copied..]);
+            Cow::Owned(o)
+        }
+        None => Cow::Borrowed(xml),
+    }
 }
 
 fn decode_entities_keep_markup(text: &str) -> String {
@@ -235,30 +269,34 @@ fn keep_char(c: char) -> Option<String> {
 }
 
 /// Port of DocxTemplate.patch_xml
-pub fn patch_xml(src_xml: &str) -> String {
+pub fn patch_xml(src_xml: &str) -> Cow<'_, str> {
     // replace {<something>{ by {{   ( works with {{ }} {% and %} {# and #})
     // (hand-rolled linear scan; fancy_regex spends ~20ms/500KB here even when
     // nothing matches)
     // gate: a match requires a delimiter directly followed by a tag
-    let mut xml = if contains_any(src_xml, &["{<", "%<", "}<", "#<"]) {
-        timed!("merge_split_braces", merge_split_braces_scan(src_xml))
+    let mut xml: Cow<'_, str> = if contains_any(src_xml, &["{<", "%<", "}<", "#<"]) {
+        Cow::Owned(timed!("merge_split_braces", merge_split_braces_scan(src_xml)))
     } else {
-        src_xml.to_string()
+        Cow::Borrowed(src_xml)
     };
+    // apply a pass, going (or staying) owned
+    macro_rules! pass {
+        ($name:expr, $e:expr) => {
+            xml = Cow::Owned(timed!($name, $e))
+        };
+    }
 
     // replace {{<some tags>jinja2 stuff<some other tags>}} by {{jinja2 stuff}}
-    // (gated: the pattern can only match where a jinja open marker exists)
+    // (hand-rolled linear scan; the fancy-regex original cost ~half of
+    // patch_xml on large documents)
+    // gate: a match requires a jinja open marker
     if contains_any(&xml, &["{{", "{%", "{#"]) {
-        xml = timed!("strip_tags_in_jinja", sub(
-        r"(?s)\{%(?:(?!%\}).)*|\{#(?:(?!#\}).)*|\{\{(?:(?!}\}).)*",
-        |m| sub_str(r"(?s)</w:t>.*?(<w:t>|<w:t [^>]*>)", "", m.get(0).unwrap().as_str()),
-        &xml,
-        ));
+        pass!("strip_tags_in_jinja", strip_tags_in_jinja_scan(&xml));
     }
 
     // manage table cell colspan
     if xml.contains("colspan") {
-    xml = timed!("colspan", sub(
+    pass!("colspan", sub(
         r"(?s)(<w:tc[ >](?:(?!<w:tc[ >]).)*)\{%\s*colspan\s+([^%]*)\s*%\}(.*?</w:tc>)",
         |m| {
             let mut cell_xml = format!("{}{}", m.get(1).unwrap().as_str(), m.get(3).unwrap().as_str());
@@ -286,7 +324,7 @@ pub fn patch_xml(src_xml: &str) -> String {
 
     // manage table cell background color
     if xml.contains("cellbg") {
-    xml = timed!("cellbg", sub(
+    pass!("cellbg", sub(
         r"(?s)(<w:tc[ >](?:(?!<w:tc[ >]).)*)\{%\s*cellbg\s+([^%]*)\s*%\}(.*?</w:tc>)",
         |m| {
             let mut cell_xml = format!("{}{}", m.get(1).unwrap().as_str(), m.get(3).unwrap().as_str());
@@ -316,10 +354,10 @@ pub fn patch_xml(src_xml: &str) -> String {
     // ensure space preservation (hand-rolled linear scan; the original
     // tempered-dot regex overflows the backtrack stack on large documents)
     if xml.contains("<w:t>") && contains_any(&xml, &["{{", "{%"]) {
-        xml = timed!("space_preserve", space_preserve_scan(&xml));
+        pass!("space_preserve", space_preserve_scan(&xml));
     }
     if contains_any(&xml, &["{{r", "{%r"]) {
-        xml = timed!("richtext_tag", sub(
+        pass!("richtext_tag", sub(
         r"(?s)(\{\{r\s.*?\}\}|\{%r\s.*?\%\})",
         |m| {
             format!(
@@ -334,11 +372,11 @@ pub fn patch_xml(src_xml: &str) -> String {
     // {%- will merge with previous paragraph text (hand-rolled; the
     // original regex spans paragraphs and overflows the backtrack stack)
     if xml.contains("{%-") {
-        xml = timed!("dash_merge_prev", dash_merge_prev_scan(&xml));
+        pass!("dash_merge_prev", dash_merge_prev_scan(&xml));
     }
     // -%} will merge with next paragraph text
     if xml.contains("-%}") {
-        xml = timed!("dash_merge_next", dash_merge_next_scan(&xml));
+        pass!("dash_merge_next", dash_merge_next_scan(&xml));
     }
 
     // replace into xml code the row/paragraph/run containing
@@ -350,13 +388,13 @@ pub fn patch_xml(src_xml: &str) -> String {
         let m1 = format!("{{{{{} ", y);
         let m2 = format!("{{%{} ", y);
         if xml.contains(&m1) || xml.contains(&m2) {
-            xml = timed!("element_tag_scan", element_tag_scan(&xml, y, false));
+            pass!("element_tag_scan", element_tag_scan(&xml, y, false));
         }
     }
     for y in ["tr", "tc", "p"] {
         let m = format!("{{#{} ", y);
         if xml.contains(&m) {
-            xml = timed!("element_tag_scan", element_tag_scan(&xml, y, true));
+            pass!("element_tag_scan", element_tag_scan(&xml, y, true));
         }
     }
 
@@ -364,7 +402,7 @@ pub fn patch_xml(src_xml: &str) -> String {
     // use {% vm %} to make this table cell and its copies
     // be vertically merged within a {% for %}
     if xml.contains("{%") && xml.contains("vm") {
-    xml = timed!("vmerge", sub(
+    pass!("vmerge", sub(
         r"(?s)<w:tc[ >](?:(?!<w:tc[ >]).)*?\{%\s*vm\s*%\}.*?</w:tc[ >]",
         |m| {
             let whole = m.get(0).unwrap().as_str();
@@ -388,7 +426,7 @@ pub fn patch_xml(src_xml: &str) -> String {
 
     // Use {% hm %} to make table cell become horizontally merged within a {% for %}.
     if xml.contains("{%") && xml.contains("hm") {
-    xml = timed!("hmerge", sub(
+    pass!("hmerge", sub(
         r"(?s)<w:tc[ >](?:(?!<w:tc[ >]).)*?\{%\s*hm\s*%\}.*?</w:tc[ >]",
         |m| {
             let whole = m.get(0).unwrap().as_str().to_string();
@@ -432,19 +470,10 @@ pub fn patch_xml(src_xml: &str) -> String {
     }
 
     // clean tags: unescape entities and smart quotes inside jinja tags
+    // (hand-rolled linear scan; the lookbehind/lazy/lookahead fancy-regex
+    // original cost ~the other half of patch_xml on large documents)
     if contains_any(&xml, &["{{", "{%"]) {
-    xml = timed!("clean_tags", sub(r"(?<=\{[\{%])(.*?)(?=[\}%]\})", |m| {
-        m.get(0)
-            .unwrap()
-            .as_str()
-            .replace("&#8216;", "'")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace('\u{201c}', "\"")
-            .replace('\u{201d}', "\"")
-            .replace('\u{2018}', "'")
-            .replace('\u{2019}', "'")
-    }, &xml));
+        pass!("clean_tags", clean_tags_scan(&xml));
     }
 
     xml
@@ -457,11 +486,11 @@ fn sub_first(pattern: &str, replacement: &str, text: &str) -> String {
 }
 
 /// Port of DocxTemplate.resolve_listing
-pub fn resolve_listing(xml: &str) -> String {
+pub fn resolve_listing(xml: &str) -> Cow<'_, str> {
     // resolve_text only rewrites \t, \n, \x07 and \x0c; without any of them
     // the whole pass is the identity, so skip the full-document copy
     if !xml.contains(['\t', '\n', '\u{7}', '\u{c}']) {
-        return xml.to_string();
+        return Cow::Borrowed(xml);
     }
     fn resolve_text(run_properties: &str, paragraph_properties: &str, m: &Captures) -> String {
         let mut s = m.get(0).unwrap().as_str().to_string();
@@ -526,11 +555,11 @@ pub fn resolve_listing(xml: &str) -> String {
         )
     }
 
-    timed!("resolve_listing_scan", sub(
+    Cow::Owned(timed!("resolve_listing_scan", sub(
         r"(?s)<w:p(?: [^>]*)?>.*?</w:p>",
         |m| resolve_paragraph(m),
         xml,
-    ))
+    )))
 }
 
 /// `<w:t>` -> `<w:t xml:space="preserve">` when a jinja tag follows before
@@ -703,6 +732,192 @@ pub fn element_tag_scan(xml: &str, y: &str, comment: bool) -> String {
     }
     out.push_str(&xml[i.min(xml.len())..]);
     out
+}
+
+/// Hand-rolled linear equivalent of the strip_tags_in_jinja pass:
+/// `(?s)\{%(?:(?!%\}).)*|\{#(?:(?!#\}).)*|\{\{(?:(?!}\}).)*` where each match
+/// has its inner `</w:t>.*?(<w:t>|<w:t [^>]*>)` runs removed (jinja tags
+/// split across runs by Word). The tempered dot is greedy up to the FIRST
+/// closing delimiter (or EOF when there is none — the closer is NOT part of
+/// the pattern, so the match succeeds either way and does not consume the
+/// closer). The fancy-regex pair cost ~half of patch_xml on large documents.
+fn strip_tags_in_jinja_scan(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    loop {
+        let b = rest.as_bytes();
+        if b.len() < 2 {
+            break;
+        }
+        // earliest opener among {% {# {{
+        let mut o = None;
+        let mut i = 0usize;
+        while i + 1 < b.len() {
+            if b[i] == b'{' && matches!(b[i + 1], b'{' | b'%' | b'#') {
+                o = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        let Some(o) = o else { break };
+        let closer = match b[o + 1] {
+            b'%' => "%}",
+            b'#' => "#}",
+            _ => "}}",
+        };
+        let content_start = o + 2;
+        let content_end = rest[content_start..]
+            .find(closer)
+            .map(|r| content_start + r)
+            .unwrap_or(rest.len());
+        out.push_str(&rest[..content_start]);
+        strip_wt_pairs(&rest[content_start..content_end], &mut out);
+        rest = &rest[content_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Remove every `</w:t>.*?(<w:t>|<w:t [^>]*>)` run (non-greedy, like the
+/// original inner regex, so each removal spans up to the NEAREST following
+/// `<w:t>` opening) from a jinja tag's content, appending the result.
+fn strip_wt_pairs(s: &str, out: &mut String) {
+    if !s.contains("</w:t>") {
+        out.push_str(s);
+        return;
+    }
+    let b = s.as_bytes();
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while let Some(rel) = s[i..].find("</w:t>") {
+        let close_start = i + rel;
+        // earliest "<w:t>" or "<w:t ...>" opening tag after the close tag
+        let mut j = close_start + 6;
+        let open_end = loop {
+            if j + 5 > b.len() {
+                break None;
+            }
+            if b[j] == b'<' && b[j + 1..].starts_with(b"w:t") {
+                if b[j + 4] == b'>' {
+                    break Some(j + 5);
+                }
+                if b[j + 4] == b' ' {
+                    // `<w:t [^>]*>`: up to and including the first '>'
+                    match s[j + 5..].find('>') {
+                        Some(g) => break Some(j + 5 + g + 1),
+                        // no '>' left anywhere: no later match can complete
+                        None => break None,
+                    }
+                }
+            }
+            j += 1;
+        };
+        match open_end {
+            Some(e) => {
+                out.push_str(&s[copied..close_start]);
+                copied = e;
+                i = e;
+            }
+            None => break,
+        }
+    }
+    out.push_str(&s[copied..]);
+}
+
+/// Hand-rolled linear equivalent of the clean_tags pass:
+/// `(?<=\{[\{%])(.*?)(?=[\}%]\})` — inside `{{ ... }}` / `{% ... %}` tags
+/// (the closer is the first `}}` OR `%}` regardless of the opener; with no
+/// closer at all, nothing matches anywhere further), unescape `&#8216;` /
+/// `&lt;` / `&gt;` and normalize smart quotes. The lookbehind + lazy dot +
+/// lookahead regex cost ~the other half of patch_xml on large documents.
+fn clean_tags_scan(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    loop {
+        let b = rest.as_bytes();
+        if b.len() < 4 {
+            break; // need at least opener (2) + closer (2)
+        }
+        // earliest opener among {{ {%
+        let mut o = None;
+        let mut i = 0usize;
+        while i + 3 < b.len() {
+            if b[i] == b'{' && (b[i + 1] == b'{' || b[i + 1] == b'%') {
+                o = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        let Some(o) = o else { break };
+        let content_start = o + 2;
+        // first "}}" or "%}" at/after content_start
+        let mut j = content_start;
+        let mut cend = None;
+        while j + 1 < b.len() {
+            if (b[j] == b'}' || b[j] == b'%') && b[j + 1] == b'}' {
+                cend = Some(j);
+                break;
+            }
+            j += 1;
+        }
+        match cend {
+            Some(e) => {
+                out.push_str(&rest[..content_start]);
+                clean_tag_content(&rest[content_start..e], &mut out);
+                // the closer is not consumed (lookahead), continue there
+                rest = &rest[e..];
+            }
+            None => break, // no closer anywhere: no further matches possible
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Apply the clean_tags replacements to a tag's content, appending to `out`:
+/// `&#8216;` -> ', `&lt;` -> <, `&gt;` -> >, U+2018/2019 -> ', U+201C/201D
+/// -> ". Single pass: the replacements introduce neither `&` nor smart
+/// quotes, so the sequential `str::replace` chain is equivalent.
+fn clean_tag_content(s: &str, out: &mut String) {
+    if !s.contains('&') && !s.contains(['\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}']) {
+        out.push_str(s);
+        return;
+    }
+    let b = s.as_bytes();
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        let rep: Option<(&str, usize)> = match b[i] {
+            b'&' => {
+                if s[i..].starts_with("&#8216;") {
+                    Some(("'", "&#8216;".len()))
+                } else if s[i..].starts_with("&lt;") {
+                    Some(("<", 4))
+                } else if s[i..].starts_with("&gt;") {
+                    Some((">", 4))
+                } else {
+                    None
+                }
+            }
+            // U+2018/2019/201C/201D are E2 80 98/99/9C/9D in UTF-8
+            0xE2 if i + 2 < b.len() && b[i + 1] == 0x80 => match b[i + 2] {
+                0x98 | 0x99 => Some(("'", 3)),
+                0x9C | 0x9D => Some(("\"", 3)),
+                _ => None,
+            },
+            _ => None,
+        };
+        match rep {
+            Some((r, len)) => {
+                out.push_str(&s[copied..i]);
+                out.push_str(r);
+                i += len;
+                copied = i;
+            }
+            None => i += 1,
+        }
+    }
+    out.push_str(&s[copied..]);
 }
 
 #[cfg(test)]
@@ -990,6 +1205,30 @@ mod tests {
         assert_eq!(patch_xml(""), "");
     }
 
+    #[test]
+    fn test_decode_text_entities_scan() {
+        // 文本节点中的 &quot;/&apos;/数字引用被解码，标记字符保持转义
+        assert_eq!(
+            decode_text_entities("<w:t>a &quot;b&quot; &amp; &lt; &#8217; &#x4E2D;</w:t>"),
+            "<w:t>a \"b\" &amp; &lt; ’ 中</w:t>"
+        );
+        // 只有 &amp;/&lt; 等保留实体时整体不变（借用，不拷贝）
+        let s = "<w:t>a &amp; b &lt; c</w:t>";
+        assert!(matches!(decode_text_entities(s), Cow::Borrowed(_)));
+        assert_eq!(decode_text_entities(s), s);
+        // 无 & 时恒等借用
+        let s = "<w:t>plain</w:t>";
+        assert!(matches!(decode_text_entities(s), Cow::Borrowed(_)));
+        // 属性中的实体不动（只看 > < 之间的文本节点）
+        let s = "<w:r w:attr=\"&quot;\"><w:t>&quot;</w:t></w:r>";
+        assert_eq!(
+            decode_text_entities(s),
+            "<w:r w:attr=\"&quot;\"><w:t>\"</w:t></w:r>"
+        );
+        // 相邻标签 `><` 间无文本；`>` 在文本前的嵌套边界
+        assert_eq!(decode_text_entities("<a><b>x</b></a>"), "<a><b>x</b></a>");
+    }
+
     /// 长输入（约 700KB）：线性扫描器在无匹配时保持恒等、在末尾有
     /// 匹配时正确跨段删除 —— 正是 AGENTS.md 第 9 条防回退栈溢出的场景
     #[test]
@@ -1009,5 +1248,75 @@ mod tests {
             &long[..long.len() - "</w:t></w:r></w:p>".len()]
         );
         assert_eq!(dash_merge_prev_scan(&input), expected);
+    }
+
+    #[test]
+    fn test_strip_tags_in_jinja_scan_edges() {
+        // 基本：剥掉标签内部跨 run 的 </w:t>...<w:t...>
+        assert_eq!(
+            strip_tags_in_jinja_scan("{{ x </w:t></w:r><w:r><w:t>+ y }}"),
+            "{{ x + y }}"
+        );
+        // 带属性的 <w:t ...> 也剥
+        assert_eq!(
+            strip_tags_in_jinja_scan("{% a </w:t><w:t xml:space=\"preserve\">b %}"),
+            "{% a b %}"
+        );
+        // 无闭合符时匹配到 EOF 且照常剥离（原正则不消耗闭合符）
+        assert_eq!(
+            strip_tags_in_jinja_scan("pre {{ x </w:t><w:t>y"),
+            "pre {{ x y"
+        );
+        // 标签内的 </w:t> 后没有 <w:t> 开标签：不剥
+        assert_eq!(
+            strip_tags_in_jinja_scan("{{ a </w:t> b }}"),
+            "{{ a </w:t> b }}"
+        );
+        // 闭合符不消耗，紧随其后的下一个标签照常处理
+        assert_eq!(
+            strip_tags_in_jinja_scan("{{ a }}</w:t><w:t>{{ b </w:t><w:t>c }}"),
+            "{{ a }}</w:t><w:t>{{ b c }}"
+        );
+        // <w:t/> 不是开标签（正则只认 <w:t> 或 <w:t ...>）
+        assert_eq!(
+            strip_tags_in_jinja_scan("{{ a </w:t><w:t/>b }}"),
+            "{{ a </w:t><w:t/>b }}"
+        );
+        // {# #} 注释同样处理
+        assert_eq!(
+            strip_tags_in_jinja_scan("{# n </w:t><w:t>x #}"),
+            "{# n x #}"
+        );
+        // 恒等
+        let s = "<w:p><w:r><w:t>plain</w:t></w:r></w:p>";
+        assert_eq!(strip_tags_in_jinja_scan(s), s);
+    }
+
+    #[test]
+    fn test_clean_tags_scan_edges() {
+        // 闭合符取第一个 }} 或 %}，与开符类型无关
+        assert_eq!(clean_tags_scan("{{ a &lt; b %}"), "{{ a < b %}");
+        assert_eq!(clean_tags_scan("{% a &gt; b }}"), "{% a > b }}");
+        // 空标签
+        assert_eq!(clean_tags_scan("{{}}"), "{{}}");
+        assert_eq!(clean_tags_scan("{%%}"), "{%%}");
+        // 无闭合符：整体原样
+        assert_eq!(clean_tags_scan("{{ a &lt; b"), "{{ a &lt; b");
+        // 标签外的实体不动
+        assert_eq!(
+            clean_tags_scan("x &lt; {{ a &lt; b }} y &lt;"),
+            "x &lt; {{ a < b }} y &lt;"
+        );
+        // &#8216; 与智能引号
+        assert_eq!(clean_tags_scan("{{ &#8216;x&#8216; }}"), "{{ 'x' }}");
+        assert_eq!(
+            clean_tags_scan("{{ \u{2018}a\u{2019}\u{201c}b\u{201d} }}"),
+            "{{ 'a'\"b\" }}"
+        );
+        // 其他 E2 80 xx 字符（如 U+201A）不动
+        assert_eq!(clean_tags_scan("{{ \u{201a} }}"), "{{ \u{201a} }}");
+        // 恒等
+        let s = "<w:p><w:r><w:t>plain</w:t></w:r></w:p>";
+        assert_eq!(clean_tags_scan(s), s);
     }
 }

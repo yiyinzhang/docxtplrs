@@ -6,6 +6,7 @@ use crate::patch::{decode_text_entities, patch_xml, resolve_listing, sub_str};
 use crate::xmldom::{Document, Element, Node};
 use minijinja::{AutoEscape, Environment, Value};
 use pyo3::prelude::PyAnyMethods as _;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 pub const DOCUMENT_PART: &str = "word/document.xml";
@@ -249,10 +250,9 @@ impl TplCore {
         // Body
         let src = self.pkg()?.get_string(DOCUMENT_PART)
             .ok_or_else(|| "word/document.xml not found".to_string())?;
-        let rendered = self.render_part_with(DOCUMENT_PART, &src, &env, ctx_once)?;
-        // fix tables and docPr ids on body only
-        let fixed = fix_tables_and_docpr(&rendered, &mut self.docx_ids_index)?;
-        self.set_part_rendered(DOCUMENT_PART, fixed);
+        // fix tables / docPr / cNvPr ids only after every part has rendered:
+        // used_subdoc is final by then, so the body is parsed+serialized once
+        let body_rendered = self.render_part_with(DOCUMENT_PART, &src, &env, ctx_once)?;
 
         // Headers & footers
         for uri in [rel_type::HEADER, rel_type::FOOTER] {
@@ -279,17 +279,21 @@ impl TplCore {
         self.render_footnotes(&env, ctx_once)?;
 
         // like docxcompose's renumber_nvpicpr_ids: when subdocs were merged,
-        // make pic:cNvPr ids unique (body first, then headers/footers)
+        // make pic:cNvPr ids unique (body first, then headers/footers). The
+        // body's cNvPr renumbering rides along with its fix_tables pass.
         if self.used_subdoc {
             let mut next_id: u32 = 1;
-            let parts: Vec<String> = std::iter::once(DOCUMENT_PART.to_string())
-                .chain(
-                    [rel_type::HEADER, rel_type::FOOTER]
-                        .into_iter()
-                        .flat_map(|uri| self.header_footer_parts(uri)),
-                )
+            let fixed = fix_tables_docpr_cnvpr(
+                &body_rendered,
+                &mut self.docx_ids_index,
+                Some(&mut next_id),
+            )?;
+            self.set_part_rendered(DOCUMENT_PART, fixed);
+            let hf_parts: Vec<String> = [rel_type::HEADER, rel_type::FOOTER]
+                .into_iter()
+                .flat_map(|uri| self.header_footer_parts(uri))
                 .collect();
-            for part in parts {
+            for part in hf_parts {
                 let Some(xml) = self.pkg()?.get_string(&part) else {
                     continue;
                 };
@@ -299,6 +303,10 @@ impl TplCore {
                     self.pkg()?.set(&part, bytes);
                 }
             }
+        } else {
+            // fix tables and docPr ids on body only
+            let fixed = fix_tables_and_docpr(&body_rendered, &mut self.docx_ids_index)?;
+            self.set_part_rendered(DOCUMENT_PART, fixed);
         }
 
         self.is_rendered = true;
@@ -350,13 +358,14 @@ impl TplCore {
         env: &Environment,
         make_ctx: &CtxFn,
     ) -> Result<String, String> {
-        let patched = patch_xml(&decode_text_entities(src_xml));
+        let decoded = decode_text_entities(src_xml);
+        let patched = patch_xml(&decoded);
         let prev = crate::pybridge::set_current_render(self as *mut TplCore, part);
         let result = (|| {
             let ctx = make_ctx(self, part)?;
             let dst = render_xml_str_with(&patched, ctx, env, self)?;
             let dst = resolve_listing(&dst);
-            self.materialize_deferred(part, dst)
+            self.materialize_deferred(part, dst.into_owned())
         })();
         crate::pybridge::restore_current_render(prev);
         result
@@ -1772,11 +1781,11 @@ fn py_like_method(
 /// Rewrite `{% trans %}` blocks into gettext function calls (jinja2 i18n
 /// extension semantics). Without an installed catalog the functions fall
 /// back to the untranslated, formatted msgid.
-pub fn preprocess_trans(src: &str) -> String {
+pub fn preprocess_trans(src: &str) -> Cow<'_, str> {
     if !src.contains("{% trans") {
-        return src.to_string();
+        return Cow::Borrowed(src);
     }
-    crate::patch::sub(
+    Cow::Owned(crate::patch::sub(
         r"(?s)\{%\s*trans\s*(.*?)%\}(.*?)(?:\{%\s*pluralize\s*(.*?)\s*%\}(.*?))?\{%\s*endtrans\s*%\}",
         |m| trans_rewrite(
             m.get(1).unwrap().as_str(),
@@ -1785,7 +1794,7 @@ pub fn preprocess_trans(src: &str) -> String {
             m.get(4).map(|g| g.as_str()),
         ),
         src,
-    )
+    ))
 }
 
 fn trans_rewrite(
@@ -1951,11 +1960,11 @@ fn percent_format(state: &minijinja::State, pattern: &str) -> Result<String, min
 ///
 /// The rewrite is scoped to jinja tag contents and skips quoted strings, so
 /// literal document text and string literals are never touched.
-pub fn preprocess_bool_compare(src: &str) -> String {
+pub fn preprocess_bool_compare(src: &str) -> Cow<'_, str> {
     if !src.contains("true") && !src.contains("false") && !src.contains("none")
         && !src.contains("True") && !src.contains("False") && !src.contains("None")
     {
-        return src.to_string();
+        return Cow::Borrowed(src);
     }
     const RULES: &[(&str, &str)] = &[
         ("== true", "is eq_true"),
@@ -1972,15 +1981,20 @@ pub fn preprocess_bool_compare(src: &str) -> String {
         ("!= None", "is not none"),
     ];
 
-    // process only the inside of {% %} / {{ }} / {# #} blocks
-    crate::patch::sub(
-        r"(?s)(\{%.*?%\}|\{\{.*?\}\})",
-        |m| {
-            let tag = m.get(0).unwrap().as_str();
-            rewrite_tag_bool_compare(tag, RULES)
-        },
-        src,
-    )
+    // process only the inside of {% %} / {{ }} blocks (linear tag scan;
+    // borrowed when no tag actually changed)
+    rewrite_jinja_tags(src, |tag| {
+        // cheap prefilter: every rule starts with == or !=
+        if !tag.contains("==") && !tag.contains("!=") {
+            return None;
+        }
+        let rewritten = rewrite_tag_bool_compare(tag, RULES);
+        if rewritten != tag {
+            Some(rewritten)
+        } else {
+            None
+        }
+    })
 }
 
 fn rewrite_tag_bool_compare(tag: &str, rules: &[(&str, &str)]) -> String {
@@ -2037,27 +2051,29 @@ fn rewrite_tag_bool_compare(tag: &str, rules: &[(&str, &str)]) -> String {
 /// Engine-feature preprocessing applied to jinja tag contents:
 /// `{% debug %}` -> `{{ debug() }}`, and printf-style `'fmt' % args` ->
 /// `('fmt')|pyformat(args)` (minijinja has no % operator for strings).
-pub fn preprocess_engine_features(src: &str) -> String {
+pub fn preprocess_engine_features(src: &str) -> Cow<'_, str> {
     let needs_debug = src.contains("{% debug");
     let needs_printf = src.contains('%');
     if !needs_debug && !needs_printf {
-        return src.to_string();
+        return Cow::Borrowed(src);
     }
-    crate::patch::sub(
-        r"(?s)(\{%.*?%\}|\{\{.*?\}\})",
-        |m| {
-            let tag = m.get(0).unwrap().as_str();
-            let mut out = tag.to_string();
-            if needs_debug {
-                out = crate::patch::sub_str(r"\{%\s*debug\s*%\}", "{{ debug() }}", &out);
-            }
-            if needs_printf && (out.contains('%') && (out.contains('\'') || out.contains('"'))) {
-                out = rewrite_printf_tags(&out);
-            }
-            out
-        },
-        src,
-    )
+    rewrite_jinja_tags(src, |tag| {
+        let mut out: Cow<'_, str> = Cow::Borrowed(tag);
+        if needs_debug && tag.contains("debug") {
+            out = Cow::Owned(crate::patch::sub_str(
+                r"\{%\s*debug\s*%\}",
+                "{{ debug() }}",
+                &out,
+            ));
+        }
+        if needs_printf && (out.contains('%') && (out.contains('\'') || out.contains('"'))) {
+            out = Cow::Owned(rewrite_printf_tags(&out));
+        }
+        match out {
+            Cow::Owned(o) if o != tag => Some(o),
+            _ => None,
+        }
+    })
 }
 
 /// Rewrite `STR % RHS` inside a tag to `(STR)|pyformat(RHS)` (char-safe).
@@ -2293,7 +2309,9 @@ pub fn render_xml_str(src_xml: &str, ctx: Value, autoescape: bool, core: &mut Tp
 /// one render call).
 pub fn render_xml_str_with(src_xml: &str, ctx: Value, env: &Environment, core: &mut TplCore) -> Result<String, String> {
     // add newlines before paragraphs so template error line numbers are useful
-    let src = sub_str(r"<w:p([ >])", "\n<w:p$1", src_xml);
+    // (plain memmem scan; the fancy-regex original paid per-match capture
+    // expansion over the whole part)
+    let src = add_paragraph_newlines(src_xml);
     let src = preprocess_trans(&src);
     let src = preprocess_bool_compare(&src);
     let src = preprocess_engine_features(&src);
@@ -2322,8 +2340,99 @@ pub fn render_xml_str_with(src_xml: &str, ctx: Value, env: &Environment, core: &
         }
     };
 
-    let dst = sub_str(r"\n<w:p([ >])", "<w:p$1", &rendered);
-    Ok(restore_escaped_delims(dst))
+    let dst = remove_paragraph_newlines(&rendered);
+    Ok(restore_escaped_delims(dst.into_owned()))
+}
+
+/// `<w:p([ >])` -> `\n<w:p$1` without regex: insert `\n` before every
+/// `<w:p ` / `<w:p>` opening tag.
+fn add_paragraph_newlines(src: &str) -> Cow<'_, str> {
+    if !src.contains("<w:p") {
+        return Cow::Borrowed(src);
+    }
+    // every match inserts exactly one '\n'
+    let extra = src.matches("<w:p ").count() + src.matches("<w:p>").count();
+    let mut out = String::with_capacity(src.len() + extra);
+    let mut rest = src;
+    while let Some(p) = rest.find("<w:p") {
+        let after = p + 4;
+        match rest.as_bytes().get(after) {
+            Some(b' ') | Some(b'>') => {
+                out.push_str(&rest[..p]);
+                out.push_str("\n<w:p");
+            }
+            _ => {
+                out.push_str(&rest[..after]);
+            }
+        }
+        rest = &rest[after..];
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// `\n<w:p([ >])` -> `<w:p$1` without regex: drop a `\n` immediately before
+/// `<w:p ` / `<w:p>`; borrowed when there is nothing to remove.
+fn remove_paragraph_newlines(s: &str) -> Cow<'_, str> {
+    if !s.contains("\n<w:p") {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(p) = rest.find("\n<w:p") {
+        let after = p + 5;
+        match rest.as_bytes().get(after) {
+            Some(b' ') | Some(b'>') => {
+                out.push_str(&rest[..p]); // drop the '\n'
+                out.push_str("<w:p");
+            }
+            _ => {
+                out.push_str(&rest[..after]);
+            }
+        }
+        rest = &rest[after..];
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// Linear-scan equivalent of the tag-finding regex `(?s)(\{%.*?%\}|\{\{.*?\}\})`:
+/// calls `f` with each `{% ... %}` / `{{ ... }}` tag (closer included, first
+/// matching closer wins, non-overlapping left to right); `f` returns
+/// Some(replacement) to splice it in or None to keep the tag verbatim.
+/// Borrowed when no tag was replaced.
+fn rewrite_jinja_tags<'a>(
+    src: &'a str,
+    mut f: impl FnMut(&str) -> Option<String>,
+) -> Cow<'a, str> {
+    let b = src.as_bytes();
+    let mut out: Option<String> = None;
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i + 3 < b.len() {
+        if b[i] == b'{' && (b[i + 1] == b'%' || b[i + 1] == b'{') {
+            let closer = if b[i + 1] == b'%' { "%}" } else { "}}" };
+            if let Some(rel) = src[i + 2..].find(closer) {
+                let tag_end = i + 2 + rel + 2;
+                if let Some(rep) = f(&src[i..tag_end]) {
+                    let o = out.get_or_insert_with(|| String::with_capacity(src.len()));
+                    o.push_str(&src[copied..i]);
+                    o.push_str(&rep);
+                    copied = tag_end;
+                }
+                i = tag_end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    match out {
+        Some(mut o) => {
+            o.push_str(&src[copied..]);
+            Cow::Owned(o)
+        }
+        None => Cow::Borrowed(src),
+    }
 }
 
 /// Single-pass equivalent of the four chained replaces
@@ -2367,29 +2476,61 @@ fn restore_escaped_delims(s: String) -> String {
 // ---------------- fix tables & docPr ids ----------------
 
 pub fn fix_tables_and_docpr(xml: &str, docx_ids_index: &mut u32) -> Result<String, String> {
-    // nothing to fix without any table or drawing: skip the full DOM
-    // parse+serialize round-trip
-    if !xml.contains("<w:tbl") && !xml.contains("wp:docPr") {
+    fix_tables_docpr_cnvpr(xml, docx_ids_index, None)
+}
+
+/// fix_tables + docPr renumber + (optionally) pic:cNvPr renumber in a single
+/// DOM parse/serialize round-trip. The cNvPr pass (docxcompose
+/// renumber_nvpicpr_ids parity) is only wanted when subdocs were merged;
+/// folding it in here saves a second full parse+serialize of the body.
+fn fix_tables_docpr_cnvpr(
+    xml: &str,
+    docx_ids_index: &mut u32,
+    cnvpr_next: Option<&mut u32>,
+) -> Result<String, String> {
+    // nothing to fix without any table, drawing or (when requested) picture:
+    // skip the full DOM parse+serialize round-trip
+    let need_cnvpr = cnvpr_next.is_some();
+    if !xml.contains("<w:tbl")
+        && !xml.contains("wp:docPr")
+        && !(need_cnvpr && xml.contains("pic:cNvPr"))
+    {
         return Ok(xml.to_string());
     }
     // If the rendered xml is not well-formed (e.g. unescaped values without
     // autoescape), attempt recovery first (docxtpl uses an lxml recover-mode
     // parser). As a last resort, apply regex-based fixes so table grids and
     // docPr ids are corrected even for severely broken xml.
-    let mut doc = match Document::parse(xml) {
-        Ok(d) => d,
+    let doc = match Document::parse(xml) {
+        Ok(d) => Some(d),
         Err(_) => match Document::parse(&recover_xml(xml)) {
-            Ok(d) => d,
-            Err(_) => {
-                let s = regex_fix_tables(xml);
-                let s = regex_fix_docpr(&s, docx_ids_index);
-                return Ok(s);
-            }
+            Ok(d) => Some(d),
+            Err(_) => None,
         },
     };
-    fix_tables_elem(&mut doc.root);
-    fix_docpr_elem(&mut doc.root, docx_ids_index);
-    Ok(doc.serialize())
+    match doc {
+        Some(mut doc) => {
+            fix_tables_elem(&mut doc.root);
+            fix_docpr_elem(&mut doc.root, docx_ids_index);
+            if let Some(next) = cnvpr_next {
+                fix_cnvpr_elem(&mut doc.root, next);
+            }
+            // round-trip output stays close to the input size (fixes are local)
+            Ok(doc.serialize_with_capacity(xml.len() + xml.len() / 8 + 64))
+        }
+        None => {
+            let s = regex_fix_tables(xml);
+            let mut s = regex_fix_docpr(&s, docx_ids_index);
+            // cNvPr renumbering is DOM-based; attempt it on the regex-fixed
+            // xml, exactly like the old fix-then-renumber sequence
+            if let Some(next) = cnvpr_next {
+                if let Some(fixed) = renumber_cnvpr(&s, next) {
+                    s = fixed;
+                }
+            }
+            Ok(s)
+        }
+    }
 }
 
 /// Renumber pic:cNvPr ids sequentially (docxcompose renumber_nvpicpr_ids).
@@ -2398,19 +2539,20 @@ fn renumber_cnvpr(xml: &str, next_id: &mut u32) -> Option<String> {
         return None;
     }
     let mut doc = Document::parse(xml).ok()?;
-    fn walk(el: &mut Element, next_id: &mut u32) {
-        if el.name == "pic:cNvPr" {
-            el.set_attr("id", &next_id.to_string());
-            *next_id += 1;
-        }
-        for c in el.children.iter_mut() {
-            if let Node::Elem(e) = c {
-                walk(e, next_id);
-            }
+    fix_cnvpr_elem(&mut doc.root, next_id);
+    Some(doc.serialize_with_capacity(xml.len() + 64))
+}
+
+fn fix_cnvpr_elem(el: &mut Element, next_id: &mut u32) {
+    if el.name == "pic:cNvPr" {
+        el.set_attr("id", &next_id.to_string());
+        *next_id += 1;
+    }
+    for c in el.children.iter_mut() {
+        if let Node::Elem(e) = c {
+            fix_cnvpr_elem(e, next_id);
         }
     }
-    walk(&mut doc.root, next_id);
-    Some(doc.serialize())
 }
 
 /// Last-resort docPr renumbering for unparseable xml.

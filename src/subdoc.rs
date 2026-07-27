@@ -403,33 +403,39 @@ fn copy_part_recursive(master: &mut Package, sub: &Package, part: &str, depth: u
 
     // remap the part's own relationships first
     let sub_rels = sub.rels(part);
-    let mut xml = String::from_utf8_lossy(blob).to_string();
     let is_xml = part.ends_with(".xml") || part.ends_with(".rels");
-    if !sub_rels.rels.is_empty() && is_xml {
-        let mut rid_map: HashMap<String, String> = HashMap::new();
-        for rel in &sub_rels.rels {
-            let new_rid = if rel.rel_type == rel_type::IMAGE {
-                let target = resolve_target(part, &rel.target);
-                let Some(img) = sub.get(&target) else { continue };
-                let (partname, _) = add_image_part(master, img, &target);
-                let rel_target = crate::package::relative_target(part, &partname);
-                master.add_rel(part, rel_type::IMAGE, &rel_target, false)
-            } else if rel.is_external {
-                master.add_rel(part, &rel.rel_type, &rel.target, true)
-            } else {
-                let target = resolve_target(part, &rel.target);
-                if sub.contains(&target) {
-                    copy_part_recursive(master, sub, &target, depth + 1);
-                }
-                let rel_target = crate::package::relative_target(part, &target);
-                master.add_rel(part, &rel.rel_type, &rel_target, false)
-            };
-            rid_map.insert(rel.id.clone(), new_rid);
+    if is_xml {
+        let mut xml = String::from_utf8_lossy(blob).into_owned();
+        if !sub_rels.rels.is_empty() {
+            let mut rid_map: HashMap<String, String> = HashMap::new();
+            for rel in &sub_rels.rels {
+                let new_rid = if rel.rel_type == rel_type::IMAGE {
+                    let target = resolve_target(part, &rel.target);
+                    let Some(img) = sub.get(&target) else { continue };
+                    let (partname, _) = add_image_part(master, img, &target);
+                    let rel_target = crate::package::relative_target(part, &partname);
+                    master.add_rel(part, rel_type::IMAGE, &rel_target, false)
+                } else if rel.is_external {
+                    master.add_rel(part, &rel.rel_type, &rel.target, true)
+                } else {
+                    let target = resolve_target(part, &rel.target);
+                    if sub.contains(&target) {
+                        copy_part_recursive(master, sub, &target, depth + 1);
+                    }
+                    let rel_target = crate::package::relative_target(part, &target);
+                    master.add_rel(part, &rel.rel_type, &rel_target, false)
+                };
+                rid_map.insert(rel.id.clone(), new_rid);
+            }
+            xml = remap_rids(&xml, &rid_map);
         }
-        xml = remap_rids(&xml, &rid_map);
+        master.set(part, xml.into_bytes());
+    } else {
+        // binary parts (embeddings, activeX, …): copy verbatim — a lossy
+        // UTF-8 round-trip would replace invalid bytes with U+FFFD and
+        // silently corrupt the part
+        master.set(part, blob.to_vec());
     }
-
-    master.set(part, xml.into_bytes());
     if let Some(ct) = sub_content_type_override(sub, part) {
         master.ensure_content_type_override(part, &ct);
     }
@@ -982,5 +988,47 @@ fn collect_footnotes<'a>(el: &'a Element, out: &mut Vec<&'a Element>) {
         if let Node::Elem(e) = c {
             collect_footnotes(e, out);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut cursor);
+            for (name, data) in entries {
+                w.start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                w.write_all(data).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    /// Binary parts (embeddings, activeX, …) must be copied verbatim: the old
+    /// lossy UTF-8 round-trip replaced invalid bytes with U+FFFD and silently
+    /// corrupted them.
+    #[test]
+    fn test_copy_part_recursive_binary_copied_verbatim() {
+        // invalid UTF-8 (0xFF/0xFE/0x80…) with no valid decoding
+        let blob: &[u8] = &[0xD0, 0xCF, 0x11, 0xE0, 0xFF, 0xFE, 0x80, 0x00, 0xF5, 0xC3];
+        let sub = Package::from_bytes(&build_zip(&[(
+            "word/embeddings/oleObject1.bin",
+            blob,
+        )]))
+        .unwrap();
+        let mut master = Package::from_bytes(&build_zip(&[])).unwrap();
+
+        copy_part_recursive(&mut master, &sub, "word/embeddings/oleObject1.bin", 0);
+
+        assert_eq!(
+            master.get("word/embeddings/oleObject1.bin"),
+            Some(blob.as_ref())
+        );
     }
 }

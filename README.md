@@ -72,10 +72,12 @@ tpl.save("out.docx")
   template preprocessing, table fixing, document object model) is native Rust.
   No python-docx / lxml / jinja2 / markupsafe chain: one self-contained wheel,
   no lxml build issues on exotic platforms, no dependency-version conflicts.
-- **Fast** — **~6-14x faster** than docxtpl (lxml + jinja2) in a microbenchmark
+- **Fast** — **~5-14x faster** than docxtpl (lxml + jinja2) on small templates
   (title + paragraph loop + `{%tr %}` table-row loop over 10/100/400 items,
-  30 renders each, CPython 3.13, release build): 0.4/0.8/2.3ms vs
-  5.4/6.9/13.9ms per render. Reproduce with your own templates before quoting
+  30 renders each: 0.4/1.1/4.8ms vs 5.0/9.9/25.6ms per render), and **~50x**
+  on an 8.9MB / 20k-paragraph document (0.4s vs 19.9s for a full
+  load-render-save cycle). CPython 3.13, release build; reproduce with
+  `tests/benchmark.py [--big]` — and with your own templates before quoting
   numbers; see [Performance](#performance) for the internals.
 - **Drop-in replacement** — the Python API and the template syntax
   (`{{ var }}`, `{%tr %}`/`{%tc %}`/`{%p %}`, `RichText`, `InlineImage`,
@@ -102,7 +104,8 @@ tpl.save("out.docx")
 ### Performance
 
 Engine-vs-engine (docxtplrs vs docxtpl + lxml + jinja2, same templates):
-**~6-14x faster** per render (see the "Fast" bullet above).
+**~5-14x faster** per render on small templates and **~50x** on a large
+(8.9MB) document (see the "Fast" bullet above).
 
 On top of that, dedicated profiling rounds removed the remaining internal
 hotspots (measured with the `maturin develop` debug build unless noted,
@@ -132,6 +135,15 @@ CPython 3.13 — release builds are faster still):
   materialized in a single scan with `Arc`-shared blobs, and the
   table/docPr fix skips its DOM round-trip when there is nothing to fix.
   Rendering a 2MB / 20k-paragraph document: **3384ms → 1901ms (-44%)**.
+- **Large-document render path** — the two dominant `patch_xml` regexes
+  (split-tag stripping, tag cleaning) and the paragraph-newline handling are
+  hand-rolled linear scanners, all pipeline passes return `Cow` (zero-copy
+  when a pass changes nothing), and xmldom got single-allocation text nodes,
+  bulk escaping and preallocated serialization; subdoc merges renumber
+  `pic:cNvPr` ids inside the same DOM round-trip instead of a second
+  parse+serialize. On the 8.9MB / 20k-paragraph document this cut render
+  time by a further **~60%** (Rust, release build) — the same input takes
+  docxtpl ~20s.
 - **Images & subdoc merge** — image-dedup hashes are cached (per-insert cost
   no longer re-hashes all media), `.rels` parts are parsed once per part
   instead of once per relationship, and rId/style/numId remapping runs as a
@@ -143,7 +155,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-docxtplrs = "0.1.7"
+docxtplrs = "0.1.8"
 minijinja = "2"
 ```
 
@@ -180,7 +192,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # in another uv project
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.7-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.8-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # or editable (local development)
 uv add --editable /path/to/docxtplrs
 ```
@@ -348,6 +360,7 @@ Engine-level extras beyond stock minijinja, so jinja2-style templates work as-is
 .venv/bin/python tests/crosscheck.py docxtplrs > /tmp/rs.json
 .venv/bin/python tests/crosscheck.py docxtpl > /tmp/ref.json   # needs crosscheck group
 .venv/bin/python tests/crosscheck.py compare /tmp/ref.json /tmp/rs.json
+.venv/bin/python tests/benchmark.py --big     # engine-vs-engine benchmark
 ```
 
 Coverage badge: line coverage of `src/` measured by rebuilding with
@@ -378,7 +391,7 @@ with `llvm-cov`.
   literals untouched).
 - `{% trans %}` is a full gettext implementation (.mo parsing + plural rules),
   but does not cover every corner of jinja2's newstyle i18n.
-- On MB-scale documents, 6 of docxtpl's regexes are replaced by linear scanners
+- On MB-scale documents, 8 of docxtpl's regexes are replaced by linear scanners
   to avoid backtracking-stack overflows; outputs are byte-compared against the
   official test suite, but extremely malformed templates may differ.
 - Zip output preserves compression methods and timestamps, but is not guaranteed
@@ -403,10 +416,11 @@ with `llvm-cov`.
 - **零 Python 依赖**：整个引擎（docx zip/XML 处理、模板预处理、表格修复、文档对象模型）
   均为 Rust 原生实现。不再需要 python-docx / lxml / jinja2 / markupsafe 依赖链——单个自包含
   wheel，没有 lxml 在冷门平台上的编译问题，也没有依赖版本冲突的烦恼。
-- **快**：微基准测试（标题 + 段落循环 + `{%tr %}` 表格行循环，10/100/400 行，
-  各渲染 30 次，CPython 3.13，release 构建）下比 docxtpl（lxml + jinja2）
-  **快约 6-14 倍**：每次渲染 0.4/0.8/2.3ms vs 5.4/6.9/13.9ms。引用数字前请用你自己的
-  模板复测；引擎内部优化见[性能](#性能)。
+- **快**：小模板（标题 + 段落循环 + `{%tr %}` 表格行循环，10/100/400 行，各渲染 30 次）
+  下比 docxtpl（lxml + jinja2）**快约 5-14 倍**：每次渲染 0.4/1.1/4.8ms vs
+  5.0/9.9/25.6ms；8.9MB / 2 万段落大文档上**快约 50 倍**（完整加载-渲染-保存周期
+  0.4s vs 19.9s）。CPython 3.13，release 构建；可用 `tests/benchmark.py [--big]`
+  复现——引用数字前请用你自己的模板复测；引擎内部优化见[性能](#性能)。
 - **无缝替代**：Python API 与模板语法（`{{ var }}`、`{%tr %}`/`{%tc %}`/`{%p %}`、
   `RichText`、`InlineImage`、`Subdoc` 等）与 docxtpl 几乎完全一致，迁移通常只需改一行 import。
   已通过 docxtpl 官方测试套件（32 个真实模板）、384 个自建测试，并有与 docxtpl 输出自动
@@ -426,8 +440,8 @@ with `llvm-cov`.
 
 ### 性能
 
-引擎对引擎（docxtplrs vs docxtpl + lxml + jinja2，相同模板）：每次渲染**快约 6-14 倍**
-（见上方"快"一条）。
+引擎对引擎（docxtplrs vs docxtpl + lxml + jinja2，相同模板）：小模板每次渲染
+**快约 5-14 倍**，8.9MB 大文档**快约 50 倍**（见上方"快"一条）。
 
 在此之上，专项 profiling 又清掉了剩余的内部热点（数据基于 `maturin develop`
 debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会更快）：
@@ -449,6 +463,11 @@ debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会�
 - **渲染管线**：所有 XML patch pass 加了 gate（零匹配不再全量拷贝文档），
   `InlineImage`/`Subdoc` 占位符单遍扫描实体化且 blob 用 `Arc` 共享，表格/docPr 修复
   在无事可修时跳过整个 DOM 往返。渲染 2MB / 2 万段落文档：**3384ms → 1901ms（-44%）**。
+- **大文档渲染路径**：`patch_xml` 耗时最高的两条正则（拆分标签剥离、标签清理）与
+  段落换行处理改为手写线性扫描器，管线各 pass 返回 `Cow`（无修改时零拷贝），
+  xmldom 文本节点单次分配、批量转义、序列化预分配；subdoc 合并时 `pic:cNvPr`
+  重编号并入同一趟 DOM 往返，不再二次解析+序列化。8.9MB / 2 万段落文档上渲染时间
+  再降 **约 60%**（Rust，release 构建）——同样输入 docxtpl 需要约 20s。
 - **图片与 subdoc 合并**：图片去重哈希带缓存（插一张图不再重算全部媒体的 sha1），
   `.rels` 每个 part 只解析一次（而非每条关系一次），rId/style/numId 重映射从
   "每条目一次全文正则"改为单遍扫描 + map 查表。
@@ -459,7 +478,7 @@ debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会�
 
 ```toml
 [dependencies]
-docxtplrs = "0.1.7"
+docxtplrs = "0.1.8"
 minijinja = "2"
 ```
 
@@ -497,7 +516,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # 在其他 uv 项目中
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.7-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.8-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # 或本地开发模式（editable）
 uv add --editable /path/to/docxtplrs
 ```
@@ -663,6 +682,7 @@ tpl.render(context, jinja_env=env)
 .venv/bin/python tests/crosscheck.py docxtplrs > /tmp/rs.json
 .venv/bin/python tests/crosscheck.py docxtpl > /tmp/ref.json   # 需要 crosscheck 依赖组
 .venv/bin/python tests/crosscheck.py compare /tmp/ref.json /tmp/rs.json
+.venv/bin/python tests/benchmark.py --big     # 引擎对引擎基准
 ```
 
 覆盖率徽章：`src/` 的行覆盖率，测量方式为 `RUSTFLAGS="-Cinstrument-coverage"` 重新
@@ -688,7 +708,7 @@ tpl.render(context, jinja_env=env)
   仅限标签内，字符串字面量不受影响）。
 - `{% trans %}` 是完整的 gettext 实现（.mo 解析 + 复数规则），但不覆盖 jinja2 newstyle
   i18n 的所有角落。
-- MB 级大文档上，docxtpl 的 6 处正则被替换为线性扫描器以避免回溯栈溢出；输出已与官方
+- MB 级大文档上，docxtpl 的 8 处正则被替换为线性扫描器以避免回溯栈溢出；输出已与官方
   测试套件逐字节比对，但极端畸形的模板可能有差异。
 - zip 输出保留压缩方式与时间戳，但不保证与 python-docx 输出逐字节一致。
 
@@ -705,8 +725,8 @@ tpl.render(context, jinja_env=env)
 ```
 src/            Rust sources (17 modules, see AGENTS.md)   Rust 源码
 python/         Python package shell (__init__ + __main__ CLI)
-tests/          384 tests + crosscheck/compare scripts      测试与交叉验证
-examples/       render.rs (Rust API), patch_dbg.rs (large-doc debugging)
+tests/          384 tests + crosscheck/compare/benchmark    测试、交叉验证与基准
+examples/       render.rs (Rust API), patch_dbg.rs (large-doc debugging), bench.rs (stage timings)
 AGENTS.md       Notes for AI coding assistants              给 AI 助手的项目说明
 ```
 
