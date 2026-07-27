@@ -575,6 +575,7 @@ fn merge_styles(
         if pkg.rels(DOCUMENT_PART).by_type(rel_type::STYLES).next().is_none() {
             pkg.add_rel(DOCUMENT_PART, rel_type::STYLES, "styles.xml", false);
         }
+        tpl.invalidate_part("word/styles.xml");
         return Ok(renames);
     }
 
@@ -668,6 +669,7 @@ fn merge_styles(
     if added > 0 {
         let xml = master_dom.serialize();
         pkg.set("word/styles.xml", xml.into_bytes());
+        tpl.invalidate_part("word/styles.xml");
     }
     Ok(renames)
 }

@@ -23,7 +23,7 @@ use pyo3::prelude::*;
 
 #[pymodule]
 fn docxtplrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("__version__", "0.1.6")?;
+    m.add("__version__", "0.1.7")?;
 
     m.add_class::<pyclasses::PyDocxTemplate>()?;
     m.add_class::<pyclasses::PyRichText>()?;

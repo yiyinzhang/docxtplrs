@@ -68,6 +68,12 @@ pub struct TplCore {
     pub doc_cache: Option<crate::xmldom::Document>,
     /// doc_cache has unpersisted mutations
     pub doc_dirty: bool,
+    /// cached parses of auxiliary xml parts (word/styles.xml, word/settings.xml,
+    /// word/comments.xml, docProps/core.xml, ...) for the docmodel facade;
+    /// word/document.xml uses doc_cache instead
+    pub part_caches: HashMap<String, crate::xmldom::Document>,
+    /// auxiliary part caches with unpersisted mutations
+    pub parts_dirty: HashSet<String>,
     /// per-part next wp:docPr shape id (avoids rescanning the part xml for
     /// every inserted image; seeded from the part's current max id)
     pub next_shape_ids: HashMap<String, u32>,
@@ -103,6 +109,7 @@ impl TplCore {
             self.package = Some(Package::from_bytes(&self.original_bytes)?);
             self.is_rendered = false;
             self.invalidate_doc();
+            self.invalidate_parts();
         }
         Ok(())
     }
@@ -149,13 +156,77 @@ impl TplCore {
         self.doc_dirty = false;
     }
 
+    /// Parsed DOM of an auxiliary part (styles/settings/comments/core/...),
+    /// parsed once and cached; reparsed after invalidation.
+    /// word/document.xml is served by document_dom instead.
+    pub fn part_dom(&mut self, part: &str) -> Result<&mut crate::xmldom::Document, String> {
+        if part == DOCUMENT_PART {
+            return self.document_dom();
+        }
+        self.init_docx(false)?;
+        if !self.part_caches.contains_key(part) {
+            let xml = self
+                .package
+                .as_ref()
+                .and_then(|p| p.get_string(part))
+                .ok_or_else(|| format!("part {} not found", part))?;
+            self.part_caches
+                .insert(part.to_string(), crate::xmldom::Document::parse(&xml)?);
+        }
+        Ok(self.part_caches.get_mut(part).unwrap())
+    }
+
+    /// Mark a cached part DOM as mutated; it is written back on flush_parts.
+    pub fn mark_part_dirty(&mut self, part: &str) {
+        if part == DOCUMENT_PART {
+            self.doc_dirty = true;
+        } else {
+            self.parts_dirty.insert(part.to_string());
+        }
+    }
+
+    /// Serialize all dirty cached DOMs (document + auxiliary parts) back
+    /// into the package.
+    pub fn flush_parts(&mut self) -> Result<(), String> {
+        self.flush_doc()?;
+        if self.parts_dirty.is_empty() {
+            return Ok(());
+        }
+        let dirty: Vec<String> = self.parts_dirty.drain().collect();
+        for part in dirty {
+            let Some(out) = self.part_caches.get(&part).map(|d| d.serialize()) else {
+                continue;
+            };
+            let enc = self.pkg()?.encoding_of(&part);
+            let bytes = crate::package::encode_part(&out, &enc);
+            self.pkg()?.set(&part, bytes);
+        }
+        Ok(())
+    }
+
+    /// Drop one cached part DOM (external code replaced that part).
+    pub fn invalidate_part(&mut self, part: &str) {
+        if part == DOCUMENT_PART {
+            self.invalidate_doc();
+            return;
+        }
+        self.part_caches.remove(part);
+        self.parts_dirty.remove(part);
+    }
+
+    /// Drop all cached auxiliary part DOMs (package was reloaded).
+    pub fn invalidate_parts(&mut self) {
+        self.part_caches.clear();
+        self.parts_dirty.clear();
+    }
+
     fn pkg(&mut self) -> Result<&mut Package, String> {
         self.package.as_mut().ok_or_else(|| "package not loaded".to_string())
     }
 
     pub fn get_xml(&mut self) -> Result<String, String> {
         self.init_docx(false)?;
-        self.flush_doc()?;
+        self.flush_parts()?;
         self.pkg()?
             .get_string(DOCUMENT_PART)
             .ok_or_else(|| "word/document.xml not found".to_string())
@@ -166,12 +237,19 @@ impl TplCore {
     pub fn render(&mut self, autoescape: bool, make_ctx: &CtxFn) -> Result<(), String> {
         self.render_init()?;
         // persist docmodel edits made since the last render/reload
-        self.flush_doc()?;
+        self.flush_parts()?;
+
+        // Build the context and the jinja environment ONCE per render and
+        // reuse them for every part (Value/Environment clones are cheap);
+        // previously each of the K parts rebuilt both from scratch.
+        let ctx = make_ctx(self, DOCUMENT_PART)?;
+        let ctx_once: &CtxFn = &|_core, _part| Ok(ctx.clone());
+        let env = make_env(autoescape, self);
 
         // Body
         let src = self.pkg()?.get_string(DOCUMENT_PART)
             .ok_or_else(|| "word/document.xml not found".to_string())?;
-        let rendered = self.render_part(DOCUMENT_PART, &src, autoescape, make_ctx)?;
+        let rendered = self.render_part_with(DOCUMENT_PART, &src, &env, ctx_once)?;
         // fix tables and docPr ids on body only
         let fixed = fix_tables_and_docpr(&rendered, &mut self.docx_ids_index)?;
         self.set_part_rendered(DOCUMENT_PART, fixed);
@@ -184,13 +262,21 @@ impl TplCore {
                     Some(s) => s,
                     None => continue,
                 };
-                let rendered = self.render_part(&part, &src, autoescape, make_ctx)?;
+                let rendered = self.render_part_with(&part, &src, &env, ctx_once)?;
                 self.set_part_rendered(&part, rendered);
             }
         }
 
-        self.render_properties(make_ctx)?;
-        self.render_footnotes(autoescape, make_ctx)?;
+        // core properties always render without autoescape (docxtpl parity)
+        let props_env;
+        let props_env = if autoescape {
+            props_env = make_env(false, self);
+            &props_env
+        } else {
+            &env
+        };
+        self.render_properties(props_env, ctx_once)?;
+        self.render_footnotes(&env, ctx_once)?;
 
         // like docxcompose's renumber_nvpicpr_ids: when subdocs were merged,
         // make pic:cNvPr ids unique (body first, then headers/footers)
@@ -251,11 +337,24 @@ impl TplCore {
         autoescape: bool,
         make_ctx: &CtxFn,
     ) -> Result<String, String> {
+        let env = make_env(autoescape, self);
+        self.render_part_with(part, src_xml, &env, make_ctx)
+    }
+
+    /// render_part with a pre-built environment (shared across all parts of
+    /// one render call).
+    fn render_part_with(
+        &mut self,
+        part: &str,
+        src_xml: &str,
+        env: &Environment,
+        make_ctx: &CtxFn,
+    ) -> Result<String, String> {
         let patched = patch_xml(&decode_text_entities(src_xml));
         let prev = crate::pybridge::set_current_render(self as *mut TplCore, part);
         let result = (|| {
             let ctx = make_ctx(self, part)?;
-            let dst = render_xml_str(&patched, ctx, autoescape, self)?;
+            let dst = render_xml_str_with(&patched, ctx, env, self)?;
             let dst = resolve_listing(&dst);
             self.materialize_deferred(part, dst)
         })();
@@ -337,7 +436,7 @@ impl TplCore {
         }
     }
 
-    fn render_properties(&mut self, make_ctx: &CtxFn) -> Result<(), String> {
+    fn render_properties(&mut self, env: &Environment, make_ctx: &CtxFn) -> Result<(), String> {
         let name = "docProps/core.xml";
         // python-docx always provides a core properties part
         if self.package.as_ref().map(|p| !p.contains(name)).unwrap_or(false) {
@@ -363,7 +462,6 @@ impl TplCore {
         let prev = crate::pybridge::set_current_render(self as *mut TplCore, name);
         let result = (|| -> Result<(), String> {
             let ctx = make_ctx(self, name)?;
-            let env = make_env(false, self);
             let mut changed = false;
             for tag in props {
                 if let Some(el) = doc.root.find_mut(tag) {
@@ -383,6 +481,7 @@ impl TplCore {
             if changed {
                 let xml = doc.serialize();
                 self.pkg()?.set(name, xml.into_bytes());
+                self.invalidate_part(name);
             }
             Ok(())
         })();
@@ -390,7 +489,7 @@ impl TplCore {
         result
     }
 
-    fn render_footnotes(&mut self, autoescape: bool, make_ctx: &CtxFn) -> Result<(), String> {
+    fn render_footnotes(&mut self, env: &Environment, make_ctx: &CtxFn) -> Result<(), String> {
         let rels = match &self.package {
             Some(p) => p.rels(DOCUMENT_PART),
             None => return Ok(()),
@@ -405,7 +504,7 @@ impl TplCore {
                 Some(s) => s,
                 None => continue,
             };
-            let rendered = self.render_part(&part, &src, autoescape, make_ctx)?;
+            let rendered = self.render_part_with(&part, &src, env, make_ctx)?;
             self.set_part_rendered(&part, rendered);
         }
         Ok(())
@@ -417,10 +516,8 @@ impl TplCore {
         let pkg = self.package.as_mut().expect("package loaded");
         let enc = pkg.encoding_of(part);
         pkg.set(part, crate::package::encode_part(&content, &enc));
-        if part == DOCUMENT_PART {
-            // rendered xml replaces whatever the docmodel cache held
-            self.invalidate_doc();
-        }
+        // rendered xml replaces whatever the part cache held
+        self.invalidate_part(part);
     }
 
     // ---------------- variables ----------------
@@ -570,7 +667,7 @@ impl TplCore {
     // ---------------- save ----------------
 
     pub fn save_bytes(&mut self) -> Result<Vec<u8>, String> {
-        self.flush_doc()?;
+        self.flush_parts()?;
         // load the package only if nothing has touched it yet; reloading
         // unconditionally here would discard pre-render docmodel edits
         self.init_docx(false)?;
@@ -2188,13 +2285,19 @@ pub fn recover_xml(xml: &str) -> String {
 }
 
 pub fn render_xml_str(src_xml: &str, ctx: Value, autoescape: bool, core: &mut TplCore) -> Result<String, String> {
+    let env = make_env(autoescape, core);
+    render_xml_str_with(src_xml, ctx, &env, core)
+}
+
+/// render_xml_str with a pre-built environment (shared across all parts of
+/// one render call).
+pub fn render_xml_str_with(src_xml: &str, ctx: Value, env: &Environment, core: &mut TplCore) -> Result<String, String> {
     // add newlines before paragraphs so template error line numbers are useful
     let src = sub_str(r"<w:p([ >])", "\n<w:p$1", src_xml);
     let src = preprocess_trans(&src);
     let src = preprocess_bool_compare(&src);
     let src = preprocess_engine_features(&src);
 
-    let env = make_env(autoescape, core);
     let rendered = match env.template_from_str(&src).and_then(|t| t.render(&ctx)) {
         Ok(s) => s,
         Err(e) => {

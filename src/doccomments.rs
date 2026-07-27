@@ -59,12 +59,12 @@ fn ensure_comments_part(core: &mut TplCore) -> Result<i64, String> {
             }
         }
     }
-    let pkg = core.package.as_ref().ok_or("package not loaded")?;
-    let xml = pkg.get_string("word/comments.xml").unwrap_or_default();
+    let dom = core.part_dom("word/comments.xml")?;
     let mut max_id: i64 = -1;
-    let re = crate::patch::re(r#"<w:comment [^>]*w:id="(\d+)""#);
-    for cap in re.captures_iter(&xml).flatten() {
-        if let Ok(n) = cap[1].parse::<i64>() {
+    let mut comments: Vec<&Element> = Vec::new();
+    dom.root.iter_descendants("w:comment", &mut comments);
+    for c in comments {
+        if let Some(Ok(n)) = c.get_attr("w:id").map(|v| v.parse::<i64>()) {
             max_id = max_id.max(n);
         }
     }
@@ -96,14 +96,10 @@ fn append_comment(
     }
     comment.push_str("</w:comment>");
 
-    let pkg = core.package.as_mut().ok_or("package not loaded")?;
-    let mut xml = pkg.get_string("word/comments.xml").unwrap_or_default();
-    if let Some(pos) = xml.rfind("</w:comments>") {
-        xml.insert_str(pos, &comment);
-    } else {
-        return Err("invalid comments part".into());
-    }
-    pkg.set("word/comments.xml", xml.into_bytes());
+    let frag = Document::parse(&comment).map_err(|e| format!("bad comment xml: {}", e))?;
+    let dom = core.part_dom("word/comments.xml")?;
+    dom.root.children.push(crate::xmldom::Node::Elem(frag.root));
+    core.mark_part_dirty("word/comments.xml");
     Ok(id)
 }
 
@@ -210,9 +206,7 @@ pub struct PyComment {
 impl PyComment {
     fn read<R>(&self, py: Python<'_>, f: impl FnOnce(&Element) -> R) -> Option<R> {
         with_core(&self.tpl, py, |core| {
-            core.init_docx(false).ok()?;
-            let xml = core.package.as_ref()?.get_string("word/comments.xml")?;
-            let dom = Document::parse(&xml).ok()?;
+            let dom = core.part_dom("word/comments.xml").ok()?;
             let mut comments: Vec<&Element> = Vec::new();
             dom.root.iter_descendants("w:comment", &mut comments);
             comments
@@ -271,12 +265,8 @@ impl PyComments {
 
     fn comment_list(&self, py: Python<'_>) -> Vec<PyComment> {
         with_core(&self.tpl, py, |core| {
-            core.init_docx(false).ok();
-            let xml = core
-                .package
-                .as_ref()
-                .and_then(|p| p.get_string("word/comments.xml"));
-            xml.and_then(|x| Document::parse(&x).ok())
+            core
+                .part_dom("word/comments.xml")
                 .map(|dom| {
                     let mut out = Vec::new();
                     let mut comments: Vec<&Element> = Vec::new();

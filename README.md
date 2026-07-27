@@ -104,9 +104,9 @@ tpl.save("out.docx")
 Engine-vs-engine (docxtplrs vs docxtpl + lxml + jinja2, same templates):
 **~6-14x faster** per render (see the "Fast" bullet above).
 
-On top of that, a dedicated profiling round removed the remaining internal
-hotspots (measured with the `maturin develop` debug build, CPython 3.13 —
-release builds are faster still):
+On top of that, dedicated profiling rounds removed the remaining internal
+hotspots (measured with the `maturin develop` debug build unless noted,
+CPython 3.13 — release builds are faster still):
 
 - **Document object model (live proxies)** — paragraph/run/table/section
   accessors used to re-parse the whole of `word/document.xml` on *every*
@@ -114,6 +114,19 @@ release builds are faster still):
   back at render/save time. Reading the text of 400 paragraphs:
   **1253ms → 3.6ms (~350x)**; 200 × `add_paragraph`: **832ms → 7ms (~120x)**;
   200 × run-text edits: **801ms → 0.4ms (~2000x)**.
+- **Per-part DOM cache** — `styles.xml` / `settings.xml` / `comments.xml` /
+  `core.xml` (and every `XmlElement` proxy part) used to be re-parsed, and
+  mutations re-serialized, on *every* access. They now share the same
+  parse-once/flush-on-save cache as `document.xml`. 20 × `styles[name]`
+  lookups over 200 styles: **21.0ms → 0.41ms (~50x)**; 20 × style-font
+  writes: **8.6ms → 0.02ms (~430x)** (release build); `resolve_style_id` no
+  longer deep-clones every style node per call.
+- **One env + one context per render** — the minijinja `Environment` (40+
+  filter/test registrations) and the Python-context → `Value` conversion used
+  to be rebuilt for *every* part (body, each header/footer, footnotes, core
+  properties). Both are now built once per `render()` call. Rendering a
+  7-part document with a 300-variable context: **5.0ms → 1.9ms (-61%)**
+  (release build).
 - **Render pipeline** — every XML patch pass is now gated (a zero-match pass
   no longer copies the full document), `InlineImage`/`Subdoc` placeholders are
   materialized in a single scan with `Arc`-shared blobs, and the
@@ -130,7 +143,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-docxtplrs = "0.1.5"
+docxtplrs = "0.1.7"
 minijinja = "2"
 ```
 
@@ -167,7 +180,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # in another uv project
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.5-cp313-cp313-manylinux_2_34_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.7-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # or editable (local development)
 uv add --editable /path/to/docxtplrs
 ```
@@ -416,13 +429,23 @@ with `llvm-cov`.
 引擎对引擎（docxtplrs vs docxtpl + lxml + jinja2，相同模板）：每次渲染**快约 6-14 倍**
 （见上方"快"一条）。
 
-在此之上，最近一轮专项 profiling 又清掉了剩余的内部热点（数据基于 `maturin develop`
-debug 构建 + CPython 3.13 实测，release 构建会更快）：
+在此之上，专项 profiling 又清掉了剩余的内部热点（数据基于 `maturin develop`
+debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会更快）：
 
 - **文档对象模型（实时代理）**：段落/表格/节等代理此前**每次**属性读写都重新全量解析
   `word/document.xml`；现在解析结果带脏标记缓存，仅在 render/save 时写回。读取 400 个
   段落文本：**1253ms → 3.6ms（约 350 倍）**；200 次 `add_paragraph`：**832ms → 7ms
   （约 120 倍）**；200 次 run 文本改写：**801ms → 0.4ms（约 2000 倍）**。
+- **per-part DOM 缓存**：`styles.xml` / `settings.xml` / `comments.xml` / `core.xml`
+  （以及所有 `XmlElement` 代理的 part）此前**每次**访问都重新解析、每次修改都重新
+  序列化；现在与 `document.xml` 一样解析一次、render/save 时统一写回。200 个 style 下
+  连续 20 次 `styles[name]` 查找：**21.0ms → 0.41ms（约 50 倍）**；20 次 style 字体
+  写入：**8.6ms → 0.02ms（约 430 倍）**（release 构建）；`resolve_style_id` 不再每次
+  调用都深克隆全部 style 节点。
+- **每次 render 只构建一次 env 与 context**：minijinja `Environment`（40+ 个
+  filter/test 注册）和 Python context → `Value` 的转换此前**每个 part**（body、每个
+  页眉/页脚、footnotes、core 属性）都重建一遍；现在每次 `render()` 调用只构建一次。
+  渲染 7 个 part + 300 个变量的文档：**5.0ms → 1.9ms（-61%）**（release 构建）。
 - **渲染管线**：所有 XML patch pass 加了 gate（零匹配不再全量拷贝文档），
   `InlineImage`/`Subdoc` 占位符单遍扫描实体化且 blob 用 `Arc` 共享，表格/docPr 修复
   在无事可修时跳过整个 DOM 往返。渲染 2MB / 2 万段落文档：**3384ms → 1901ms（-44%）**。
@@ -436,7 +459,7 @@ debug 构建 + CPython 3.13 实测，release 构建会更快）：
 
 ```toml
 [dependencies]
-docxtplrs = "0.1.5"
+docxtplrs = "0.1.7"
 minijinja = "2"
 ```
 
@@ -474,7 +497,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # 在其他 uv 项目中
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.5-cp313-cp313-manylinux_2_34_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.7-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # 或本地开发模式（editable）
 uv add --editable /path/to/docxtplrs
 ```

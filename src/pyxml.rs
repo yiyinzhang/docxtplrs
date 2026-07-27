@@ -8,7 +8,7 @@
 
 use crate::docmodel::with_core;
 use crate::pyclasses::PyDocxTemplate;
-use crate::template::{TplCore, DOCUMENT_PART};
+use crate::template::TplCore;
 use crate::xmldom::{Document, Element, Node};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -66,52 +66,26 @@ fn read_el<R>(
     path: &[usize],
     f: impl FnOnce(&Element) -> R,
 ) -> Result<R, String> {
-    if part == DOCUMENT_PART {
-        let dom = core.document_dom()?;
-        let el = nav(&dom.root, path).ok_or_else(|| "element not found".to_string())?;
-        Ok(f(el))
-    } else {
-        core.init_docx(false)?;
-        let pkg = core.package.as_ref().ok_or("package not loaded")?;
-        let xml = pkg
-            .get_string(part)
-            .ok_or_else(|| format!("part {} not found", part))?;
-        let dom = Document::parse(&xml)?;
-        let el = nav(&dom.root, path).ok_or_else(|| "element not found".to_string())?;
-        Ok(f(el))
-    }
+    let dom = core.part_dom(part)?;
+    let el = nav(&dom.root, path).ok_or_else(|| "element not found".to_string())?;
+    Ok(f(el))
 }
 
-/// Mutating access to the addressed element; the part is written back.
+/// Mutating access to the addressed element; the cached DOM is written back
+/// to the package on the next flush (render/save/etc).
 fn edit_el<R>(
     core: &mut TplCore,
     part: &str,
     path: &[usize],
     f: impl FnOnce(&mut Element) -> R,
 ) -> Result<R, String> {
-    if part == DOCUMENT_PART {
-        let r = {
-            let dom = core.document_dom()?;
-            let el = nav_mut(&mut dom.root, path).ok_or_else(|| "element not found".to_string())?;
-            f(el)
-        };
-        core.mark_doc_dirty();
-        Ok(r)
-    } else {
-        core.init_docx(false)?;
-        let pkg = core.package.as_mut().ok_or("package not loaded")?;
-        let xml = pkg
-            .get_string(part)
-            .ok_or_else(|| format!("part {} not found", part))?;
-        let mut dom = Document::parse(&xml)?;
-        let r = {
-            let el = nav_mut(&mut dom.root, path).ok_or_else(|| "element not found".to_string())?;
-            f(el)
-        };
-        let enc = pkg.encoding_of(part);
-        pkg.set(part, crate::package::encode_part(&dom.serialize(), &enc));
-        Ok(r)
-    }
+    let r = {
+        let dom = core.part_dom(part)?;
+        let el = nav_mut(&mut dom.root, path).ok_or_else(|| "element not found".to_string())?;
+        f(el)
+    };
+    core.mark_part_dirty(part);
+    Ok(r)
 }
 
 impl PyXmlElement {

@@ -1396,13 +1396,9 @@ pub struct PyStyle {
 }
 
 pub(crate) fn with_styles<R>(core: &mut TplCore, f: impl FnOnce(&mut Element) -> R) -> Result<R, String> {
-    core.init_docx(false)?;
     ensure_styles_part(core)?;
-    let pkg = core.package.as_mut().ok_or("package not loaded")?;
-    let xml = pkg.get_string("word/styles.xml").unwrap_or_default();
-    let mut dom = Document::parse(&xml)?;
-    let r = f(&mut dom.root);
-    pkg.set("word/styles.xml", dom.serialize().into_bytes());
+    let r = f(&mut core.part_dom("word/styles.xml")?.root);
+    core.mark_part_dirty("word/styles.xml");
     Ok(r)
 }
 
@@ -1471,9 +1467,7 @@ impl PyStyle {
 
     fn read<R>(&self, py: Python<'_>, f: impl FnOnce(&Element) -> R) -> Option<R> {
         with_core(&self.tpl, py, |core| {
-            core.init_docx(false).ok()?;
-            let xml = core.package.as_ref()?.get_string("word/styles.xml")?;
-            let dom = Document::parse(&xml).ok()?;
+            let dom = core.part_dom("word/styles.xml").ok()?;
             find_style_el(&dom.root, &self.style_id).map(|e| f(e))
         })
     }
@@ -1968,12 +1962,8 @@ impl PyStyles {
 
     fn style_list(&self, py: Python<'_>) -> Vec<PyStyle> {
         with_core(&self.tpl, py, |core| {
-            core.init_docx(false).ok();
-            let xml = core
-                .package
-                .as_ref()
-                .and_then(|p| p.get_string("word/styles.xml"));
-            xml.and_then(|x| Document::parse(&x).ok())
+            core
+                .part_dom("word/styles.xml")
                 .map(|dom| {
                     let mut out = Vec::new();
                     fn walk(el: &Element, out: &mut Vec<String>) {
@@ -2010,15 +2000,11 @@ impl PyStyles {
         with_core(&self.tpl, py, |core| {
             core.init_docx(false).map_err(PyRuntimeError::new_err)?;
             let sid = crate::subdocbuilder::resolve_style_id(core, &key);
-            // verify it exists
-            let found = {
-                core.package
-                    .as_ref()
-                    .and_then(|p| p.get_string("word/styles.xml"))
-                    .and_then(|x| Document::parse(&x).ok())
-                    .map(|dom| find_style_el(&dom.root, &sid).is_some())
-                    .unwrap_or(false)
-            };
+            // verify it exists (cached DOM)
+            let found = core
+                .part_dom("word/styles.xml")
+                .map(|dom| find_style_el(&dom.root, &sid).is_some())
+                .unwrap_or(false);
             if !found {
                 return Err(PyValueError::new_err(format!("no style with name '{}'", key)));
             }
@@ -2107,11 +2093,8 @@ pub(crate) fn ensure_settings_part(core: &mut TplCore) -> Result<(), String> {
 
 fn with_settings<R>(core: &mut TplCore, f: impl FnOnce(&mut Element) -> R) -> Result<R, String> {
     ensure_settings_part(core)?;
-    let pkg = core.package.as_mut().ok_or("package not loaded")?;
-    let xml = pkg.get_string("word/settings.xml").unwrap_or_default();
-    let mut dom = Document::parse(&xml)?;
-    let r = f(&mut dom.root);
-    pkg.set("word/settings.xml", dom.serialize().into_bytes());
+    let r = f(&mut core.part_dom("word/settings.xml")?.root);
+    core.mark_part_dirty("word/settings.xml");
     Ok(r)
 }
 
@@ -2132,11 +2115,7 @@ impl PySettings {
     #[getter]
     fn odd_and_even_pages_header_footer(&self, py: Python<'_>) -> bool {
         with_core(&self.tpl, py, |core| {
-            core.init_docx(false).ok();
-            core.package
-                .as_ref()
-                .and_then(|p| p.get_string("word/settings.xml"))
-                .and_then(|x| Document::parse(&x).ok())
+            core.part_dom("word/settings.xml")
                 .map(|dom| dom.root.find("w:evenAndOddHeaders").is_some())
                 .unwrap_or(false)
         })
@@ -2217,19 +2196,10 @@ pub fn ensure_core_part(pkg: &mut crate::package::Package) {
 }
 
 pub fn get_core_property(core: &mut TplCore, tag: &str) -> String {
-    core.init_docx(false).ok();
-    let Some(pkg) = core.package.as_ref() else {
-        return String::new();
-    };
-    let Some(xml) = pkg.get_string("docProps/core.xml") else {
-        return String::new();
-    };
-    let Ok(dom) = Document::parse(&xml) else {
-        return String::new();
-    };
-    dom.root
-        .find(tag)
-        .map(|e| e.text_content())
+    core
+        .part_dom("docProps/core.xml")
+        .ok()
+        .and_then(|dom| dom.root.find(tag).map(|e| e.text_content()))
         .unwrap_or_default()
 }
 
@@ -2243,28 +2213,28 @@ pub fn set_core_property(core: &mut TplCore, tag: &str, value: &str) -> Result<(
     {
         ensure_core_part(core.package.as_mut().unwrap());
     }
-    let pkg = core.package.as_mut().ok_or("package not loaded")?;
-    let xml = pkg.get_string("docProps/core.xml").unwrap_or_else(|| DEFAULT_CORE_XML.to_string());
-    let mut dom = Document::parse(&xml)?;
-    match dom.root.find_mut(tag) {
-        Some(el) => {
-            el.children = vec![Node::Text(value.to_string())];
-        }
-        None => {
-            let mut el = Element::new(tag);
-            el.children.push(Node::Text(value.to_string()));
-            let pos = dom
-                .root
-                .children
-                .iter()
-                .position(|c| matches!(c, Node::Elem(e) if e.name.starts_with("dcterms:")));
-            match pos {
-                Some(i) => dom.root.children.insert(i, Node::Elem(el)),
-                None => dom.root.children.push(Node::Elem(el)),
+    {
+        let dom = core.part_dom("docProps/core.xml")?;
+        match dom.root.find_mut(tag) {
+            Some(el) => {
+                el.children = vec![Node::Text(value.to_string())];
+            }
+            None => {
+                let mut el = Element::new(tag);
+                el.children.push(Node::Text(value.to_string()));
+                let pos = dom
+                    .root
+                    .children
+                    .iter()
+                    .position(|c| matches!(c, Node::Elem(e) if e.name.starts_with("dcterms:")));
+                match pos {
+                    Some(i) => dom.root.children.insert(i, Node::Elem(el)),
+                    None => dom.root.children.push(Node::Elem(el)),
+                }
             }
         }
     }
-    pkg.set("docProps/core.xml", dom.serialize().into_bytes());
+    core.mark_part_dirty("docProps/core.xml");
     Ok(())
 }
 

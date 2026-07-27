@@ -156,45 +156,36 @@ fn usable_width_twips(_tpl: &mut TplCore) -> i64 {
 
 /// Resolve a style name or id to a style id, consulting the master styles part.
 pub fn resolve_style_id(tpl: &mut TplCore, style: &str) -> String {
-    let Some(pkg) = tpl.package.as_ref() else {
+    let Ok(dom) = tpl.part_dom("word/styles.xml") else {
         return style.to_string();
     };
-    let Some(xml) = pkg.get_string("word/styles.xml") else {
-        return style.to_string();
-    };
-    let Ok(dom) = crate::xmldom::Document::parse(&xml) else {
-        return style.to_string();
-    };
-    let mut styles: Vec<crate::xmldom::Element> = Vec::new();
-    collect_styles(&dom.root, &mut styles);
-    // exact styleId match first
-    for st in &styles {
-        if st.get_attr("w:styleId") == Some(style) {
-            return style.to_string();
-        }
-    }
-    // then by w:name (case-insensitive, python-docx uses name lookup)
+    // exact styleId match first, then by w:name (case-insensitive,
+    // python-docx uses name lookup); single walk over the cached DOM
     let want = style.to_lowercase();
-    for st in &styles {
-        if let Some(name_el) = st.find("w:name") {
-            if let Some(v) = name_el.get_attr("w:val") {
-                if v.to_lowercase() == want {
-                    if let Some(id) = st.get_attr("w:styleId") {
-                        return id.to_string();
+    let mut by_name: Option<String> = None;
+    let mut stack: Vec<&crate::xmldom::Element> = vec![&dom.root];
+    while let Some(el) = stack.pop() {
+        // push in reverse so traversal follows document order
+        for c in el.children.iter().rev() {
+            if let crate::xmldom::Node::Elem(e) = c {
+                if e.name == "w:style" {
+                    if e.get_attr("w:styleId") == Some(style) {
+                        return style.to_string();
+                    }
+                    if by_name.is_none() {
+                        if let Some(v) = e
+                            .find("w:name")
+                            .and_then(|n| n.get_attr("w:val"))
+                        {
+                            if v.to_lowercase() == want {
+                                by_name = e.get_attr("w:styleId").map(|s| s.to_string());
+                            }
+                        }
                     }
                 }
+                stack.push(e);
             }
         }
     }
-    style.to_string()
-}
-
-fn collect_styles(el: &crate::xmldom::Element, out: &mut Vec<crate::xmldom::Element>) {
-    for c in &el.children {
-        if let crate::xmldom::Node::Elem(e) = c {
-            if e.name == "w:style" {
-                out.push(e.clone());
-            }
-        }
-    }
+    by_name.unwrap_or_else(|| style.to_string())
 }
