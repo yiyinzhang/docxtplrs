@@ -62,6 +62,15 @@ pub struct PyDocxTemplate {
 
 #[pymethods]
 impl PyDocxTemplate {
+    /// Relationship type URI of header parts (docxtpl HEADER_URI).
+    #[classattr]
+    const HEADER_URI: &'static str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/header";
+    /// Relationship type URI of footer parts (docxtpl FOOTER_URI).
+    #[classattr]
+    const FOOTER_URI: &'static str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer";
+
     #[new]
     fn new(template_file: &Bound<'_, PyAny>) -> PyResult<Self> {
         let bytes = read_bytes_source(template_file)?;
@@ -488,6 +497,49 @@ impl PyDocxTemplate {
             dict.set_item(k, (tref, tpart))?;
         }
         Ok(dict.unbind())
+    }
+
+    /// CRC32 of a file (path, bytes or file-like), as used by replace_pic
+    /// to locate an embedded image (docxtpl get_file_crc).
+    #[staticmethod]
+    fn get_file_crc(file_obj: &Bound<'_, PyAny>) -> PyResult<u32> {
+        let bytes = read_bytes_source(file_obj)?;
+        Ok(crc32(&bytes))
+    }
+
+    /// Iterate (rel_id, element) of the header/footer parts of the document,
+    /// filtered by relationship type URI (docxtpl get_headers_footers).
+    /// `element` is a live XmlElement proxy of the part root.
+    fn get_headers_footers(
+        slf: Py<Self>,
+        py: Python<'_>,
+        uri: &str,
+    ) -> PyResult<Vec<(String, crate::pyxml::PyXmlElement)>> {
+        let tpl = slf.bind(py).borrow();
+        let mut core = tpl.core.borrow_mut();
+        core.init_docx(false).map_err(to_pyerr)?;
+        let pkg = core
+            .package
+            .as_ref()
+            .ok_or_else(|| to_pyerr("package not loaded".into()))?;
+        let rels = pkg.rels(crate::template::DOCUMENT_PART);
+        let mut out = Vec::new();
+        for rel in rels.by_type(uri) {
+            let part =
+                crate::package::resolve_target(crate::template::DOCUMENT_PART, &rel.target);
+            if !pkg.contains(&part) {
+                continue;
+            }
+            out.push((
+                rel.id.clone(),
+                crate::pyxml::PyXmlElement {
+                    tpl: slf.clone_ref(py),
+                    part,
+                    path: Vec::new(),
+                },
+            ));
+        }
+        Ok(out)
     }
 }
 

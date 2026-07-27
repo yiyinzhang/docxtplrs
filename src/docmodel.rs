@@ -571,6 +571,37 @@ impl PyTable {
             col: j,
         }
     }
+
+    /// The table style id (python-docx table.style; accepts a style name or
+    /// id on assignment, returns the style id).
+    #[getter]
+    fn style(&self, py: Python<'_>) -> Option<String> {
+        self.read(py, |t| {
+            t.find("w:tblPr")
+                .and_then(|p| p.find("w:tblStyle"))
+                .and_then(|e| e.get_attr("w:val").map(|s| s.to_string()))
+        })
+        .flatten()
+    }
+
+    #[setter]
+    fn set_style(&self, py: Python<'_>, v: String) -> PyResult<()> {
+        let sid = with_core(&self.tpl, py, |core| {
+            crate::subdocbuilder::resolve_style_id(core, &v)
+        });
+        self.edit(py, |t| {
+            // w:tblPr must be the first child of w:tbl
+            if t.find("w:tblPr").is_none() {
+                t.children.insert(0, Node::Elem(Element::new("w:tblPr")));
+            }
+            let tblpr = t.find_mut("w:tblPr").unwrap();
+            // w:tblStyle must be the first child of w:tblPr
+            if tblpr.find("w:tblStyle").is_none() {
+                tblpr.children.insert(0, Node::Elem(Element::new("w:tblStyle")));
+            }
+            tblpr.find_mut("w:tblStyle").unwrap().set_attr("w:val", &sid);
+        })
+    }
 }
 
 /// A table row (live proxy).
@@ -668,6 +699,184 @@ impl PyCell {
             p.children.push(Node::Elem(r));
             c.children.push(Node::Elem(p));
         })
+    }
+
+    /// Merge this cell with `other` into one cell spanning the rectangular
+    /// region between them (python-docx cell.merge). Returns the merged cell.
+    fn merge(&self, py: Python<'_>, other: Bound<'_, PyCell>) -> PyResult<PyCell> {
+        let (oidx, orow, ocol) = {
+            let o = other.borrow();
+            (o.index, o.row, o.col)
+        };
+        if oidx != self.index {
+            return Err(PyValueError::new_err(
+                "cannot merge cells of different tables",
+            ));
+        }
+        let (r1, r2) = (self.row.min(orow), self.row.max(orow));
+        let (c1, c2) = (self.col.min(ocol), self.col.max(ocol));
+        if r1 != r2 || c1 != c2 {
+            with_core(&self.tpl, py, |core| {
+                let mut found = false;
+                mutate_document(core, |body| {
+                    if let Some(t) = nth_direct(body, "w:tbl", self.index) {
+                        merge_region(t, r1, r2, c1, c2);
+                        found = true;
+                    }
+                })
+                .map_err(py_err)?;
+                if !found {
+                    return Err(PyValueError::new_err("table not found"));
+                }
+                Ok(())
+            })?;
+        }
+        Ok(PyCell {
+            tpl: self.tpl.clone_ref(py),
+            index: self.index,
+            row: r1,
+            col: c1,
+        })
+    }
+}
+
+/// Positions of the direct w:tc children of a table row.
+fn tc_positions(row: &Element) -> Vec<usize> {
+    row.children
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| matches!(c, Node::Elem(e) if e.name == "w:tc"))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn tcpr_mut(tc: &mut Element) -> &mut Element {
+    if tc.find("w:tcPr").is_none() {
+        tc.children.insert(0, Node::Elem(Element::new("w:tcPr")));
+    }
+    tc.find_mut("w:tcPr").unwrap()
+}
+
+/// Rectangular cell merge over direct tc addressing: horizontal span via
+/// w:gridSpan, vertical span via w:vMerge (python-docx semantics: content of
+/// every merged-away cell is moved into the top-left cell; vertical
+/// continuation cells end up with a single empty paragraph).
+fn merge_region(t: &mut Element, r1: usize, r2: usize, c1: usize, c2: usize) {
+    // content collected from merged-away cells, in reading order
+    let mut tail: Vec<Node> = Vec::new();
+    for r in r1..=r2 {
+        let Some(row) = nth_direct(t, "w:tr", r) else {
+            continue;
+        };
+        let tpos = tc_positions(row);
+        if c1 >= tpos.len() {
+            continue;
+        }
+        let c2c = c2.min(tpos.len() - 1);
+        // total grid span of the merged range
+        let mut span: i64 = 0;
+        for &p in &tpos[c1..=c2c] {
+            if let Node::Elem(tc) = &row.children[p] {
+                span += tc
+                    .find("w:tcPr")
+                    .and_then(|pr| pr.find("w:gridSpan"))
+                    .and_then(|g| g.get_attr("w:val"))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1);
+            }
+        }
+        // remove cells c1+1..=c2c (reverse so positions stay valid),
+        // keeping their non-empty content
+        let mut moved: Vec<Node> = Vec::new();
+        for &p in tpos[c1 + 1..=c2c].iter().rev() {
+            if let Node::Elem(tc) = row.children.remove(p) {
+                for ch in tc.children {
+                    if is_non_empty_block(&ch) {
+                        moved.push(ch);
+                    }
+                }
+            }
+        }
+        moved.reverse();
+        let first_pos = tpos[c1];
+        if let Node::Elem(tc) = &mut row.children[first_pos] {
+            if r > r1 {
+                // vertical continuation: move own content up to the origin cell
+                let mut own: Vec<Node> = Vec::new();
+                for ch in std::mem::take(&mut tc.children) {
+                    if is_non_empty_block(&ch) {
+                        own.push(ch);
+                    } else if matches!(&ch, Node::Elem(e) if e.name == "w:tcPr") {
+                        tc.children.push(ch);
+                    }
+                }
+                tail.append(&mut own);
+            }
+            {
+                let tcpr = tcpr_mut(tc);
+                if span > 1 {
+                    if tcpr.find("w:gridSpan").is_none() {
+                        tcpr.children.insert(0, Node::Elem(Element::new("w:gridSpan")));
+                    }
+                    tcpr
+                        .find_mut("w:gridSpan")
+                        .unwrap()
+                        .set_attr("w:val", &span.to_string());
+                }
+                if r2 > r1 {
+                    if tcpr.find("w:vMerge").is_none() {
+                        tcpr.children.insert(0, Node::Elem(Element::new("w:vMerge")));
+                    }
+                    let vm = tcpr.find_mut("w:vMerge").unwrap();
+                    if r == r1 {
+                        vm.set_attr("w:val", "restart");
+                    } else {
+                        vm.attrs.retain(|(k, _)| k != "w:val");
+                    }
+                }
+            }
+            tail.append(&mut moved);
+            if r > r1 {
+                // vertical-continuation cell: exactly one empty paragraph
+                tc.children
+                    .retain(|ch| matches!(ch, Node::Elem(e) if e.name == "w:tcPr"));
+                tc.children.push(Node::Elem(Element::new("w:p")));
+            }
+        }
+    }
+    // move the collected content into the origin cell
+    if tail.is_empty() {
+        return;
+    }
+    if let Some(row) = nth_direct(t, "w:tr", r1) {
+        let tpos = tc_positions(row);
+        if c1 >= tpos.len() {
+            return;
+        }
+        if let Node::Elem(tc) = &mut row.children[tpos[c1]] {
+            // drop a single trailing empty paragraph (python-docx does this
+            // before appending moved content)
+            if matches!(
+                tc.children.last(),
+                Some(Node::Elem(e)) if e.name == "w:p" && element_text(e).is_empty()
+            ) {
+                tc.children.pop();
+            }
+            tc.children.append(&mut tail);
+            if !tc.children.iter().any(|ch| matches!(ch, Node::Elem(e) if e.name == "w:p")) {
+                tc.children.push(Node::Elem(Element::new("w:p")));
+            }
+        }
+    }
+}
+
+/// A block element worth moving when merging: non-paragraph blocks and
+/// paragraphs with text content.
+fn is_non_empty_block(ch: &Node) -> bool {
+    match ch {
+        Node::Elem(e) if e.name == "w:tcPr" => false,
+        Node::Elem(e) => e.name != "w:p" || !element_text(e).is_empty(),
+        Node::Text(_) => false,
     }
 }
 
@@ -882,6 +1091,48 @@ impl PySection {
         }
     }
 
+    /// Header used on even pages (python-docx even_page_header).
+    /// Requires settings.odd_and_even_pages_header_footer to take effect.
+    #[getter]
+    fn even_page_header(&self, py: Python<'_>) -> PySectionHdrFtr {
+        PySectionHdrFtr {
+            tpl: self.tpl.clone_ref(py),
+            section: self.index,
+            kind: "even_header".to_string(),
+        }
+    }
+
+    /// Footer used on even pages (python-docx even_page_footer).
+    #[getter]
+    fn even_page_footer(&self, py: Python<'_>) -> PySectionHdrFtr {
+        PySectionHdrFtr {
+            tpl: self.tpl.clone_ref(py),
+            section: self.index,
+            kind: "even_footer".to_string(),
+        }
+    }
+
+    /// Header used on the first page (python-docx first_page_header).
+    /// Requires different_first_page_header_footer to take effect.
+    #[getter]
+    fn first_page_header(&self, py: Python<'_>) -> PySectionHdrFtr {
+        PySectionHdrFtr {
+            tpl: self.tpl.clone_ref(py),
+            section: self.index,
+            kind: "first_header".to_string(),
+        }
+    }
+
+    /// Footer used on the first page (python-docx first_page_footer).
+    #[getter]
+    fn first_page_footer(&self, py: Python<'_>) -> PySectionHdrFtr {
+        PySectionHdrFtr {
+            tpl: self.tpl.clone_ref(py),
+            section: self.index,
+            kind: "first_footer".to_string(),
+        }
+    }
+
     #[getter]
     fn different_first_page_header_footer(&self, py: Python<'_>) -> bool {
         self.read(py, |sp| sp.find("w:titlePg").is_some())
@@ -912,10 +1163,24 @@ pub struct PySectionHdrFtr {
 }
 
 fn rel_type_for(kind: &str) -> &'static str {
-    if kind == "header" {
+    let (_, base) = split_kind(kind);
+    if base == "header" {
         crate::package::rel_type::HEADER
     } else {
         crate::package::rel_type::FOOTER
+    }
+}
+
+/// Split a hdrftr kind into (w:type value, base "header"|"footer").
+/// Kinds: header/footer (default), even_header/even_footer, first_header/first_footer.
+fn split_kind(kind: &str) -> (&'static str, &'static str) {
+    match kind {
+        "footer" => ("default", "footer"),
+        "even_header" => ("even", "header"),
+        "even_footer" => ("even", "footer"),
+        "first_header" => ("first", "header"),
+        "first_footer" => ("first", "footer"),
+        _ => ("default", "header"),
     }
 }
 
@@ -932,18 +1197,19 @@ fn find_hdrftr_part(
         let mut sects: Vec<&Element> = Vec::new();
         dom.root.iter_descendants("w:sectPr", &mut sects);
         let sect = sects.get(section_idx)?;
-        let want_tag = if kind == "header" {
+        let (wtype, base) = split_kind(kind);
+        let want_tag = if base == "header" {
             "w:headerReference"
         } else {
             "w:footerReference"
         };
-        // use the default-type reference
+        // use the reference with the matching w:type
         let mut rid: Option<String> = None;
         for c in &sect.children {
             if let Node::Elem(e) = c {
                 if e.name == want_tag {
                     let t = e.get_attr("w:type").unwrap_or("default");
-                    if t == "default" && rid.is_none() {
+                    if t == wtype && rid.is_none() {
                         rid = e.get_attr("r:id").map(|s| s.to_string());
                     }
                 }
@@ -1024,7 +1290,7 @@ impl PySectionHdrFtr {
                 "<w:p><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p>",
                 crate::richtext::html_escape(text)
             );
-            let close = format!("</w:{}>", if self.kind == "header" { "hdr" } else { "ftr" });
+            let close = format!("</w:{}>", if split_kind(&self.kind).1 == "header" { "hdr" } else { "ftr" });
             if let Some(pos) = xml.rfind(&close) {
                 xml.insert_str(pos, &para);
             } else {
@@ -1054,33 +1320,35 @@ fn remove_hdrftr_reference(core: &mut TplCore, section_idx: usize, kind: &str) -
         }
         collect(body, &mut sects);
         if let Some(sect) = sects.get_mut(section_idx) {
-            let want = if kind == "header" {
+            let (wtype, base) = split_kind(kind);
+            let want = if base == "header" {
                 "w:headerReference"
             } else {
                 "w:footerReference"
             };
             sect.children.retain(|c| {
-                !(matches!(c, Node::Elem(e) if e.name == want && e.get_attr("w:type").unwrap_or("default") == "default"))
+                !(matches!(c, Node::Elem(e) if e.name == want && e.get_attr("w:type").unwrap_or("default") == wtype))
             });
         }
     })
 }
 
 fn create_hdrftr_part(core: &mut TplCore, section_idx: usize, kind: &str) -> Result<(), String> {
+    let (wtype, base) = split_kind(kind);
     let pkg = core.package.as_mut().ok_or("package not loaded")?;
     // find next part number
-    let prefix = if kind == "header" { "word/header" } else { "word/footer" };
+    let prefix = if base == "header" { "word/header" } else { "word/footer" };
     let mut n = 1;
     while pkg.contains(&format!("{}{}.xml", prefix, n)) {
         n += 1;
     }
     let part = format!("{}{}.xml", prefix, n);
-    let root = if kind == "header" { "hdr" } else { "ftr" };
+    let root = if base == "header" { "hdr" } else { "ftr" };
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:{root} xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"></w:{root}>"
     );
     pkg.set(&part, xml.into_bytes());
-    let ct = if kind == "header" {
+    let ct = if base == "header" {
         "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"
     } else {
         "application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"
@@ -1090,7 +1358,7 @@ fn create_hdrftr_part(core: &mut TplCore, section_idx: usize, kind: &str) -> Res
     let rid = pkg.add_rel(DOCUMENT_PART, rel_type_for(kind), &target, false);
 
     // add the reference to the section
-    let tag = if kind == "header" {
+    let tag = if base == "header" {
         "w:headerReference"
     } else {
         "w:footerReference"
@@ -1111,7 +1379,7 @@ fn create_hdrftr_part(core: &mut TplCore, section_idx: usize, kind: &str) -> Res
         collect(body, &mut sects);
         if let Some(sect) = sects.get_mut(section_idx) {
             let mut el = Element::new(tag);
-            el.set_attr("w:type", "default");
+            el.set_attr("w:type", wtype);
             el.set_attr("r:id", &rid);
             sect.children.insert(0, Node::Elem(el));
         }
@@ -1138,7 +1406,8 @@ pub(crate) fn with_styles<R>(core: &mut TplCore, f: impl FnOnce(&mut Element) ->
     Ok(r)
 }
 
-fn ensure_styles_part(core: &mut TplCore) -> Result<(), String> {
+pub(crate) fn ensure_styles_part(core: &mut TplCore) -> Result<(), String> {
+    core.init_docx(false)?;
     let pkg = core.package.as_mut().ok_or("package not loaded")?;
     if pkg.contains("word/styles.xml") {
         return Ok(());
@@ -1225,6 +1494,17 @@ pub struct PyDocument {
 
 #[pymethods]
 impl PyDocument {
+    /// Raw XML root element of word/document.xml (live proxy), the
+    /// python-docx `document.element` escape hatch.
+    #[getter]
+    pub fn element(&self, py: Python<'_>) -> crate::pyxml::PyXmlElement {
+        crate::pyxml::PyXmlElement {
+            tpl: self.tpl.clone_ref(py),
+            part: DOCUMENT_PART.to_string(),
+            path: Vec::new(),
+        }
+    }
+
     #[getter]
     pub fn paragraphs(&self, py: Python<'_>) -> Vec<PyParagraph> {
         let n = with_core(&self.tpl, py, |core| count_in_body(core, "w:p"));
@@ -1668,6 +1948,18 @@ pub struct PyStyles {
 
 #[pymethods]
 impl PyStyles {
+    /// Raw XML root element of word/styles.xml (live proxy), the
+    /// python-docx `styles.element` escape hatch.
+    #[getter]
+    fn element(&self, py: Python<'_>) -> PyResult<crate::pyxml::PyXmlElement> {
+        with_core(&self.tpl, py, |core| ensure_styles_part(core)).map_err(py_err)?;
+        Ok(crate::pyxml::PyXmlElement {
+            tpl: self.tpl.clone_ref(py),
+            part: "word/styles.xml".to_string(),
+            path: Vec::new(),
+        })
+    }
+
     fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let styles = self.style_list(py);
         let list = pyo3::types::PyList::new(py, styles)?;
@@ -1796,22 +2088,25 @@ pub struct PySettings {
     pub tpl: Py<PyDocxTemplate>,
 }
 
-fn with_settings<R>(core: &mut TplCore, f: impl FnOnce(&mut Element) -> R) -> Result<R, String> {
+pub(crate) fn ensure_settings_part(core: &mut TplCore) -> Result<(), String> {
     core.init_docx(false)?;
-    {
-        let pkg = core.package.as_mut().ok_or("package not loaded")?;
-        if !pkg.contains("word/settings.xml") {
-            let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:settings xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"/>";
-            pkg.set("word/settings.xml", xml.as_bytes().to_vec());
-            pkg.ensure_content_type_override(
-                "word/settings.xml",
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml",
-            );
-            if pkg.rels(DOCUMENT_PART).by_type(crate::package::rel_type::SETTINGS).next().is_none() {
-                pkg.add_rel(DOCUMENT_PART, crate::package::rel_type::SETTINGS, "settings.xml", false);
-            }
+    let pkg = core.package.as_mut().ok_or("package not loaded")?;
+    if !pkg.contains("word/settings.xml") {
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:settings xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"/>";
+        pkg.set("word/settings.xml", xml.as_bytes().to_vec());
+        pkg.ensure_content_type_override(
+            "word/settings.xml",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml",
+        );
+        if pkg.rels(DOCUMENT_PART).by_type(crate::package::rel_type::SETTINGS).next().is_none() {
+            pkg.add_rel(DOCUMENT_PART, crate::package::rel_type::SETTINGS, "settings.xml", false);
         }
     }
+    Ok(())
+}
+
+fn with_settings<R>(core: &mut TplCore, f: impl FnOnce(&mut Element) -> R) -> Result<R, String> {
+    ensure_settings_part(core)?;
     let pkg = core.package.as_mut().ok_or("package not loaded")?;
     let xml = pkg.get_string("word/settings.xml").unwrap_or_default();
     let mut dom = Document::parse(&xml)?;
@@ -1822,6 +2117,18 @@ fn with_settings<R>(core: &mut TplCore, f: impl FnOnce(&mut Element) -> R) -> Re
 
 #[pymethods]
 impl PySettings {
+    /// Raw XML root element of word/settings.xml (live proxy), the
+    /// python-docx `settings.element` escape hatch.
+    #[getter]
+    fn element(&self, py: Python<'_>) -> PyResult<crate::pyxml::PyXmlElement> {
+        with_core(&self.tpl, py, |core| ensure_settings_part(core)).map_err(py_err)?;
+        Ok(crate::pyxml::PyXmlElement {
+            tpl: self.tpl.clone_ref(py),
+            part: "word/settings.xml".to_string(),
+            path: Vec::new(),
+        })
+    }
+
     #[getter]
     fn odd_and_even_pages_header_footer(&self, py: Python<'_>) -> bool {
         with_core(&self.tpl, py, |core| {

@@ -12,6 +12,7 @@ pub mod package;
 pub mod patch;
 mod pybridge;
 mod pyclasses;
+mod pyxml;
 pub mod richtext;
 mod subdoc;
 mod subdocbuilder;
@@ -22,7 +23,7 @@ use pyo3::prelude::*;
 
 #[pymodule]
 fn docxtplrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("__version__", "0.1.0")?;
+    m.add("__version__", "0.1.6")?;
 
     m.add_class::<pyclasses::PyDocxTemplate>()?;
     m.add_class::<pyclasses::PyRichText>()?;
@@ -52,6 +53,7 @@ fn docxtplrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<docmodel::PySettings>()?;
     m.add_class::<doccomments::PyComments>()?;
     m.add_class::<doccomments::PyComment>()?;
+    m.add_class::<pyxml::PyXmlElement>()?;
 
     // aliases like docxtpl: R = RichText, RP = RichTextParagraph
     m.add("R", m.getattr("RichText")?)?;

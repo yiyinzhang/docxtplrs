@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/docxtplrs.svg)](https://crates.io/crates/docxtplrs)
 [![docs.rs](https://docs.rs/docxtplrs/badge.svg)](https://docs.rs/docxtplrs)
 [![license](https://img.shields.io/badge/license-LGPL--2.1--or--later-blue.svg)](https://github.com/yiyinzhang/docxtplrs)
-[![tests](https://img.shields.io/badge/tests-362%20passed-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
+[![tests](https://img.shields.io/badge/tests-384%20passed-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
 [![coverage](https://img.shields.io/badge/coverage-86%25-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
 [![crosscheck](https://img.shields.io/badge/crosscheck-ALL%20MATCH-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
 
@@ -22,7 +22,7 @@ docx 的 zip/XML 处理、模板预处理、表格修复、关系管理、文档
 
 > ⚠️ Vibecoding project / AI 结对编写项目：written by an AI (Kimi Code) with the user,
 > without line-by-line human review / 未经人工逐行审查。Verified by the official docxtpl
-> test suite (32 real-world templates) + 362 in-house tests / 已通过官方套件与 362 个自建测试，
+> test suite (32 real-world templates) + 384 in-house tests / 已通过官方套件与 384 个自建测试，
 > but evaluate before production use / 生产使用前请自行评估。
 
 ## Quick start / 快速开始
@@ -81,7 +81,7 @@ tpl.save("out.docx")
   (`{{ var }}`, `{%tr %}`/`{%tc %}`/`{%p %}`, `RichText`, `InlineImage`,
   `Subdoc`, ...) mirror docxtpl; migrating is usually just changing the import.
   Verified against the official docxtpl test suite (32 real-world templates),
-  362 in-house tests, plus automated output cross-checking against docxtpl
+  384 in-house tests, plus automated output cross-checking against docxtpl
   itself (`tests/crosscheck.py`).
 - **One engine, two languages** — the same renderer is available as a native
   Rust crate, so Rust services/CLIs can render docx templates with no Python
@@ -253,6 +253,14 @@ tpl.save("out.docx")                         # or io.BytesIO()
   styles/settings/comments/core_properties/inline_shapes`,
   `add_paragraph/add_heading/add_picture/add_table/add_page_break/add_section`,
   run/cell formatting assignment, `__getattr__` delegation
+- Raw-XML escape hatch: `settings/document/styles.element` return a live
+  `XmlElement` proxy (`tag/text/attrib/get/set/remove_attr/find/findall/
+  children/append/insert/remove/xml`), covering python-docx's `.element` use
+  cases (e.g. `settings.element` for `w:zoom`)
+- `Table.style`, `Cell.merge()` (gridSpan/vMerge, python-docx semantics),
+  `Section.even_page_header/footer`, `Section.first_page_header/footer`
+- docxtpl helpers: `HEADER_URI`/`FOOTER_URI`, `get_file_crc()` (path/bytes/
+  file-like), `get_headers_footers(uri)` yielding live `(rid, XmlElement)` pairs
 - `RichText`/`R`, `RichTextParagraph`/`RP`, `Listing`, `InlineImage`, `Subdoc`
   (file merging + programmatic `add_paragraph/add_picture/add_table`)
 - Units: `Length/Emu/Inches/Cm/Mm/Pt/Twips`; jinja2.utils: `Cycler/Joiner/
@@ -323,7 +331,7 @@ Engine-level extras beyond stock minijinja, so jinja2-style templates work as-is
 #### Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q          # 362 unit tests
+.venv/bin/python -m pytest tests/ -q          # 384 unit tests
 .venv/bin/python tests/crosscheck.py docxtplrs > /tmp/rs.json
 .venv/bin/python tests/crosscheck.py docxtpl > /tmp/ref.json   # needs crosscheck group
 .venv/bin/python tests/crosscheck.py compare /tmp/ref.json /tmp/rs.json
@@ -388,7 +396,7 @@ with `llvm-cov`.
   模板复测；引擎内部优化见[性能](#性能)。
 - **无缝替代**：Python API 与模板语法（`{{ var }}`、`{%tr %}`/`{%tc %}`/`{%p %}`、
   `RichText`、`InlineImage`、`Subdoc` 等）与 docxtpl 几乎完全一致，迁移通常只需改一行 import。
-  已通过 docxtpl 官方测试套件（32 个真实模板）、362 个自建测试，并有与 docxtpl 输出自动
+  已通过 docxtpl 官方测试套件（32 个真实模板）、384 个自建测试，并有与 docxtpl 输出自动
   交叉比对的工具（`tests/crosscheck.py`）。
 - **一个引擎，两种语言**：同一渲染器同时提供原生 Rust crate，Rust 服务/CLI 可以完全不
   经过 Python 渲染 docx 模板。
@@ -552,6 +560,14 @@ tpl.save("out.docx")                         # 或 io.BytesIO()
   styles/settings/comments/core_properties/inline_shapes`、
   `add_paragraph/add_heading/add_picture/add_table/add_page_break/add_section`、
   run/单元格格式赋值、`__getattr__` 委托
+- 原始 XML 逃生口：`settings/document/styles.element` 返回实时的 `XmlElement`
+  代理（`tag/text/attrib/get/set/remove_attr/find/findall/children/append/
+  insert/remove/xml`），覆盖 python-docx `.element` 的常见用法（如用
+  `settings.element` 设置 `w:zoom`）
+- `Table.style`、`Cell.merge()`（gridSpan/vMerge，python-docx 语义）、
+  `Section.even_page_header/footer`、`Section.first_page_header/footer`
+- docxtpl 辅助 API：`HEADER_URI`/`FOOTER_URI`、`get_file_crc()`（路径/bytes/
+  文件对象）、`get_headers_footers(uri)` 产出实时的 `(rid, XmlElement)` 对
 - `RichText`/`R`、`RichTextParagraph`/`RP`、`Listing`、`InlineImage`、`Subdoc`
   （文件合并 + 编程式 `add_paragraph/add_picture/add_table`）
 - 单位：`Length/Emu/Inches/Cm/Mm/Pt/Twips`；jinja2.utils：`Cycler/Joiner/
@@ -620,7 +636,7 @@ tpl.render(context, jinja_env=env)
 #### 测试
 
 ```bash
-.venv/bin/python -m pytest tests/ -q          # 362 个单元测试
+.venv/bin/python -m pytest tests/ -q          # 384 个单元测试
 .venv/bin/python tests/crosscheck.py docxtplrs > /tmp/rs.json
 .venv/bin/python tests/crosscheck.py docxtpl > /tmp/ref.json   # 需要 crosscheck 依赖组
 .venv/bin/python tests/crosscheck.py compare /tmp/ref.json /tmp/rs.json
@@ -666,7 +682,7 @@ tpl.render(context, jinja_env=env)
 ```
 src/            Rust sources (17 modules, see AGENTS.md)   Rust 源码
 python/         Python package shell (__init__ + __main__ CLI)
-tests/          362 tests + crosscheck/compare scripts      测试与交叉验证
+tests/          384 tests + crosscheck/compare scripts      测试与交叉验证
 examples/       render.rs (Rust API), patch_dbg.rs (large-doc debugging)
 AGENTS.md       Notes for AI coding assistants              给 AI 助手的项目说明
 ```
