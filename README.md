@@ -72,11 +72,11 @@ tpl.save("out.docx")
   template preprocessing, table fixing, document object model) is native Rust.
   No python-docx / lxml / jinja2 / markupsafe chain: one self-contained wheel,
   no lxml build issues on exotic platforms, no dependency-version conflicts.
-- **Fast** — **~5-14x faster** than docxtpl (lxml + jinja2) on small templates
+- **Fast** — **~6-12x faster** than docxtpl (lxml + jinja2) on small templates
   (title + paragraph loop + `{%tr %}` table-row loop over 10/100/400 items,
-  30 renders each: 0.4/1.1/4.8ms vs 5.0/9.9/25.6ms per render), and **~50x**
-  on an 8.9MB / 20k-paragraph document (0.4s vs 19.9s for a full
-  load-render-save cycle). CPython 3.13, release build; reproduce with
+  30 renders each: 0.3-0.5/0.8-1.1/3.2-4.0ms vs 4.3-4.8/7.7-9.3/20-25ms per
+  render), and **~60x** on an 8.9MB / 20k-paragraph document (0.3s vs ~20s
+  for a full load-render-save cycle). CPython 3.13, release build; reproduce with
   `tests/benchmark.py [--big]` — and with your own templates before quoting
   numbers; see [Performance](#performance) for the internals.
 - **Drop-in replacement** — the Python API and the template syntax
@@ -104,7 +104,7 @@ tpl.save("out.docx")
 ### Performance
 
 Engine-vs-engine (docxtplrs vs docxtpl + lxml + jinja2, same templates):
-**~5-14x faster** per render on small templates and **~50x** on a large
+**~6-12x faster** per render on small templates and **~60x** on a large
 (8.9MB) document (see the "Fast" bullet above).
 
 On top of that, dedicated profiling rounds removed the remaining internal
@@ -440,9 +440,9 @@ with `llvm-cov`.
   均为 Rust 原生实现。不再需要 python-docx / lxml / jinja2 / markupsafe 依赖链——单个自包含
   wheel，没有 lxml 在冷门平台上的编译问题，也没有依赖版本冲突的烦恼。
 - **快**：小模板（标题 + 段落循环 + `{%tr %}` 表格行循环，10/100/400 行，各渲染 30 次）
-  下比 docxtpl（lxml + jinja2）**快约 5-14 倍**：每次渲染 0.4/1.1/4.8ms vs
-  5.0/9.9/25.6ms；8.9MB / 2 万段落大文档上**快约 50 倍**（完整加载-渲染-保存周期
-  0.4s vs 19.9s）。CPython 3.13，release 构建；可用 `tests/benchmark.py [--big]`
+  下比 docxtpl（lxml + jinja2）**快约 6-12 倍**：每次渲染 0.3-0.5/0.8-1.1/3.2-4.0ms vs
+  4.3-4.8/7.7-9.3/20-25ms；8.9MB / 2 万段落大文档上**快约 60 倍**（完整加载-渲染-保存
+  周期 0.3s vs 约 20s）。CPython 3.13，release 构建；可用 `tests/benchmark.py [--big]`
   复现——引用数字前请用你自己的模板复测；引擎内部优化见[性能](#性能)。
 - **无缝替代**：Python API 与模板语法（`{{ var }}`、`{%tr %}`/`{%tc %}`/`{%p %}`、
   `RichText`、`InlineImage`、`Subdoc` 等）与 docxtpl 几乎完全一致，迁移通常只需改一行 import。
@@ -464,7 +464,7 @@ with `llvm-cov`.
 ### 性能
 
 引擎对引擎（docxtplrs vs docxtpl + lxml + jinja2，相同模板）：小模板每次渲染
-**快约 5-14 倍**，8.9MB 大文档**快约 50 倍**（见上方"快"一条）。
+**快约 6-12 倍**，8.9MB 大文档**快约 60 倍**（见上方"快"一条）。
 
 在此之上，专项 profiling 又清掉了剩余的内部热点（数据基于 `maturin develop`
 debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会更快）：
