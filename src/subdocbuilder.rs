@@ -156,12 +156,21 @@ fn usable_width_twips(_tpl: &mut TplCore) -> i64 {
 
 /// Resolve a style name or id to a style id, consulting the master styles part.
 pub fn resolve_style_id(tpl: &mut TplCore, style: &str) -> String {
+    let key = style.to_lowercase();
+    if let Some(cached) = tpl.style_resolve_cache.get(&key) {
+        return cached.clone();
+    }
+    let resolved = resolve_style_id_uncached(tpl, style, &key);
+    tpl.style_resolve_cache.insert(key, resolved.clone());
+    resolved
+}
+
+fn resolve_style_id_uncached(tpl: &mut TplCore, style: &str, want: &str) -> String {
     let Ok(dom) = tpl.part_dom("word/styles.xml") else {
         return style.to_string();
     };
     // exact styleId match first, then by w:name (case-insensitive,
     // python-docx uses name lookup); single walk over the cached DOM
-    let want = style.to_lowercase();
     let mut by_name: Option<String> = None;
     let mut stack: Vec<&crate::xmldom::Element> = vec![&dom.root];
     while let Some(el) = stack.pop() {
@@ -177,7 +186,7 @@ pub fn resolve_style_id(tpl: &mut TplCore, style: &str) -> String {
                             .find("w:name")
                             .and_then(|n| n.get_attr("w:val"))
                         {
-                            if v.to_lowercase() == want {
+                            if v.to_lowercase() == *want {
                                 by_name = e.get_attr("w:styleId").map(|s| s.to_string());
                             }
                         }

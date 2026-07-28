@@ -26,7 +26,7 @@ fn collect_wt(el: &Element, out: &mut String) {
         match c {
             Node::Elem(e) => {
                 if e.name == "w:t" {
-                    out.push_str(&e.text_content());
+                    e.push_text_content(out);
                 } else if e.name == "w:tab" {
                     out.push('\t');
                 } else if e.name == "w:br" {
@@ -73,29 +73,29 @@ impl PyParagraph {
     pub(crate) fn edit<R>(&self, py: Python<'_>, f: impl FnOnce(&mut Element) -> R) -> PyResult<R> {
         with_core(&self.tpl, py, |core| {
             let mut result = None;
+            let gen = core.doc_gen;
+            let mut cur = core.para_cursor;
             mutate_document(core, |body| {
-                if let Some(p) = nth_direct(body, "w:p", self.index) {
+                if let Some(p) = nth_cursor_mut(body, "w:p", self.index, &mut cur, gen) {
                     result = Some(f(p));
                 }
             })
             .map_err(py_err)?;
+            core.para_cursor = cur;
             result.ok_or_else(|| PyValueError::new_err("paragraph not found"))
         })
     }
 
     pub(crate) fn read<R>(&self, py: Python<'_>, f: impl FnOnce(&Element) -> R) -> Option<R> {
         with_core(&self.tpl, py, |core| {
-            read_body(core, |body| {
-                body.children
-                    .iter()
-                    .filter_map(|c| match c {
-                        Node::Elem(e) if e.name == "w:p" => Some(e),
-                        _ => None,
-                    })
-                    .nth(self.index)
-                    .map(|p| f(p))
+            let gen = core.doc_gen;
+            let mut cur = core.para_cursor;
+            let r = read_body(core, |body| {
+                nth_cursor_ref(body, "w:p", self.index, &mut cur, gen).map(|p| f(p))
             })
-            .flatten()
+            .flatten();
+            core.para_cursor = cur;
+            r
         })
     }
 }
@@ -210,26 +210,33 @@ impl PyRun {
     pub(crate) fn edit<R>(&self, py: Python<'_>, f: impl FnOnce(&mut Element) -> R) -> PyResult<R> {
         with_core(&self.tpl, py, |core| {
             let mut result = None;
+            let gen = core.doc_gen;
+            let mut cur = core.para_cursor;
             mutate_document(core, |body| {
-                if let Some(p) = nth_direct(body, "w:p", self.para) {
+                if let Some(p) = nth_cursor_mut(body, "w:p", self.para, &mut cur, gen) {
                     if let Some(r) = nth_direct(p, "w:r", self.index) {
                         result = Some(f(r));
                     }
                 }
             })
             .map_err(py_err)?;
+            core.para_cursor = cur;
             result.ok_or_else(|| PyValueError::new_err("run not found"))
         })
     }
 
     fn read<R>(&self, py: Python<'_>, f: impl FnOnce(&Element) -> R) -> Option<R> {
         with_core(&self.tpl, py, |core| {
-            read_body(core, |body| {
-                nth_direct_ref(body, "w:p", self.para)
+            let gen = core.doc_gen;
+            let mut cur = core.para_cursor;
+            let r = read_body(core, |body| {
+                nth_cursor_ref(body, "w:p", self.para, &mut cur, gen)
                     .and_then(|p| nth_direct_ref(p, "w:r", self.index))
                     .map(|r| f(r))
             })
-            .flatten()
+            .flatten();
+            core.para_cursor = cur;
+            r
         })
     }
 }
@@ -242,6 +249,83 @@ pub(crate) fn nth_direct_ref<'a>(el: &'a Element, name: &str, n: usize) -> Optio
             _ => None,
         })
         .nth(n)
+}
+
+/// nth child named `name`, resuming from a validated sequential-access
+/// cursor (doc_gen, index, child_pos) when possible: sequential proxy
+/// iteration becomes O(1) amortized per access instead of rescanning from
+/// the head (O(n^2) for a full document walk). The cursor is validated
+/// against the document's mutation generation, so any DOM change safely
+/// falls back to a full scan.
+pub(crate) fn nth_cursor_ref<'a>(
+    el: &'a Element,
+    name: &str,
+    n: usize,
+    cur: &mut (u64, usize, usize),
+    gen: u64,
+) -> Option<&'a Element> {
+    let (cgen, ci, cp) = *cur;
+    let (mut idx, mut i) = if cgen == gen
+        && ci <= n
+        && cp < el.children.len()
+        && matches!(&el.children[cp], Node::Elem(e) if e.name == name)
+    {
+        (ci, cp)
+    } else {
+        (0, 0)
+    };
+    while i < el.children.len() {
+        if let Node::Elem(e) = &el.children[i] {
+            if e.name == name {
+                if idx == n {
+                    *cur = (gen, n, i);
+                    return Some(e);
+                }
+                idx += 1;
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// nth_cursor_ref for mutable access
+pub(crate) fn nth_cursor_mut<'a>(
+    el: &'a mut Element,
+    name: &str,
+    n: usize,
+    cur: &mut (u64, usize, usize),
+    gen: u64,
+) -> Option<&'a mut Element> {
+    let (cgen, ci, cp) = *cur;
+    let (mut idx, mut i) = if cgen == gen
+        && ci <= n
+        && cp < el.children.len()
+        && matches!(&el.children[cp], Node::Elem(e) if e.name == name)
+    {
+        (ci, cp)
+    } else {
+        (0, 0)
+    };
+    let mut found = None;
+    while i < el.children.len() {
+        if let Node::Elem(e) = &el.children[i] {
+            if e.name == name {
+                if idx == n {
+                    found = Some(i);
+                    break;
+                }
+                idx += 1;
+            }
+        }
+        i += 1;
+    }
+    let pos = found?;
+    *cur = (gen, n, pos);
+    match &mut el.children[pos] {
+        Node::Elem(e) => Some(e),
+        _ => None,
+    }
 }
 
 pub(crate) fn ensure_rpr(run: &mut Element) -> &mut Element {
@@ -493,20 +577,29 @@ pub struct PyTable {
 impl PyTable {
     fn read<R>(&self, py: Python<'_>, f: impl FnOnce(&Element) -> R) -> Option<R> {
         with_core(&self.tpl, py, |core| {
-            read_body(core, |body| nth_direct_ref(body, "w:tbl", self.index).map(|t| f(t)))
-                .flatten()
+            let gen = core.doc_gen;
+            let mut cur = core.tbl_cursor;
+            let r = read_body(core, |body| {
+                nth_cursor_ref(body, "w:tbl", self.index, &mut cur, gen).map(|t| f(t))
+            })
+            .flatten();
+            core.tbl_cursor = cur;
+            r
         })
     }
 
     fn edit<R>(&self, py: Python<'_>, f: impl FnOnce(&mut Element) -> R) -> PyResult<R> {
         with_core(&self.tpl, py, |core| {
             let mut result = None;
+            let gen = core.doc_gen;
+            let mut cur = core.tbl_cursor;
             mutate_document(core, |body| {
-                if let Some(t) = nth_direct(body, "w:tbl", self.index) {
+                if let Some(t) = nth_cursor_mut(body, "w:tbl", self.index, &mut cur, gen) {
                     result = Some(f(t));
                 }
             })
             .map_err(py_err)?;
+            core.tbl_cursor = cur;
             result.ok_or_else(|| PyValueError::new_err("table not found"))
         })
     }
@@ -617,9 +710,12 @@ impl PyTableRow {
     #[getter]
     fn cells(&self, py: Python<'_>) -> Vec<PyCell> {
         let n = with_core(&self.tpl, py, |core| {
-            read_body(core, |body| {
-                nth_direct_ref(body, "w:tbl", self.index)
-                    .and_then(|t| nth_direct_ref(t, "w:tr", self.row))
+            let gen = core.doc_gen;
+            let mut tcur = core.tbl_cursor;
+            let mut rcur = core.row_cursor;
+            let r = read_body(core, |body| {
+                nth_cursor_ref(body, "w:tbl", self.index, &mut tcur, gen)
+                    .and_then(|t| nth_cursor_ref(t, "w:tr", self.row, &mut rcur, gen))
                     .map(|r| {
                         r.children
                             .iter()
@@ -627,9 +723,12 @@ impl PyTableRow {
                             .count()
                     })
             })
-            .flatten()
-            .unwrap_or(0)
-        });
+            .flatten();
+            core.tbl_cursor = tcur;
+            core.row_cursor = rcur;
+            r
+        })
+        .unwrap_or(0);
         (0..n)
             .map(|col| PyCell {
                 tpl: self.tpl.clone_ref(py),
@@ -654,9 +753,12 @@ impl PyCell {
     fn edit<R>(&self, py: Python<'_>, f: impl FnOnce(&mut Element) -> R) -> PyResult<R> {
         with_core(&self.tpl, py, |core| {
             let mut result = None;
+            let gen = core.doc_gen;
+            let mut tcur = core.tbl_cursor;
+            let mut rcur = core.row_cursor;
             mutate_document(core, |body| {
-                if let Some(t) = nth_direct(body, "w:tbl", self.index) {
-                    if let Some(r) = nth_direct(t, "w:tr", self.row) {
+                if let Some(t) = nth_cursor_mut(body, "w:tbl", self.index, &mut tcur, gen) {
+                    if let Some(r) = nth_cursor_mut(t, "w:tr", self.row, &mut rcur, gen) {
                         if let Some(c) = nth_direct(r, "w:tc", self.col) {
                             result = Some(f(c));
                         }
@@ -664,6 +766,8 @@ impl PyCell {
                 }
             })
             .map_err(py_err)?;
+            core.tbl_cursor = tcur;
+            core.row_cursor = rcur;
             result.ok_or_else(|| PyValueError::new_err("cell not found"))
         })
     }
@@ -674,15 +778,21 @@ impl PyCell {
     #[getter]
     fn text(&self, py: Python<'_>) -> String {
         with_core(&self.tpl, py, |core| {
-            read_body(core, |body| {
-                nth_direct_ref(body, "w:tbl", self.index)
-                    .and_then(|t| nth_direct_ref(t, "w:tr", self.row))
+            let gen = core.doc_gen;
+            let mut tcur = core.tbl_cursor;
+            let mut rcur = core.row_cursor;
+            let r = read_body(core, |body| {
+                nth_cursor_ref(body, "w:tbl", self.index, &mut tcur, gen)
+                    .and_then(|t| nth_cursor_ref(t, "w:tr", self.row, &mut rcur, gen))
                     .and_then(|r| nth_direct_ref(r, "w:tc", self.col))
                     .map(|c| element_text(c))
             })
-            .flatten()
-            .unwrap_or_default()
+            .flatten();
+            core.tbl_cursor = tcur;
+            core.row_cursor = rcur;
+            r
         })
+        .unwrap_or_default()
     }
 
     #[setter]
@@ -1297,7 +1407,7 @@ impl PySectionHdrFtr {
                 return Err("invalid header/footer part".into());
             }
             let enc = pkg.encoding_of(&part);
-            pkg.set(&part, crate::package::encode_part(&xml, &enc));
+            pkg.set(&part, crate::package::encode_part_owned(xml, &enc));
             Ok(())
         })
         .map_err(py_err)

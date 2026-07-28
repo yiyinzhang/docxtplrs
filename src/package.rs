@@ -239,7 +239,7 @@ pub struct Package {
     media_sha1: HashMap<String, String>,
     /// parsed .rels per part (parse once per part; write-through on
     /// save_rels, invalidated by direct `set` of the .rels entry)
-    rels_cache: std::cell::RefCell<HashMap<String, Rels>>,
+    rels_cache: std::cell::RefCell<HashMap<String, std::rc::Rc<Rels>>>,
 }
 
 /// Detect the encoding of an XML part from BOM / xml declaration.
@@ -308,6 +308,31 @@ pub fn encode_part(content: &str, encoding: &str) -> Vec<u8> {
     cow.to_vec()
 }
 
+/// True for entries whose payload is already compressed (png/jpg/...):
+/// deflating them gains ~0% but costs the full save CPU on multi-MB media,
+/// so they are written with `Stored` instead.
+fn incompressible_entry(name: &str) -> bool {
+    let ext = name.rsplit('.').next().unwrap_or("");
+    ext.eq_ignore_ascii_case("png")
+        || ext.eq_ignore_ascii_case("jpg")
+        || ext.eq_ignore_ascii_case("jpeg")
+        || ext.eq_ignore_ascii_case("gif")
+        || ext.eq_ignore_ascii_case("webp")
+        || ext.eq_ignore_ascii_case("mp3")
+        || ext.eq_ignore_ascii_case("mp4")
+        || ext.eq_ignore_ascii_case("zip")
+}
+
+/// encode_part taking ownership of the content: the UTF-8 path (nearly
+/// every docx part) is zero-copy via String::into_bytes.
+pub fn encode_part_owned(content: String, encoding: &str) -> Vec<u8> {
+    let enc = encoding.to_lowercase();
+    if enc == "utf-8" || enc == "utf8" || enc.is_empty() {
+        return content.into_bytes();
+    }
+    encode_part(&content, encoding)
+}
+
 impl Package {
     pub fn from_bytes(data: &[u8]) -> Result<Package, String> {
         let cursor = Cursor::new(data);
@@ -346,10 +371,18 @@ impl Package {
     }
 
     pub fn set(&mut self, name: &str, data: Vec<u8>) {
-        if name.starts_with("word/media/") {
+        let media_sha = name
+            .starts_with("word/media/")
+            .then(|| sha1_hex(&data));
+        self.set_inner(name, data, media_sha);
+    }
+
+    /// set() with a caller-computed media hash (get_or_add_image already
+    /// hashed the blob for dedup — don't hash multi-MB media twice)
+    fn set_inner(&mut self, name: &str, data: Vec<u8>, media_sha: Option<String>) {
+        if let Some(h) = media_sha {
             // keep the dedup cache consistent (cheap: one hash per set)
-            self.media_sha1
-                .insert(name.to_string(), sha1_hex(&data));
+            self.media_sha1.insert(name.to_string(), h);
         }
         if name.ends_with(".rels") {
             self.rels_cache.borrow_mut().remove(name);
@@ -357,13 +390,13 @@ impl Package {
         if let Some(&i) = self.index.get(name) {
             self.entries[i].1 = data;
         } else {
+            let compression = if incompressible_entry(name) {
+                zip::CompressionMethod::Stored
+            } else {
+                zip::CompressionMethod::Deflated
+            };
             self.index.insert(name.to_string(), self.entries.len());
-            self.entries.push((
-                name.to_string(),
-                data,
-                zip::CompressionMethod::Deflated,
-                None,
-            ));
+            self.entries.push((name.to_string(), data, compression, None));
         }
     }
 
@@ -384,7 +417,14 @@ impl Package {
                 if name.ends_with('/') {
                     continue; // skip directory entries (python-docx doesn't write them)
                 }
-                let mut options = options.compression_method(*compression);
+                // already-compressed payloads are stored verbatim: deflate
+                // on them is ~0% gain for the dominant save cost
+                let method = if incompressible_entry(name) {
+                    zip::CompressionMethod::Stored
+                } else {
+                    *compression
+                };
+                let mut options = options.compression_method(method);
                 if let Some(dt) = mtime {
                     options = options.last_modified_time(*dt);
                 }
@@ -398,15 +438,17 @@ impl Package {
 
     /// Load rels for a part (empty if no .rels entry); parsed once per part
     /// and cached until `save_rels`/`set` touch the underlying entry.
-    pub fn rels(&self, part: &str) -> Rels {
+    /// Rc-shared: repeated lookups (header/footer discovery per render, image
+    /// inserts) are refcount bumps instead of cloning every Rel.
+    pub fn rels(&self, part: &str) -> std::rc::Rc<Rels> {
         let path = rels_path_for(part);
         if let Some(r) = self.rels_cache.borrow().get(&path) {
             return r.clone();
         }
-        let rels = match self.get_string(&path) {
+        let rels = std::rc::Rc::new(match self.get_string(&path) {
             Some(xml) => Rels::from_xml(&xml),
             None => Rels::default(),
-        };
+        });
         self.rels_cache
             .borrow_mut()
             .insert(path, rels.clone());
@@ -420,12 +462,12 @@ impl Package {
         // next rels() on this part skips re-parsing
         self.rels_cache
             .borrow_mut()
-            .insert(path, rels.clone());
+            .insert(path, std::rc::Rc::new(rels.clone()));
     }
 
     /// Add a relationship to a part, returning the new rId
     pub fn add_rel(&mut self, part: &str, rel_type: &str, target: &str, is_external: bool) -> String {
-        let mut rels = self.rels(part);
+        let mut rels = (*self.rels(part)).clone();
         let id = rels.add(rel_type, target, is_external);
         self.save_rels(part, &rels);
         id
@@ -511,7 +553,7 @@ impl Package {
             return existing;
         }
         let partname = self.next_image_partname(ext);
-        self.set(&partname, blob.to_vec());
+        self.set_inner(&partname, blob.to_vec(), Some(sha));
         self.ensure_content_type_default(ext, content_type);
         partname
     }

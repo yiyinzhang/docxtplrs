@@ -37,6 +37,9 @@ pub enum Deferred {
 pub struct TplCore {
     pub original_bytes: Vec<u8>,
     pub package: Option<Package>,
+    /// pristine package parsed once from original_bytes; reload clones it
+    /// (memcpy) instead of re-inflating the whole zip on every render
+    pub original_package: Option<Package>,
     pub is_rendered: bool,
     pub is_saved: bool,
     pub allow_missing_pics: bool,
@@ -78,10 +81,45 @@ pub struct TplCore {
     /// per-part next wp:docPr shape id (avoids rescanning the part xml for
     /// every inserted image; seeded from the part's current max id)
     pub next_shape_ids: HashMap<String, u32>,
+    /// bumped on every document DOM mutation; invalidates the sequential
+    /// docmodel access cursors below
+    pub doc_gen: u64,
+    /// sequential-access cursors (doc_gen, nth-of-tag index, child position)
+    /// for docmodel proxies: paragraph/table/row iteration becomes O(1)
+    /// amortized instead of rescanning from the parent's head every access
+    pub para_cursor: (u64, usize, usize),
+    pub tbl_cursor: (u64, usize, usize),
+    pub row_cursor: (u64, usize, usize),
+    /// style name/id (lowercased) -> resolved styleId; invalidated together
+    /// with the styles part cache
+    pub style_resolve_cache: HashMap<String, String>,
+    /// next free w:bookmark id while merging subdocs: scanned from the
+    /// master once, then advanced locally (avoids a full master scan per
+    /// subdoc); reset on every render (master reloads)
+    pub bookmark_next_id: Option<i64>,
+    /// cached jinja environments (one slot per autoescape mode) holding the
+    /// compiled per-part templates, reused across renders while the env
+    /// configuration and the patched part sources are unchanged
+    pub env_caches: [Option<EnvCache>; 2],
+    /// bumped whenever filters/tests/functions/globals/loader/gettext change,
+    /// invalidating env_caches (env_options are compared by value instead)
+    pub env_gen: u64,
+}
+
+/// A cached jinja environment plus the content hashes of the part templates
+/// registered in it.
+#[derive(Debug)]
+pub struct EnvCache {
+    pub autoescape: bool,
+    pub gen: u64,
+    pub env_options: EnvOptions,
+    pub env: Environment<'static>,
+    /// part name -> fxhash of the preprocessed source registered in `env`
+    pub tpl_hashes: HashMap<String, u64>,
 }
 
 /// jinja2 environment options supported via duck-typing.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EnvOptions {
     pub trim_blocks: Option<bool>,
     pub lstrip_blocks: Option<bool>,
@@ -107,7 +145,16 @@ impl TplCore {
 
     pub fn init_docx(&mut self, reload: bool) -> Result<(), String> {
         if self.package.is_none() || (self.is_rendered && reload) {
-            self.package = Some(Package::from_bytes(&self.original_bytes)?);
+            // reload clones the pristine package (memcpy) instead of
+            // re-inflating every zip entry (incl. multi-MB media)
+            self.package = Some(match &self.original_package {
+                Some(p) => p.clone(),
+                None => {
+                    let pkg = Package::from_bytes(&self.original_bytes)?;
+                    self.original_package = Some(pkg.clone());
+                    pkg
+                }
+            });
             self.is_rendered = false;
             self.invalidate_doc();
             self.invalidate_parts();
@@ -132,6 +179,7 @@ impl TplCore {
 
     pub fn mark_doc_dirty(&mut self) {
         self.doc_dirty = true;
+        self.doc_gen += 1;
     }
 
     /// Serialize the cached document DOM back into the package if mutated.
@@ -146,7 +194,7 @@ impl TplCore {
         let out = dom.serialize();
         let pkg = self.pkg()?;
         let enc = pkg.encoding_of(DOCUMENT_PART);
-        pkg.set(DOCUMENT_PART, crate::package::encode_part(&out, &enc));
+        pkg.set(DOCUMENT_PART, crate::package::encode_part_owned(out, &enc));
         self.doc_dirty = false;
         Ok(())
     }
@@ -155,6 +203,7 @@ impl TplCore {
     pub fn invalidate_doc(&mut self) {
         self.doc_cache = None;
         self.doc_dirty = false;
+        self.doc_gen += 1;
     }
 
     /// Parsed DOM of an auxiliary part (styles/settings/comments/core/...),
@@ -181,8 +230,12 @@ impl TplCore {
     pub fn mark_part_dirty(&mut self, part: &str) {
         if part == DOCUMENT_PART {
             self.doc_dirty = true;
+            self.doc_gen += 1;
         } else {
             self.parts_dirty.insert(part.to_string());
+            if part == "word/styles.xml" {
+                self.style_resolve_cache.clear();
+            }
         }
     }
 
@@ -199,7 +252,7 @@ impl TplCore {
                 continue;
             };
             let enc = self.pkg()?.encoding_of(&part);
-            let bytes = crate::package::encode_part(&out, &enc);
+            let bytes = crate::package::encode_part_owned(out, &enc);
             self.pkg()?.set(&part, bytes);
         }
         Ok(())
@@ -213,12 +266,16 @@ impl TplCore {
         }
         self.part_caches.remove(part);
         self.parts_dirty.remove(part);
+        if part == "word/styles.xml" {
+            self.style_resolve_cache.clear();
+        }
     }
 
     /// Drop all cached auxiliary part DOMs (package was reloaded).
     pub fn invalidate_parts(&mut self) {
         self.part_caches.clear();
         self.parts_dirty.clear();
+        self.style_resolve_cache.clear();
     }
 
     fn pkg(&mut self) -> Result<&mut Package, String> {
@@ -240,19 +297,18 @@ impl TplCore {
         // persist docmodel edits made since the last render/reload
         self.flush_parts()?;
 
-        // Build the context and the jinja environment ONCE per render and
-        // reuse them for every part (Value/Environment clones are cheap);
-        // previously each of the K parts rebuilt both from scratch.
+        // Build the context ONCE per render and reuse it for every part;
+        // the jinja environment and compiled part templates live in the
+        // env_caches slots and are reused across renders (P0-5).
         let ctx = make_ctx(self, DOCUMENT_PART)?;
         let ctx_once: &CtxFn = &|_core, _part| Ok(ctx.clone());
-        let env = make_env(autoescape, self);
 
         // Body
         let src = self.pkg()?.get_string(DOCUMENT_PART)
             .ok_or_else(|| "word/document.xml not found".to_string())?;
         // fix tables / docPr / cNvPr ids only after every part has rendered:
         // used_subdoc is final by then, so the body is parsed+serialized once
-        let body_rendered = self.render_part_with(DOCUMENT_PART, &src, &env, ctx_once)?;
+        let body_rendered = self.render_part_with(DOCUMENT_PART, &src, autoescape, ctx_once)?;
 
         // Headers & footers
         for uri in [rel_type::HEADER, rel_type::FOOTER] {
@@ -262,21 +318,14 @@ impl TplCore {
                     Some(s) => s,
                     None => continue,
                 };
-                let rendered = self.render_part_with(&part, &src, &env, ctx_once)?;
+                let rendered = self.render_part_with(&part, &src, autoescape, ctx_once)?;
                 self.set_part_rendered(&part, rendered);
             }
         }
 
         // core properties always render without autoescape (docxtpl parity)
-        let props_env;
-        let props_env = if autoescape {
-            props_env = make_env(false, self);
-            &props_env
-        } else {
-            &env
-        };
-        self.render_properties(props_env, ctx_once)?;
-        self.render_footnotes(&env, ctx_once)?;
+        self.render_properties(ctx_once)?;
+        self.render_footnotes(autoescape, ctx_once)?;
 
         // like docxcompose's renumber_nvpicpr_ids: when subdocs were merged,
         // make pic:cNvPr ids unique (body first, then headers/footers). The
@@ -299,7 +348,7 @@ impl TplCore {
                 };
                 let enc = self.pkg()?.encoding_of(&part);
                 if let Some(fixed) = renumber_cnvpr(&xml, &mut next_id) {
-                    let bytes = crate::package::encode_part(&fixed, &enc);
+                    let bytes = crate::package::encode_part_owned(fixed, &enc);
                     self.pkg()?.set(&part, bytes);
                 }
             }
@@ -323,6 +372,7 @@ impl TplCore {
         self.used_subdoc = false;
         self.last_error_context.clear();
         self.next_shape_ids.clear();
+        self.bookmark_next_id = None;
         Ok(())
     }
 
@@ -345,17 +395,16 @@ impl TplCore {
         autoescape: bool,
         make_ctx: &CtxFn,
     ) -> Result<String, String> {
-        let env = make_env(autoescape, self);
-        self.render_part_with(part, src_xml, &env, make_ctx)
+        self.render_part_with(part, src_xml, autoescape, make_ctx)
     }
 
-    /// render_part with a pre-built environment (shared across all parts of
-    /// one render call).
+    /// render one part with the cached jinja environment (shared across all
+    /// parts and across renders while the part sources are unchanged).
     fn render_part_with(
         &mut self,
         part: &str,
         src_xml: &str,
-        env: &Environment,
+        autoescape: bool,
         make_ctx: &CtxFn,
     ) -> Result<String, String> {
         let decoded = decode_text_entities(src_xml);
@@ -363,12 +412,103 @@ impl TplCore {
         let prev = crate::pybridge::set_current_render(self as *mut TplCore, part);
         let result = (|| {
             let ctx = make_ctx(self, part)?;
-            let dst = render_xml_str_with(&patched, ctx, env, self)?;
+            let dst = self.render_part_jinja(part, &patched, ctx, autoescape)?;
             let dst = resolve_listing(&dst);
             self.materialize_deferred(part, dst.into_owned())
         })();
         crate::pybridge::restore_current_render(prev);
         result
+    }
+
+    /// Cached environment access: one slot per autoescape mode, rebuilt only
+    /// when the configuration changed (env_gen bump or env_options diff).
+    fn jinja_env(&mut self, autoescape: bool) -> &mut EnvCache {
+        let idx = autoescape as usize;
+        let stale = match &self.env_caches[idx] {
+            Some(c) => c.gen != self.env_gen || c.env_options != self.env_options,
+            None => true,
+        };
+        if stale {
+            let env = make_env(autoescape, self);
+            self.env_caches[idx] = Some(EnvCache {
+                autoescape,
+                gen: self.env_gen,
+                env_options: self.env_options.clone(),
+                env,
+                tpl_hashes: HashMap::new(),
+            });
+        }
+        self.env_caches[idx].as_mut().unwrap()
+    }
+
+    /// Render the patched xml of one part through the cached jinja env,
+    /// reusing the compiled template when the preprocessed source is
+    /// unchanged (content-hash keyed); compiling a multi-MB document part
+    /// is one of the remaining O(size) costs of a repeated render.
+    fn render_part_jinja(
+        &mut self,
+        part: &str,
+        src_xml: &str,
+        ctx: Value,
+        autoescape: bool,
+    ) -> Result<String, String> {
+        let src = add_paragraph_newlines(src_xml);
+        let src = preprocess_trans(&src);
+        let src = preprocess_bool_compare(&src);
+        let src = preprocess_engine_features(&src);
+        let hash = fxhash64(src.as_bytes());
+        let compile_err = {
+            let cache = self.jinja_env(autoescape);
+            if cache.tpl_hashes.get(part) == Some(&hash) {
+                None
+            } else {
+                match cache.env.add_template_owned(part.to_string(), src.to_string()) {
+                    Ok(()) => {
+                        cache.tpl_hashes.insert(part.to_string(), hash);
+                        None
+                    }
+                    Err(e) => Some(e),
+                }
+            }
+        };
+        if let Some(e) = compile_err {
+            return Err(self.jinja_error_msg(&e, &src));
+        }
+        let render_result = {
+            let cache = self.env_caches[autoescape as usize].as_ref().unwrap();
+            match cache.env.get_template(part) {
+                Ok(t) => t.render(&ctx),
+                Err(e) => Err(e),
+            }
+        };
+        let rendered = match render_result {
+            Ok(s) => s,
+            Err(e) => return Err(self.jinja_error_msg(&e, &src)),
+        };
+        let dst = remove_paragraph_newlines(&rendered);
+        Ok(restore_escaped_delims(dst.into_owned()))
+    }
+
+    /// Format a jinja error with source context lines (docx_context parity).
+    fn jinja_error_msg(&mut self, e: &minijinja::Error, src: &str) -> String {
+        let mut msg = format!("{}", e);
+        if let Some(line) = e.line() {
+            let start = line.saturating_sub(4);
+            let context: Vec<String> = src
+                .lines()
+                .skip(start)
+                .take(7)
+                .map(|l| sub_str(r"<[^>]+>", "", l))
+                .collect();
+            self.last_error_context = context.clone();
+            msg.push_str(&format!(
+                "\nContext (lines {}-{}):\n{}",
+                start + 1,
+                start + 7,
+                context.join("\n")
+            ));
+        }
+        msg
     }
 
     /// Replace deferred-value placeholders actually printed by the template
@@ -445,7 +585,7 @@ impl TplCore {
         }
     }
 
-    fn render_properties(&mut self, env: &Environment, make_ctx: &CtxFn) -> Result<(), String> {
+    fn render_properties(&mut self, make_ctx: &CtxFn) -> Result<(), String> {
         let name = "docProps/core.xml";
         // python-docx always provides a core properties part
         if self.package.as_ref().map(|p| !p.contains(name)).unwrap_or(false) {
@@ -475,13 +615,19 @@ impl TplCore {
             for tag in props {
                 if let Some(el) = doc.root.find_mut(tag) {
                     let initial = el.text_content();
-                    if initial.is_empty() {
+                    if initial.is_empty() || !initial.contains('{') {
+                        // no jinja marker: rendering would be the identity
                         continue;
                     }
-                    let rendered = env
-                        .template_from_str(&initial)
-                        .and_then(|t| t.render(&ctx))
-                        .map_err(|e| format!("error rendering core property {}: {}", tag, e))?;
+                    let rendered = {
+                        // core properties always render without autoescape
+                        let cache = self.jinja_env(false);
+                        cache
+                            .env
+                            .template_from_str(&initial)
+                            .and_then(|t| t.render(&ctx))
+                            .map_err(|e| format!("error rendering core property {}: {}", tag, e))?
+                    };
                     let rendered = self.materialize_deferred(name, rendered)?;
                     el.children = vec![Node::Text(rendered)];
                     changed = true;
@@ -498,7 +644,7 @@ impl TplCore {
         result
     }
 
-    fn render_footnotes(&mut self, env: &Environment, make_ctx: &CtxFn) -> Result<(), String> {
+    fn render_footnotes(&mut self, autoescape: bool, make_ctx: &CtxFn) -> Result<(), String> {
         let rels = match &self.package {
             Some(p) => p.rels(DOCUMENT_PART),
             None => return Ok(()),
@@ -513,7 +659,12 @@ impl TplCore {
                 Some(s) => s,
                 None => continue,
             };
-            let rendered = self.render_part_with(&part, &src, env, make_ctx)?;
+            // no jinja marker, no entity to decode, no listing char: the
+            // whole patch+render+write-back round-trip would be the identity
+            if !src.contains(['{', '&', '\t', '\n', '\u{7}', '\u{c}']) {
+                continue;
+            }
+            let rendered = self.render_part_with(&part, &src, autoescape, make_ctx)?;
             self.set_part_rendered(&part, rendered);
         }
         Ok(())
@@ -524,7 +675,7 @@ impl TplCore {
     fn set_part_rendered(&mut self, part: &str, content: String) {
         let pkg = self.package.as_mut().expect("package loaded");
         let enc = pkg.encoding_of(part);
-        pkg.set(part, crate::package::encode_part(&content, &enc));
+        pkg.set(part, crate::package::encode_part_owned(content, &enc));
         // rendered xml replaces whatever the part cache held
         self.invalidate_part(part);
     }
@@ -682,32 +833,41 @@ impl TplCore {
         self.init_docx(false)?;
         self.pre_processing()?;
 
-        // post processing: zip-level replacements (rare path: only clone the
-        // whole package, media blobs included, when replacements are pending)
+        // post processing: zip-level replacements (rare path). Applied in
+        // place and then restored, avoiding a full package clone (media
+        // blobs included) for a single to_bytes() call.
         let out = if !self.crc_to_new_media.is_empty()
             || !self.crc_to_new_embedded.is_empty()
             || !self.zipname_to_replace.is_empty()
         {
-            let mut pkg = self
-                .package
-                .clone()
-                .ok_or_else(|| "package not loaded".to_string())?;
-            for (name, data, _compression, _mtime) in pkg.entries.iter_mut() {
-                if let Some(new) = self.zipname_to_replace.get(name) {
-                    *data = new.clone();
-                } else if name.starts_with("word/media/") {
-                    let c = crc32(data);
-                    if let Some(new) = self.crc_to_new_media.get(&c) {
-                        *data = new.clone();
-                    }
-                } else if name.starts_with("word/embeddings/") {
-                    let c = crc32(data);
-                    if let Some(new) = self.crc_to_new_embedded.get(&c) {
-                        *data = new.clone();
+            let mut swapped: Vec<(usize, Vec<u8>)> = Vec::new();
+            {
+                let pkg = self.package.as_mut().ok_or_else(|| "package not loaded".to_string())?;
+                for (idx, (name, data, _compression, _mtime)) in pkg.entries.iter_mut().enumerate() {
+                    let new = if let Some(new) = self.zipname_to_replace.get(name) {
+                        Some(new.clone())
+                    } else if name.starts_with("word/media/") {
+                        self.crc_to_new_media.get(&crc32(data)).cloned()
+                    } else if name.starts_with("word/embeddings/") {
+                        self.crc_to_new_embedded.get(&crc32(data)).cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(new) = new {
+                        swapped.push((idx, std::mem::replace(data, new)));
                     }
                 }
             }
-            pkg.to_bytes()?
+            let bytes = self
+                .package
+                .as_ref()
+                .ok_or_else(|| "package not loaded".to_string())?
+                .to_bytes()?;
+            let pkg = self.package.as_mut().unwrap();
+            for (idx, old) in swapped {
+                pkg.entries[idx].1 = old;
+            }
+            bytes
         } else {
             self.package
                 .as_ref()
@@ -1180,20 +1340,22 @@ fn call_python_variadic(
         }
         let tuple = pyo3::types::PyTuple::new(py, py_args)
             .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))?;
-        // keyword arguments -> PyDict
-        let dict = pyo3::types::PyDict::new(py);
+        // keyword arguments -> PyDict (None when empty: skips the dict
+        // allocation + per-call kwargs packing for the common no-kwargs call)
+        let mut dict = None;
         for key in kwargs.args() {
             let v: Value = kwargs.get(key).map_err(|e| e)?;
-            dict.set_item(
-                key,
-                crate::pybridge::value_to_py(py, &v).map_err(|e| {
-                    minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
-                })?,
-            )
-            .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))?;
+            dict.get_or_insert_with(|| pyo3::types::PyDict::new(py))
+                .set_item(
+                    key,
+                    crate::pybridge::value_to_py(py, &v).map_err(|e| {
+                        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string())
+                    })?,
+                )
+                .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))?;
         }
         let result = callable
-            .call(py, tuple, Some(&dict))
+            .call(py, tuple, dict.as_ref())
             .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))?;
         let result = result.bind(py);
         crate::pybridge::py_to_value_render(&result)
@@ -2053,7 +2215,12 @@ fn rewrite_tag_bool_compare(tag: &str, rules: &[(&str, &str)]) -> String {
 /// `('fmt')|pyformat(args)` (minijinja has no % operator for strings).
 pub fn preprocess_engine_features(src: &str) -> Cow<'_, str> {
     let needs_debug = src.contains("{% debug");
-    let needs_printf = src.contains('%');
+    // printf-style needs a quoted string right before % ("..' % x" / "..'% x");
+    // a bare % (every {% tag}) must not trigger the full tag rewrite scan
+    let needs_printf = src.contains("'%")
+        || src.contains("\"%")
+        || src.contains("' %")
+        || src.contains("\" %");
     if !needs_debug && !needs_printf {
         return Cow::Borrowed(src);
     }
@@ -2344,6 +2511,22 @@ pub fn render_xml_str_with(src_xml: &str, ctx: Value, env: &Environment, core: &
     Ok(restore_escaped_delims(dst.into_owned()))
 }
 
+/// rustc-hash style rotate-xor-multiply over the whole buffer (multi-GB/s;
+/// a SipHash DefaultHasher would be a measurable cost on multi-MB parts)
+fn fxhash64(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+    let mut h = 0u64;
+    let mut chunks = bytes.chunks_exact(8);
+    for c in &mut chunks {
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(K);
+    }
+    let mut tail = 0u64;
+    for (i, b) in chunks.remainder().iter().enumerate() {
+        tail |= (*b as u64) << (8 * i);
+    }
+    (h.rotate_left(5) ^ tail).wrapping_mul(K)
+}
+
 /// `<w:p([ >])` -> `\n<w:p$1` without regex: insert `\n` before every
 /// `<w:p ` / `<w:p>` opening tag.
 fn add_paragraph_newlines(src: &str) -> Cow<'_, str> {
@@ -2491,11 +2674,26 @@ fn fix_tables_docpr_cnvpr(
     // nothing to fix without any table, drawing or (when requested) picture:
     // skip the full DOM parse+serialize round-trip
     let need_cnvpr = cnvpr_next.is_some();
-    if !xml.contains("<w:tbl")
-        && !xml.contains("wp:docPr")
-        && !(need_cnvpr && xml.contains("pic:cNvPr"))
-    {
+    let has_tbl = xml.contains("<w:tbl");
+    let has_docpr = xml.contains("wp:docPr");
+    let has_cnvpr = need_cnvpr && xml.contains("pic:cNvPr");
+    if !has_tbl && !has_docpr && !has_cnvpr {
         return Ok(xml.to_string());
+    }
+    if !has_tbl {
+        // no tables: docPr/cNvPr renumbering are pure id rewrites — linear
+        // string scans avoid the full DOM parse+serialize round-trip
+        let mut s = if has_docpr {
+            regex_fix_docpr(xml, docx_ids_index)
+        } else {
+            xml.to_string()
+        };
+        if let Some(next) = cnvpr_next {
+            if let Some(fixed) = renumber_cnvpr(&s, next) {
+                s = fixed;
+            }
+        }
+        return Ok(s);
     }
     // If the rendered xml is not well-formed (e.g. unescaped values without
     // autoescape), attempt recovery first (docxtpl uses an lxml recover-mode
@@ -2510,10 +2708,15 @@ fn fix_tables_docpr_cnvpr(
     };
     match doc {
         Some(mut doc) => {
-            fix_tables_elem(&mut doc.root);
-            fix_docpr_elem(&mut doc.root, docx_ids_index);
+            let mut changed = fix_tables_elem(&mut doc.root);
+            changed |= fix_docpr_elem(&mut doc.root, docx_ids_index);
             if let Some(next) = cnvpr_next {
-                fix_cnvpr_elem(&mut doc.root, next);
+                changed |= fix_cnvpr_elem(&mut doc.root, next);
+            }
+            if !changed {
+                // grid widths and ids were already consistent: skip the
+                // whole serialize (the expensive half of this pass)
+                return Ok(xml.to_string());
             }
             // round-trip output stays close to the input size (fixes are local)
             Ok(doc.serialize_with_capacity(xml.len() + xml.len() / 8 + 64))
@@ -2543,16 +2746,19 @@ fn renumber_cnvpr(xml: &str, next_id: &mut u32) -> Option<String> {
     Some(doc.serialize_with_capacity(xml.len() + 64))
 }
 
-fn fix_cnvpr_elem(el: &mut Element, next_id: &mut u32) {
+fn fix_cnvpr_elem(el: &mut Element, next_id: &mut u32) -> bool {
+    let mut changed = false;
     if el.name == "pic:cNvPr" {
         el.set_attr("id", &next_id.to_string());
         *next_id += 1;
+        changed = true;
     }
     for c in el.children.iter_mut() {
         if let Node::Elem(e) = c {
-            fix_cnvpr_elem(e, next_id);
+            changed |= fix_cnvpr_elem(e, next_id);
         }
     }
+    changed
 }
 
 /// Last-resort docPr renumbering for unparseable xml.
@@ -2660,42 +2866,48 @@ fn regex_fix_tables(xml: &str) -> String {
     out
 }
 
-fn fix_docpr_elem(el: &mut Element, idx: &mut u32) {
+fn fix_docpr_elem(el: &mut Element, idx: &mut u32) -> bool {
+    let mut changed = false;
     if el.name == "wp:docPr" {
         *idx += 1;
         el.set_attr("id", &idx.to_string());
+        changed = true;
     }
     for c in el.children.iter_mut() {
         if let Node::Elem(e) = c {
-            fix_docpr_elem(e, idx);
+            changed |= fix_docpr_elem(e, idx);
         }
     }
+    changed
 }
 
-fn fix_tables_elem(el: &mut Element) {
+fn fix_tables_elem(el: &mut Element) -> bool {
+    let mut changed = false;
     if el.name == "w:tbl" {
-        fix_one_table(el);
+        changed |= fix_one_table(el);
     }
     for c in el.children.iter_mut() {
         if let Node::Elem(e) = c {
-            fix_tables_elem(e);
+            changed |= fix_tables_elem(e);
         }
     }
+    changed
 }
 
-fn fix_one_table(tbl: &mut Element) {
+fn fix_one_table(tbl: &mut Element) -> bool {
+    let mut changed = false;
     let Some(tbl_grid_idx) = tbl
         .children
         .iter()
         .position(|c| matches!(c, Node::Elem(e) if e.name == "w:tblGrid"))
     else {
-        return;
+        return false;
     };
 
     // snapshot column widths
     let grid = match &tbl.children[tbl_grid_idx] {
         Node::Elem(e) => e,
-        _ => return,
+        _ => return false,
     };
     let mut col_widths: Vec<f64> = grid
         .find_all("w:gridCol")
@@ -2740,6 +2952,7 @@ fn fix_one_table(tbl: &mut Element) {
     if to_add > 0 {
         let width: f64 = col_widths.iter().sum();
         if width > 0.0 && n_columns > 0 {
+            changed = true;
             let old_average = width / n_columns as f64;
             let new_average = width / (n_columns + to_add) as f64;
             for w in col_widths.iter_mut() {
@@ -2771,7 +2984,7 @@ fn fix_one_table(tbl: &mut Element) {
     // refetch columns
     let grid = match &tbl.children[tbl_grid_idx] {
         Node::Elem(e) => e,
-        _ => return,
+        _ => return changed,
     };
     let columns = grid.find_all("w:gridCol");
     let columns_len = columns.len();
@@ -2786,6 +2999,7 @@ fn fix_one_table(tbl: &mut Element) {
 
     let to_remove = columns_len.saturating_sub(cells_len_max);
     if to_remove > 0 && columns_len > 0 {
+        changed = true;
         let removed_width: f64 = col_widths2[columns_len - to_remove..].iter().sum();
         if let Node::Elem(grid) = &mut tbl.children[tbl_grid_idx] {
             // remove last to_remove gridCol children
@@ -2822,4 +3036,5 @@ fn fix_one_table(tbl: &mut Element) {
             }
         }
     }
+    changed
 }

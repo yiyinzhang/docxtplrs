@@ -52,6 +52,14 @@ fn py_truthy(obj: &Bound<'_, PyAny>) -> bool {
 
 // ---------------------------------------------------------------- DocxTemplate
 
+/// Send/Ungil wrapper for values that are logically confined to one thread
+/// but must cross a GIL-detached section (pyo3 requires Ungil). Sound here:
+/// the detached closure still executes on the current thread; a concurrent
+/// access to the same DocxTemplate from another thread fails loudly on the
+/// RefCell borrow rather than racing.
+struct AssertSend<T>(T);
+unsafe impl<T> Send for AssertSend<T> {}
+
 /// Class for managing docx files as they were jinja2 templates
 #[pyclass(name = "DocxTemplate", unsendable)]
 pub struct PyDocxTemplate {
@@ -227,12 +235,24 @@ impl PyDocxTemplate {
                 }
             }
         }
-        let result = core.render(autoescape, &|core, part| {
-            py_to_value(context, core, part, 0).map_err(|e| e.to_string())
+        // Render runs detached from the GIL: the engine re-acquires it on
+        // demand (Python::attach) for context/filter callbacks, so other
+        // Python threads keep running during a heavy render.
+        let ctx_obj = context.clone().unbind();
+        let core = AssertSend(core);
+        let (result, ctx) = context.py().detach(move || {
+            // bind the wrapper as a whole so the closure captures AssertSend
+            // (a field access would capture the !Send RefMut directly)
+            let mut core = core;
+            let result = core.0.render(autoescape, &|core, part| {
+                pyo3::Python::attach(|py| {
+                    py_to_value(ctx_obj.bind(py), core, part, 0).map_err(|e| e.to_string())
+                })
+            });
+            let ctx = core.0.last_error_context.clone();
+            (result, ctx)
         });
         result.map_err(|e| {
-            let ctx = core.last_error_context.clone();
-            drop(core);
             let err = PyErr::new::<crate::pyclasses::TemplateError, _>(e);
             if !ctx.is_empty() {
                 Python::attach(|py| {
@@ -270,6 +290,7 @@ impl PyDocxTemplate {
         let mut core = self.core.borrow_mut();
         core.custom_filters.retain(|(n, _)| n != name);
         core.custom_filters.push((name.to_string(), callable));
+        core.env_gen += 1;
     }
 
     /// Register a custom jinja test (python callable).
@@ -277,6 +298,7 @@ impl PyDocxTemplate {
         let mut core = self.core.borrow_mut();
         core.custom_tests.retain(|(n, _)| n != name);
         core.custom_tests.push((name.to_string(), callable));
+        core.env_gen += 1;
     }
 
     /// Register a custom jinja global function (python callable).
@@ -284,6 +306,7 @@ impl PyDocxTemplate {
         let mut core = self.core.borrow_mut();
         core.custom_functions.retain(|(n, _)| n != name);
         core.custom_functions.push((name.to_string(), callable));
+        core.env_gen += 1;
     }
 
     /// Register a custom jinja global value.
@@ -291,25 +314,37 @@ impl PyDocxTemplate {
         let mut core = self.core.borrow_mut();
         core.custom_globals.retain(|(n, _)| n != name);
         core.custom_globals.push((name.to_string(), value));
+        core.env_gen += 1;
     }
 
     /// Set a template loader callable (name -> source or None),
     /// enabling {% include %} and {% import %}.
     fn set_template_loader(&self, loader: Py<PyAny>) {
-        self.core.borrow_mut().template_loader = Some(loader);
+        let mut core = self.core.borrow_mut();
+        core.template_loader = Some(loader);
+        core.env_gen += 1;
     }
 
     /// Install a gettext .mo catalog enabling {% trans %} translations.
     fn install_gettext(&self, mo_file: &Bound<'_, PyAny>) -> PyResult<()> {
         let bytes = read_bytes_source(mo_file)?;
         let catalog = crate::gettext::Catalog::parse(&bytes).map_err(PyValueError::new_err)?;
-        self.core.borrow_mut().gettext_catalog = Some(std::sync::Arc::new(catalog));
+        let mut core = self.core.borrow_mut();
+        core.gettext_catalog = Some(std::sync::Arc::new(catalog));
+        core.env_gen += 1;
         Ok(())
     }
 
     /// Save the rendered (or media-replaced) docx to a path or file-like object.
     pub fn save(&self, py: Python<'_>, filename: &Bound<'_, PyAny>) -> PyResult<()> {
-        let bytes = self.core.borrow_mut().save_bytes().map_err(to_pyerr)?;
+        // zip compression is pure Rust: run it detached from the GIL
+        let core = AssertSend(&self.core);
+        let bytes = py
+            .detach(move || {
+                let core = core; // capture AssertSend as a whole
+                core.0.borrow_mut().save_bytes()
+            })
+            .map_err(to_pyerr)?;
         if let Ok(path) = filename.extract::<String>() {
             std::fs::write(&path, &bytes)
                 .map_err(|e| PyValueError::new_err(format!("cannot write {}: {}", path, e)))?;
@@ -853,11 +888,11 @@ fn extract_length(obj: &Bound<'_, PyAny>) -> PyResult<Option<i64>> {
 }
 
 // ---------------------------------------------------------------- InlineImage
-
 /// Generate an inline image from a template variable
 #[pyclass(name = "InlineImage", unsendable)]
 pub struct PyInlineImage {
-    pub blob: Vec<u8>,
+    /// Arc-shared so registering the Deferred per render is O(1)
+    pub blob: std::sync::Arc<[u8]>,
     pub filename: Option<String>,
     pub width: Option<i64>,
     pub height: Option<i64>,
@@ -890,7 +925,7 @@ impl PyInlineImage {
             });
         let blob = read_bytes_source(image_descriptor)?;
         Ok(PyInlineImage {
-            blob,
+            blob: blob.into(),
             filename,
             width: width.map(|w| extract_length(w)).transpose()?.flatten(),
             height: height.map(|h| extract_length(h)).transpose()?.flatten(),

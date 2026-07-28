@@ -162,13 +162,18 @@ impl Element {
     /// Concatenated text content of all descendants
     pub fn text_content(&self) -> String {
         let mut s = String::new();
+        self.push_text_content(&mut s);
+        s
+    }
+
+    /// text_content without the intermediate String per element
+    pub fn push_text_content(&self, out: &mut String) {
         for c in &self.children {
             match c {
-                Node::Text(t) => s.push_str(t),
-                Node::Elem(e) => s.push_str(&e.text_content()),
+                Node::Text(t) => out.push_str(t),
+                Node::Elem(e) => e.push_text_content(out),
             }
         }
-        s
     }
 }
 

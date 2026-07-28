@@ -469,36 +469,49 @@ fn dissolve_property_fields(mut xml: String) -> String {
 
 /// Renumber w:bookmarkStart/w:bookmarkEnd ids past the master's max id.
 fn renumber_bookmarks(tpl: &mut TplCore, mut body_xml: String) -> String {
-    let _ = tpl.flush_doc();
-    let master_xml = tpl
-        .package
-        .as_ref()
-        .and_then(|p| p.get_string(DOCUMENT_PART))
-        .unwrap_or_default();
     let id_re = crate::patch::re(r#"<w:bookmarkStart[^>]* w:id="(\d+)""#);
-    let mut max_id: i64 = 0;
-    for cap in id_re.captures_iter(&master_xml).flatten() {
-        if let Ok(n) = cap[1].parse::<i64>() {
-            max_id = max_id.max(n);
-        }
-    }
+    // cheap reject before touching the master at all (most subdoc bodies
+    // have no bookmarks)
     if !id_re.find(&body_xml).ok().flatten().is_some() {
         return body_xml;
     }
-    let offset = max_id + 1;
+    // the master max id is scanned once, then advanced locally as each
+    // subdoc's bookmarks are renumbered (they land in the master in order)
+    let base = match tpl.bookmark_next_id {
+        Some(b) => b,
+        None => {
+            let _ = tpl.flush_doc();
+            let master_xml = tpl
+                .package
+                .as_ref()
+                .and_then(|p| p.get_string(DOCUMENT_PART))
+                .unwrap_or_default();
+            let mut max_id: i64 = 0;
+            for cap in id_re.captures_iter(&master_xml).flatten() {
+                if let Ok(n) = cap[1].parse::<i64>() {
+                    max_id = max_id.max(n);
+                }
+            }
+            max_id + 1
+        }
+    };
+    let mut max_assigned = base;
     body_xml = psub(
         r#"(<w:bookmark(?:Start|End)[^>]* w:id=")(\d+)(")"#,
-        move |m: &fancy_regex::Captures| {
+        |m: &fancy_regex::Captures| {
             let n: i64 = m.get(2).unwrap().as_str().parse().unwrap_or(0);
+            let new = n + base;
+            max_assigned = max_assigned.max(new);
             format!(
                 "{}{}{}",
                 m.get(1).unwrap().as_str(),
-                n + offset,
+                new,
                 m.get(3).unwrap().as_str()
             )
         },
         &body_xml,
     );
+    tpl.bookmark_next_id = Some(max_assigned + 1);
     body_xml
 }
 

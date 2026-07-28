@@ -67,57 +67,13 @@ pub fn py_to_value(
     if depth > 64 {
         return Ok(Value::from(()));
     }
+    // fast path first: plain scalars are the bulk of all conversions and
+    // can never be one of our custom pyclasses (checked below), so dispatch
+    // them without the failed casts (hot: PyWrapper::get_value per lookup)
     if obj.is_none() {
         // jinja2 renders None as "None"; wrap so display matches while
         // keeping falsy semantics
         return Ok(Value::from_object(PyNoneObj));
-    }
-    // our own safe-xml types first
-    if let Ok(rt) = obj.cast::<PyRichText>() {
-        return Ok(Value::from_safe_string(rt.borrow().xml.borrow().clone()));
-    }
-    if let Ok(rt) = obj.cast::<crate::pyclasses::PyRichTextParagraph>() {
-        return Ok(Value::from_safe_string(rt.borrow().xml.borrow().clone()));
-    }
-    if let Ok(l) = obj.cast::<PyListing>() {
-        return Ok(Value::from_safe_string(l.borrow().xml.borrow().clone()));
-    }
-    if let Ok(img) = obj.cast::<PyInlineImage>() {
-        let oid = obj.as_ptr() as usize;
-        // cheap path: already registered for this render — don't rebuild
-        // (and re-clone) the Deferred
-        if let Some(&i) = tpl.deferred_by_oid.get(&oid) {
-            return Ok(Value::from_safe_string(crate::template::deferred_token(i)));
-        }
-        let d = {
-            let b = img.borrow();
-            crate::template::Deferred::Image {
-                blob: std::sync::Arc::from(&b.blob[..]),
-                filename: b.filename.clone(),
-                width: b.width,
-                height: b.height,
-                anchor: b.anchor.clone(),
-                title: b.title.clone(),
-                descr: b.descr.clone(),
-            }
-        };
-        return Ok(Value::from_safe_string(register_deferred(tpl, oid, d)));
-    }
-    if let Ok(sd) = obj.cast::<PySubdoc>() {
-        let oid = obj.as_ptr() as usize;
-        if let Some(&i) = tpl.deferred_by_oid.get(&oid) {
-            return Ok(Value::from_safe_string(crate::template::deferred_token(i)));
-        }
-        let b = sd.borrow();
-        let d = match &b.bytes {
-            Some(bytes) => crate::template::Deferred::Subdoc {
-                bytes: Some(std::sync::Arc::from(&bytes[..])),
-            },
-            None => crate::template::Deferred::SubdocBlocks {
-                blocks: std::sync::Arc::new(b.blocks.borrow().clone()),
-            },
-        };
-        return Ok(Value::from_safe_string(register_deferred(tpl, oid, d)));
     }
     if obj.is_instance_of::<PyBool>() {
         // jinja2 renders booleans as True/False
@@ -147,6 +103,53 @@ pub fn py_to_value(
         let b = obj.cast::<PyBytes>()?;
         let s = String::from_utf8_lossy(b.as_bytes()).to_string();
         return Ok(Value::from(s));
+    }
+    // our own safe-xml types next
+    if let Ok(rt) = obj.cast::<PyRichText>() {
+        return Ok(Value::from_safe_string(rt.borrow().xml.borrow().clone()));
+    }
+    if let Ok(rt) = obj.cast::<crate::pyclasses::PyRichTextParagraph>() {
+        return Ok(Value::from_safe_string(rt.borrow().xml.borrow().clone()));
+    }
+    if let Ok(l) = obj.cast::<PyListing>() {
+        return Ok(Value::from_safe_string(l.borrow().xml.borrow().clone()));
+    }
+    if let Ok(img) = obj.cast::<PyInlineImage>() {
+        let oid = obj.as_ptr() as usize;
+        // cheap path: already registered for this render — don't rebuild
+        // (and re-clone) the Deferred
+        if let Some(&i) = tpl.deferred_by_oid.get(&oid) {
+            return Ok(Value::from_safe_string(crate::template::deferred_token(i)));
+        }
+        let d = {
+            let b = img.borrow();
+            crate::template::Deferred::Image {
+                blob: b.blob.clone(),
+                filename: b.filename.clone(),
+                width: b.width,
+                height: b.height,
+                anchor: b.anchor.clone(),
+                title: b.title.clone(),
+                descr: b.descr.clone(),
+            }
+        };
+        return Ok(Value::from_safe_string(register_deferred(tpl, oid, d)));
+    }
+    if let Ok(sd) = obj.cast::<PySubdoc>() {
+        let oid = obj.as_ptr() as usize;
+        if let Some(&i) = tpl.deferred_by_oid.get(&oid) {
+            return Ok(Value::from_safe_string(crate::template::deferred_token(i)));
+        }
+        let b = sd.borrow();
+        let d = match &b.bytes {
+            Some(bytes) => crate::template::Deferred::Subdoc {
+                bytes: Some(std::sync::Arc::from(&bytes[..])),
+            },
+            None => crate::template::Deferred::SubdocBlocks {
+                blocks: std::sync::Arc::new(b.blocks.borrow().clone()),
+            },
+        };
+        return Ok(Value::from_safe_string(register_deferred(tpl, oid, d)));
     }
     if let Ok(dict) = obj.cast::<PyDict>() {
         if depth == 0 {
@@ -346,6 +349,38 @@ pub fn py_to_value_render(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
 }
 
 fn convert_shallow(obj: &Bound<'_, PyAny>) -> Option<Value> {
+    // fast path: scalars and containers need no render core (only the
+    // deferred-value types do), so skip the TLS lookup + full dispatch
+    if obj.is_none() {
+        return Some(Value::from_object(PyNoneObj));
+    }
+    if obj.is_instance_of::<PyBool>() {
+        return Some(Value::from_object(PyBoolObj(obj.extract::<bool>().ok()?)));
+    }
+    if obj.is_instance_of::<PyInt>() {
+        if let Ok(i) = obj.extract::<i64>() {
+            return Some(Value::from(i));
+        }
+        if let Ok(i) = obj.extract::<i128>() {
+            return Some(Value::from(i));
+        }
+        return Some(Value::from(obj.str().ok()?.to_string_lossy().to_string()));
+    }
+    if obj.is_instance_of::<PyFloat>() {
+        return Some(Value::from(obj.extract::<f64>().ok()?));
+    }
+    if obj.is_instance_of::<PyString>() {
+        return Some(Value::from(obj.extract::<String>().ok()?));
+    }
+    if obj.is_instance_of::<PyBytes>() {
+        let b = obj.cast::<PyBytes>().ok()?;
+        return Some(Value::from(String::from_utf8_lossy(b.as_bytes()).to_string()));
+    }
+    if obj.is_instance_of::<PyDict>() || obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyTuple>() {
+        return Some(Value::from_object(PyWrapper {
+            obj: obj.clone().unbind(),
+        }));
+    }
     // route through the active render core when available (so that deferred
     // values like InlineImage register correctly), otherwise use a scratch core
     if let Some(v) = with_current_core(|core, part| py_to_value(obj, core, part, 1).ok()) {
@@ -376,13 +411,15 @@ impl Object for PyWrapper {
     fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
         Python::attach(|py| {
             let obj = self.obj.bind(py);
-            let is_dict = obj.is_instance_of::<PyDict>();
             if let Some(name) = key.as_str() {
-                if is_dict {
-                    // dicts: item access first (dict methods stay available
-                    // through call_method)
-                    if let Ok(item) = obj.get_item(name) {
-                        return convert_shallow(&item);
+                if let Ok(dict) = obj.cast::<PyDict>() {
+                    // dicts: item access first; PyDict::get_item reports a
+                    // miss without raising (avoids a KeyError + getattr
+                    // AttributeError pair per undefined lookup)
+                    match dict.get_item(name) {
+                        Ok(Some(item)) => return convert_shallow(&item),
+                        Ok(None) => {}
+                        Err(_) => return None,
                     }
                     if let Ok(attr) = obj.getattr(name) {
                         return convert_shallow(&attr);

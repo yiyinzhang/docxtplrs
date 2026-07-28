@@ -148,6 +148,29 @@ CPython 3.13 — release builds are faster still):
   no longer re-hashes all media), `.rels` parts are parsed once per part
   instead of once per relationship, and rId/style/numId remapping runs as a
   single scan with a map lookup instead of one full-text regex per entry.
+- **Zip & template caching round** — media payloads (png/jpg/...) are stored
+  without re-deflating on save, `render()` reloads clone the pristine package
+  instead of re-inflating the whole zip, compiled jinja templates are cached
+  per part across renders (content-hash keyed), the three always-firing
+  `patch_xml` passes run as one fused scan, and the table/docPr fix skips its
+  DOM round-trip for table-free documents. On a 4.2MB template with 4×1MB
+  embedded images: save **204ms → 7ms (~29x)**, repeated render
+  **2.5ms → 0.9ms (~3x)**, full cycle **177ms → 11ms (~16x)** (release build;
+  `tests/bench_media.py`).
+- **Bridge & listing round** — `resolve_listing` (newline/tab expansion) no
+  longer runs per-paragraph fancy-regexes (one linear scan instead),
+  zip-level media replacements no longer clone the whole package, media
+  blobs are `Arc`-shared and hashed once, and the Python bridge converts
+  scalars through a fast path (no TLS lookup, no failed casts, dict misses
+  without exceptions). Listing-heavy render (300 multi-line cells):
+  **8.9ms → 4.8ms (~1.9x)** vs the pre-P0 baseline (`tests/bench_listing.py`).
+- **Concurrency & model round** — `render()`/`save()` now run detached from
+  the GIL (re-acquired on demand for Python callbacks), docmodel proxies use
+  generation-validated access cursors instead of rescanning from the body
+  head (reading 2000 paragraph texts sequentially: **17.4ms → 0.7ms
+  (~25x)**), `.rels` lookups are `Rc`-shared, style-id resolution and
+  subdoc bookmark renumbering are cached, and the render pipeline skips
+  footnotes/core-property work when there are no template tags.
 
 ### 1. Usage as a Rust crate
 
@@ -155,7 +178,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-docxtplrs = "0.1.8"
+docxtplrs = "0.1.9"
 minijinja = "2"
 ```
 
@@ -192,7 +215,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # in another uv project
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.8-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.9-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # or editable (local development)
 uv add --editable /path/to/docxtplrs
 ```
@@ -471,6 +494,23 @@ debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会�
 - **图片与 subdoc 合并**：图片去重哈希带缓存（插一张图不再重算全部媒体的 sha1），
   `.rels` 每个 part 只解析一次（而非每条关系一次），rId/style/numId 重映射从
   "每条目一次全文正则"改为单遍扫描 + map 查表。
+- **zip 与模板缓存轮**：png/jpg 等已压缩媒体在 save 时不再重新 deflate（直接 Stored
+  写出），`render()` 重载时克隆原始 Package 而非重新解压整个 zip，编译后的 jinja
+  模板按 part 缓存（内容哈希为 key）跨 render 复用，三个必然触发的 `patch_xml`
+  pass 融合为单趟扫描，无表格文档的表格/docPr 修复跳过整个 DOM 往返。含 4×1MB
+  图片的 4.2MB 模板：save **204ms → 7ms（约 29 倍）**，重复 render
+  **2.5ms → 0.9ms（约 3 倍）**，完整周期 **177ms → 11ms（约 16 倍）**（release
+  构建；`tests/bench_media.py`）。
+- **桥接与 listing 轮**：`resolve_listing`（换行/制表符展开）不再逐段落跑
+  fancy-regex（改为一趟线性扫描），zip 级媒体替换不再整体克隆包，媒体 blob
+  改为 `Arc` 共享且只哈希一次，Python 桥接层的标量转换走快路径（免 TLS 查询、
+  免失败 cast、dict miss 不再产生异常）。listing 密集渲染（300 个多行单元格）：
+  **8.9ms → 4.8ms（约 1.9 倍）**（对比 P0 前基线；`tests/bench_listing.py`）。
+- **并发与模型轮**：`render()`/`save()` 现在脱离 GIL 执行（Python 回调按需重新
+  获取），docmodel 代理改用带代际校验的访问游标（不再每次从 body 头部重扫——
+  顺序读取 2000 个段落文本：**17.4ms → 0.7ms（约 25 倍）**），`.rels` 查找
+  改为 `Rc` 共享，styleId 解析与 subdoc bookmark 重编号带缓存，渲染管线在
+  footnotes/core 属性无模板标签时整体跳过。
 
 ### 1. Rust 用法
 
@@ -478,7 +518,7 @@ debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会�
 
 ```toml
 [dependencies]
-docxtplrs = "0.1.8"
+docxtplrs = "0.1.9"
 minijinja = "2"
 ```
 
@@ -516,7 +556,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # 在其他 uv 项目中
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.8-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.9-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # 或本地开发模式（editable）
 uv add --editable /path/to/docxtplrs
 ```

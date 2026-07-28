@@ -7,11 +7,22 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 /// Timing instrumentation, enabled with PATCH_TIMING=1.
+fn patch_timing_enabled() -> bool {
+    // env::var scans the environment and allocates; cache the answer
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PATCH_TIMING").is_ok())
+}
+
+fn patch_debug_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PATCH_DEBUG").is_ok())
+}
+
 macro_rules! timed {
     ($name:expr, $e:expr) => {{
         let __t0 = std::time::Instant::now();
         let __r = $e;
-        if std::env::var("PATCH_TIMING").is_ok() {
+        if patch_timing_enabled() {
             eprintln!("[patch-timing] {}: {:.3}ms", $name, __t0.elapsed().as_secs_f64() * 1000.0);
         }
         __r
@@ -29,7 +40,7 @@ thread_local! {
 }
 
 pub(crate) fn re(pattern: &str) -> Rc<Regex> {
-    if std::env::var("PATCH_DEBUG").is_ok() {
+    if patch_debug_enabled() {
         eprintln!("[patch] running: {}", pattern);
     }
     RE_CACHE.with(|c| {
@@ -152,6 +163,10 @@ pub fn sub_str(pattern: &str, replacement: &str, text: &str) -> String {
     // route through `sub` (fancy-regex's replace_all unwraps internally)
     let replacement = replacement.to_string();
     sub(pattern, move |m| {
+        // no group references: skip the 18 full-string replace scans
+        if !replacement.contains('$') {
+            return replacement.clone();
+        }
         let mut out = replacement.clone();
         // expand $N / ${N} group references
         for g in 1..=9 {
@@ -286,12 +301,37 @@ pub fn patch_xml(src_xml: &str) -> Cow<'_, str> {
         };
     }
 
-    // replace {{<some tags>jinja2 stuff<some other tags>}} by {{jinja2 stuff}}
-    // (hand-rolled linear scan; the fancy-regex original cost ~half of
-    // patch_xml on large documents)
-    // gate: a match requires a jinja open marker
+    // replace {{<some tags>jinja2 stuff<some other tags>}} by {{jinja2 stuff}},
+    // ensure space preservation for runs containing jinja tags, and unescape
+    // entities/smart quotes inside jinja tags — fused into a single linear
+    // scan (fused_jinja_scan) that produces byte-identical output to running
+    // strip_tags_in_jinja_scan + space_preserve_scan + clean_tags_scan in
+    // sequence, with one full-document allocation instead of three.
+    // gate: a match in any of the three passes requires a jinja open marker
+    // (the space-preserve pass additionally requires `<w:t>`, which the fused
+    // scan handles internally: without one, nothing is rewritten)
+    //
+    // Exception: docxtpl runs colspan/cellbg BETWEEN strip_tags_in_jinja and
+    // space_preserve (their empty-run removal matches `<w:t></w:t>`, which the
+    // space pass would already have rewritten). A fused pass cannot reproduce
+    // that interleaving, so templates with those (rare) markers keep the
+    // original three-pass sequence below.
+    let mut cell_directive = xml.contains("colspan") || xml.contains("cellbg");
     if contains_any(&xml, &["{{", "{%", "{#"]) {
-        pass!("strip_tags_in_jinja", strip_tags_in_jinja_scan(&xml));
+        if cell_directive {
+            pass!("strip_tags_in_jinja", strip_tags_in_jinja_scan(&xml));
+        } else {
+            let fused = timed!("fused_jinja", fused_jinja_scan(&xml));
+            if fused.contains("colspan") || fused.contains("cellbg") {
+                // pathological: the marker was formed across a stripped run
+                // split — redo with the original pass order so colspan/cellbg
+                // still run between strip_tags_in_jinja and space_preserve
+                pass!("strip_tags_in_jinja", strip_tags_in_jinja_scan(&xml));
+                cell_directive = true;
+            } else {
+                xml = Cow::Owned(fused);
+            }
+        }
     }
 
     // manage table cell colspan
@@ -351,9 +391,8 @@ pub fn patch_xml(src_xml: &str) -> Cow<'_, str> {
     ));
     }
 
-    // ensure space preservation (hand-rolled linear scan; the original
-    // tempered-dot regex overflows the backtrack stack on large documents)
-    if xml.contains("<w:t>") && contains_any(&xml, &["{{", "{%"]) {
+    // ensure space preservation (see the fused_jinja note above)
+    if cell_directive && xml.contains("<w:t>") && contains_any(&xml, &["{{", "{%"]) {
         pass!("space_preserve", space_preserve_scan(&xml));
     }
     if contains_any(&xml, &["{{r", "{%r"]) {
@@ -470,9 +509,8 @@ pub fn patch_xml(src_xml: &str) -> Cow<'_, str> {
     }
 
     // clean tags: unescape entities and smart quotes inside jinja tags
-    // (hand-rolled linear scan; the lookbehind/lazy/lookahead fancy-regex
-    // original cost ~the other half of patch_xml on large documents)
-    if contains_any(&xml, &["{{", "{%"]) {
+    // (see the fused_jinja note above)
+    if cell_directive && contains_any(&xml, &["{{", "{%"]) {
         pass!("clean_tags", clean_tags_scan(&xml));
     }
 
@@ -492,74 +530,123 @@ pub fn resolve_listing(xml: &str) -> Cow<'_, str> {
     if !xml.contains(['\t', '\n', '\u{7}', '\u{c}']) {
         return Cow::Borrowed(xml);
     }
-    fn resolve_text(run_properties: &str, paragraph_properties: &str, m: &Captures) -> String {
-        let mut s = m.get(0).unwrap().as_str().to_string();
-        s = s.replace(
-            '\t',
-            &format!(
-                "</w:t></w:r><w:r>{}<w:tab/></w:r><w:r>{}<w:t xml:space=\"preserve\">",
-                run_properties, run_properties
-            ),
-        );
-        s = s.replace(
-            '\u{7}',
-            &format!(
-                "</w:t></w:r></w:p><w:p>{}<w:r>{}<w:t xml:space=\"preserve\">",
-                paragraph_properties, run_properties
-            ),
-        );
-        s = s.replace('\n', "</w:t><w:br/><w:t xml:space=\"preserve\">");
-        s = s.replace(
-            '\u{c}',
-            &format!(
-                "</w:t></w:r></w:p><w:p><w:r><w:br w:type=\"page\"/></w:r></w:p><w:p>{}<w:r>{}<w:t xml:space=\"preserve\">",
-                paragraph_properties, run_properties
-            ),
-        );
-        s
-    }
+    Cow::Owned(timed!("resolve_listing_scan", resolve_listing_scan(xml)))
+}
 
-    fn resolve_run(paragraph_properties: &str, m: &Captures) -> String {
-        let whole = m.get(0).unwrap().as_str();
-        let run_properties = re(r"(?s)<w:rPr>.*?</w:rPr>")
-            .find(whole)
-            .ok()
-            .flatten()
-            .map(|mm| mm.as_str().to_string())
-            .unwrap_or_default();
-        sub(
-            r"(?s)<w:t(?: [^>]*)?>.*?</w:t>",
-            |x| resolve_text(&run_properties, paragraph_properties, x),
-            whole,
-        )
-    }
-
-    fn resolve_paragraph(m: &Captures) -> String {
-        let whole = m.get(0).unwrap().as_str();
-        // Fast path: resolve_text only rewrites \t, \n, \x07 and \x0c. A
-        // paragraph without any of them is returned unchanged, so skip the
-        // (expensive) per-paragraph/per-run regex scans entirely.
-        if !whole.contains(['\t', '\n', '\u{7}', '\u{c}']) {
-            return whole.to_string();
+/// Find the next `<tag>`/`<tag ...>` opening tag (regex `<tag(?: [^>]*)?>`,
+/// which notably does NOT match longer tags like `<w:pPr>`/`<w:rPr>`/
+/// `<w:tab/>`): returns (start, end_after_gt).
+fn find_open_tag(s: &str, tag: &str) -> Option<(usize, usize)> {
+    let mut i = 0usize;
+    while let Some(rel) = s[i..].find(tag) {
+        let p = i + rel;
+        let after = p + tag.len();
+        match s.as_bytes().get(after) {
+            Some(b'>') => return Some((p, after + 1)),
+            Some(b' ') => {
+                // [^>]* up to the first '>'; without one no match is
+                // possible here or anywhere further
+                let gt = s[after..].find('>')?;
+                return Some((p, after + gt + 1));
+            }
+            _ => i = p + 1,
         }
-        let paragraph_properties = re(r"(?s)<w:pPr>.*?</w:pPr>")
-            .find(whole)
-            .ok()
-            .flatten()
-            .map(|mm| mm.as_str().to_string())
-            .unwrap_or_default();
-        sub(
-            r"(?s)<w:r(?: [^>]*)?>.*?</w:r>",
-            |x| resolve_run(&paragraph_properties, x),
-            whole,
-        )
     }
+    None
+}
 
-    Cow::Owned(timed!("resolve_listing_scan", sub(
-        r"(?s)<w:p(?: [^>]*)?>.*?</w:p>",
-        |m| resolve_paragraph(m),
-        xml,
-    )))
+/// first `<open>...</close>` (non-greedy), like regex find on `<open>.*?</close>`
+fn find_first_elem<'a>(s: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = s.find(open)?;
+    let end = s[start + open.len()..]
+        .find(close)
+        .map(|i| start + open.len() + i + close.len())?;
+    Some(&s[start..end])
+}
+
+/// Hand-rolled linear equivalent of the fancy-regex paragraph/run/w:t
+/// scans (the backtracking VM dominated render time for listing-heavy
+/// templates): for each `<w:p>` containing a listing char, rewrite \t, \n,
+/// \x07, \x0c inside its `<w:t>` elements.
+fn resolve_listing_scan(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some((ps, pe)) = find_open_tag(rest, "<w:p") {
+        // non-greedy up to the FIRST </w:p>; without one no match is
+        // possible here or anywhere further
+        let Some(close) = rest[pe..].find("</w:p>") else { break };
+        let para_end = pe + close + "</w:p>".len();
+        let whole = &rest[ps..para_end];
+        out.push_str(&rest[..ps]);
+        // fast path: a paragraph without listing chars is verbatim
+        if whole.contains(['\t', '\n', '\u{7}', '\u{c}']) {
+            resolve_paragraph_scan(whole, &mut out);
+        } else {
+            out.push_str(whole);
+        }
+        rest = &rest[para_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn resolve_paragraph_scan(whole: &str, out: &mut String) {
+    let ppr = find_first_elem(whole, "<w:pPr>", "</w:pPr>").unwrap_or("");
+    let mut rest = whole;
+    while let Some((rs, re)) = find_open_tag(rest, "<w:r") {
+        let Some(close) = rest[re..].find("</w:r>") else { break };
+        let run_end = re + close + "</w:r>".len();
+        out.push_str(&rest[..rs]);
+        resolve_run_scan(&rest[rs..run_end], ppr, out);
+        rest = &rest[run_end..];
+    }
+    out.push_str(rest);
+}
+
+fn resolve_run_scan(run: &str, ppr: &str, out: &mut String) {
+    let rpr = find_first_elem(run, "<w:rPr>", "</w:rPr>").unwrap_or("");
+    let mut rest = run;
+    while let Some((ts, te)) = find_open_tag(rest, "<w:t") {
+        let Some(close) = rest[te..].find("</w:t>") else { break };
+        let elem_end = te + close + "</w:t>".len();
+        out.push_str(&rest[..ts]);
+        resolve_text_into(&rest[ts..elem_end], rpr, ppr, out);
+        rest = &rest[elem_end..];
+    }
+    out.push_str(rest);
+}
+
+/// resolve_text on one `<w:t>...</w:t>` element. Keeps the original
+/// sequential str::replace chain (the replacements are rescanned by the
+/// later replaces), but only on the small element string.
+fn resolve_text_into(s: &str, run_properties: &str, paragraph_properties: &str, out: &mut String) {
+    if !s.contains(['\t', '\n', '\u{7}', '\u{c}']) {
+        out.push_str(s);
+        return;
+    }
+    let s = s.replace(
+        '\t',
+        &format!(
+            "</w:t></w:r><w:r>{}<w:tab/></w:r><w:r>{}<w:t xml:space=\"preserve\">",
+            run_properties, run_properties
+        ),
+    );
+    let s = s.replace(
+        '\u{7}',
+        &format!(
+            "</w:t></w:r></w:p><w:p>{}<w:r>{}<w:t xml:space=\"preserve\">",
+            paragraph_properties, run_properties
+        ),
+    );
+    let s = s.replace('\n', "</w:t><w:br/><w:t xml:space=\"preserve\">");
+    let s = s.replace(
+        '\u{c}',
+        &format!(
+            "</w:t></w:r></w:p><w:p><w:r><w:br w:type=\"page\"/></w:r></w:p><w:p>{}<w:r>{}<w:t xml:space=\"preserve\">",
+            paragraph_properties, run_properties
+        ),
+    );
+    out.push_str(&s);
 }
 
 /// `<w:t>` -> `<w:t xml:space="preserve">` when a jinja tag follows before
@@ -918,6 +1005,419 @@ fn clean_tag_content(s: &str, out: &mut String) {
         }
     }
     out.push_str(&s[copied..]);
+}
+
+// --------------------------------------------------------------------
+// Fused strip_tags_in_jinja + space_preserve + clean_tags (single pass)
+// --------------------------------------------------------------------
+
+const WT_PLAIN: &str = "<w:t>";
+const WT_PRESERVE: &str = "<w:t xml:space=\"preserve\">";
+
+/// Token kinds detected in the post-strip stream by the fused emitter.
+#[derive(Clone, Copy)]
+enum Tok {
+    /// exact `<w:t>` open tag
+    Wt,
+    /// `{{` or `{%`
+    Open,
+    /// `}}` or `%}` (only relevant inside a clean region)
+    Close,
+}
+
+enum Dec {
+    Token(Tok, usize),
+    /// the first carried byte is definitely plain text (the remainder may
+    /// still start a token, e.g. `<w:t}` followed by `}`)
+    Plain,
+    Undecided,
+}
+
+/// Decide whether the carried bytes (a possible token prefix, <= 5 ASCII
+/// bytes) already form a token. All token bytes are ASCII; a non-ASCII byte
+/// can never be part of a token and is never put into the carry.
+fn decide(carry: &[u8], in_clean: bool) -> Dec {
+    match carry[0] {
+        b'<' => {
+            const WT: &[u8] = b"<w:t>";
+            if carry.len() < WT.len() {
+                if WT.starts_with(carry) {
+                    Dec::Undecided
+                } else {
+                    Dec::Plain
+                }
+            } else if &carry[..WT.len()] == WT {
+                Dec::Token(Tok::Wt, WT.len())
+            } else {
+                Dec::Plain
+            }
+        }
+        b'{' => {
+            if carry.len() < 2 {
+                Dec::Undecided
+            } else if carry[1] == b'{' || carry[1] == b'%' {
+                Dec::Token(Tok::Open, 2)
+            } else {
+                Dec::Plain
+            }
+        }
+        b'}' | b'%' if in_clean => {
+            if carry.len() < 2 {
+                Dec::Undecided
+            } else if carry[1] == b'}' {
+                Dec::Token(Tok::Close, 2)
+            } else {
+                Dec::Plain
+            }
+        }
+        _ => Dec::Plain,
+    }
+}
+
+/// Stream emitter that applies the space_preserve and clean_tags passes on
+/// the post-strip text as it is produced by the strip driver, so the whole
+/// strip -> space -> clean composition happens in a single scan with a
+/// single full-document allocation.
+///
+/// Equivalence with the sequential composition, by pass:
+/// - space_preserve_scan(A) rewrites an exact `<w:t>` to
+///   `<w:t xml:space="preserve">` iff the text up to the next exact `<w:t>`
+///   (or EOF) contains `{{`/`{%`. The emitter sees exactly the bytes of A:
+///   strip-removed `</w:t>...<w:t>` pairs never enter the stream, so "next
+///   `<w:t>`" is automatically the post-strip one. The decision for a seen
+///   `<w:t>` stays open (`pending_wt`, following text goes to `hold`) until
+///   an opener (rewrite), the next `<w:t>` (plain), or EOF (plain). When a
+///   `<w:t>` sits inside a clean region whose closer arrives first, it is
+///   flushed plain and its position remembered (`retro_wt`); a later opener
+///   (before the next `<w:t>`) still upgrades it in place. The rewrite only
+///   inserts bytes into the opening tag, so it cannot affect clean's region
+///   structure (no `{`/`}`/`%`) nor its content replacements.
+/// - clean_tags_scan(B) cleans regions `{{`/`{%` .. first `}}`/`%}` (opener
+///   set excludes `{#`; closer not consumed; no closer anywhere -> verbatim).
+///   The emitter tracks exactly those regions on the stream (`cbuf`), which
+///   also covers `{{`/`{%` nested inside `{#...#}` strip regions and clean
+///   closers that precede the strip closer (e.g. `{% a }} b %}`).
+struct FusedEmitter {
+    out: String,
+    /// clean-region content accumulator: Some while inside `{{`/`{%` .. first
+    /// `}}`/`%}`; cleaned with clean_tag_content when the region closes
+    cbuf: Option<String>,
+    /// undecided token prefix carried across feed() boundaries (<=4 ASCII)
+    carry: Vec<u8>,
+    /// a `<w:t>` was seen but not yet emitted: its space_preserve decision is
+    /// still open; plain text seen meanwhile accumulates in `hold`
+    pending_wt: bool,
+    hold: String,
+    /// position in `out` of a `<w:t>` that had to be flushed plain before its
+    /// decision because its enclosing clean region closed
+    retro_wt: Option<usize>,
+}
+
+impl FusedEmitter {
+    fn new(cap: usize) -> Self {
+        FusedEmitter {
+            out: String::with_capacity(cap),
+            cbuf: None,
+            carry: Vec::new(),
+            pending_wt: false,
+            hold: String::new(),
+            retro_wt: None,
+        }
+    }
+
+    #[inline]
+    fn plain_dest(&mut self) -> &mut String {
+        if self.pending_wt {
+            &mut self.hold
+        } else if let Some(b) = &mut self.cbuf {
+            b
+        } else {
+            &mut self.out
+        }
+    }
+
+    #[inline]
+    fn push_plain(&mut self, s: &str) {
+        self.plain_dest().push_str(s);
+    }
+
+    /// Emit the pending `<w:t>` (as `tag`) plus any held text. The state
+    /// (inside/outside a clean region) cannot have changed while the tag was
+    /// pending, because every state-changing event flushes it first.
+    fn flush_pending(&mut self, tag: &str) {
+        debug_assert!(self.pending_wt);
+        self.pending_wt = false;
+        let hold = std::mem::take(&mut self.hold);
+        let dest = match &mut self.cbuf {
+            Some(b) => b,
+            None => &mut self.out,
+        };
+        dest.push_str(tag);
+        dest.push_str(&hold);
+    }
+
+    /// exact `<w:t>` seen in the stream
+    fn on_wt(&mut self) {
+        if self.pending_wt {
+            // the previous `<w:t>`'s region ends here, un-triggered: plain
+            self.flush_pending(WT_PLAIN);
+        } else {
+            // a previously flushed (retro) `<w:t>` is now decided plain
+            self.retro_wt = None;
+        }
+        self.pending_wt = true;
+    }
+
+    /// `{{` or `{%` seen in the stream
+    fn on_jinja_open(&mut self, two: &str) {
+        // space_preserve: an opener before the next `<w:t>` upgrades the
+        // pending (or, across a clean-region boundary, already-flushed) tag
+        if self.pending_wt {
+            self.flush_pending(WT_PRESERVE);
+        } else if let Some(p) = self.retro_wt.take() {
+            // insert the attribute before the tag's `>`
+            self.out.insert_str(p + 4, " xml:space=\"preserve\"");
+        }
+        // clean_tags: an opener starts a region unless already inside one
+        match &mut self.cbuf {
+            Some(b) => b.push_str(two),
+            None => {
+                self.out.push_str(two);
+                self.cbuf = Some(String::new());
+            }
+        }
+    }
+
+    /// `}}` or `%}` seen while inside a clean region
+    fn on_clean_close(&mut self, two: &str) {
+        let buf = self.cbuf.take().unwrap();
+        if self.pending_wt {
+            // The pending `<w:t>` sits inside this region but its
+            // space_preserve decision is still open (a later opener, before
+            // the next `<w:t>`, would still rewrite it in the sequential
+            // composition). Flush it plain and remember where, so a later
+            // opener can upgrade it in place. Cleaning the content before
+            // and after the tag separately is equivalent to cleaning the
+            // whole: the tag bytes are pure ASCII markup that none of
+            // clean_tag_content's replacements can span or touch.
+            self.pending_wt = false;
+            clean_tag_content(&buf, &mut self.out);
+            self.retro_wt = Some(self.out.len());
+            self.out.push_str(WT_PLAIN);
+            let hold = std::mem::take(&mut self.hold);
+            clean_tag_content(&hold, &mut self.out);
+        } else {
+            clean_tag_content(&buf, &mut self.out);
+        }
+        // the closer is not consumed by clean_tags: it is plain outside text
+        self.out.push_str(two);
+    }
+
+    fn on_token(&mut self, tok: Tok, text: &str) {
+        match tok {
+            Tok::Wt => self.on_wt(),
+            Tok::Open => self.on_jinja_open(text),
+            Tok::Close => self.on_clean_close(text),
+        }
+    }
+
+    /// Feed a piece of post-strip text. Pieces may split tokens arbitrarily;
+    /// undecided prefixes are kept in `carry` and resolved on the next feed.
+    fn feed(&mut self, s: &str) {
+        let mut rest = s;
+        while !self.carry.is_empty() {
+            match decide(&self.carry, self.cbuf.is_some()) {
+                Dec::Undecided => {
+                    let Some(&c) = rest.as_bytes().first() else {
+                        return; // wait for the next feed / finish()
+                    };
+                    if c >= 0x80 {
+                        // a non-ASCII byte can never complete a token: the
+                        // carried bytes (pure ASCII) are plain text
+                        let carried = std::mem::take(&mut self.carry);
+                        self.push_plain(std::str::from_utf8(&carried).unwrap());
+                    } else {
+                        self.carry.push(c);
+                        rest = &rest[1..]; // c is ASCII: still a char boundary
+                    }
+                }
+                Dec::Plain => {
+                    let first = self.carry.remove(0);
+                    self.plain_dest().push(first as char); // carried bytes are ASCII
+                }
+                Dec::Token(tok, len) => {
+                    let mut tmp = [0u8; 5];
+                    tmp[..len].copy_from_slice(&self.carry[..len]);
+                    self.carry.drain(..len);
+                    let text = std::str::from_utf8(&tmp[..len]).unwrap();
+                    self.on_token(tok, text);
+                }
+            }
+        }
+        if !rest.is_empty() {
+            self.scan(rest);
+        }
+    }
+
+    /// Scan one fed piece for token events, routing plain text through
+    /// `push_plain`.
+    fn scan(&mut self, s: &str) {
+        let b = s.as_bytes();
+        let n = b.len();
+        let mut plain_start = 0usize;
+        let mut i = 0usize;
+        while i < n {
+            let c = b[i];
+            let candidate =
+                c == b'<' || c == b'{' || (self.cbuf.is_some() && (c == b'}' || c == b'%'));
+            if !candidate {
+                i += 1;
+                continue;
+            }
+            let avail = n - i;
+            let (tok, len) = match c {
+                b'<' if avail >= 5 => {
+                    if &b[i..i + 5] == b"<w:t>" {
+                        (Some(Tok::Wt), 5)
+                    } else {
+                        (None, 1)
+                    }
+                }
+                b'{' if avail >= 2 => {
+                    if b[i + 1] == b'{' || b[i + 1] == b'%' {
+                        (Some(Tok::Open), 2)
+                    } else {
+                        (None, 1)
+                    }
+                }
+                b'}' | b'%' if avail >= 2 => {
+                    // only reached inside a clean region (see `candidate`)
+                    if b[i + 1] == b'}' {
+                        (Some(Tok::Close), 2)
+                    } else {
+                        (None, 1)
+                    }
+                }
+                _ => {
+                    // possible token split at the end of this piece: stash it
+                    self.push_plain(&s[plain_start..i]);
+                    self.carry.extend_from_slice(&b[i..]);
+                    return;
+                }
+            };
+            match tok {
+                None => i += 1,
+                Some(t) => {
+                    self.push_plain(&s[plain_start..i]);
+                    self.on_token(t, &s[i..i + len]);
+                    i += len;
+                    plain_start = i;
+                }
+            }
+        }
+        self.push_plain(&s[plain_start..]);
+    }
+
+    fn finish(mut self) -> String {
+        if !self.carry.is_empty() {
+            let carried = std::mem::take(&mut self.carry);
+            self.push_plain(std::str::from_utf8(&carried).unwrap());
+        }
+        if self.pending_wt {
+            self.flush_pending(WT_PLAIN); // EOF: no trigger can follow
+        }
+        if let Some(buf) = self.cbuf.take() {
+            // clean_tags: a tag with no closer anywhere never matches; the
+            // opener (already in out) and the content pass through verbatim
+            self.out.push_str(&buf);
+        }
+        self.out
+    }
+}
+
+/// Feed `s` to the emitter with every `</w:t>.*?(<w:t>|<w:t [^>]*>)` run
+/// removed (same logic as strip_wt_pairs, but streaming).
+fn feed_strip_wt_pairs(s: &str, em: &mut FusedEmitter) {
+    if !s.contains("</w:t>") {
+        em.feed(s);
+        return;
+    }
+    let b = s.as_bytes();
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while let Some(rel) = s[i..].find("</w:t>") {
+        let close_start = i + rel;
+        // earliest "<w:t>" or "<w:t ...>" opening tag after the close tag
+        let mut j = close_start + 6;
+        let open_end = loop {
+            if j + 5 > b.len() {
+                break None;
+            }
+            if b[j] == b'<' && b[j + 1..].starts_with(b"w:t") {
+                if b[j + 4] == b'>' {
+                    break Some(j + 5);
+                }
+                if b[j + 4] == b' ' {
+                    match s[j + 5..].find('>') {
+                        Some(g) => break Some(j + 5 + g + 1),
+                        None => break None,
+                    }
+                }
+            }
+            j += 1;
+        };
+        match open_end {
+            Some(e) => {
+                em.feed(&s[copied..close_start]);
+                copied = e;
+                i = e;
+            }
+            None => break,
+        }
+    }
+    em.feed(&s[copied..]);
+}
+
+/// Fused single-pass equivalent of running strip_tags_in_jinja_scan,
+/// space_preserve_scan and clean_tags_scan in sequence (see FusedEmitter for
+/// the equivalence argument). The strip driver is identical to
+/// strip_tags_in_jinja_scan, except that the post-strip text is streamed
+/// through the emitter instead of being materialized.
+fn fused_jinja_scan(xml: &str) -> String {
+    let mut em = FusedEmitter::new(xml.len());
+    let mut rest = xml;
+    loop {
+        let b = rest.as_bytes();
+        if b.len() < 2 {
+            break;
+        }
+        // earliest opener among {% {# {{
+        let mut o = None;
+        let mut i = 0usize;
+        while i + 1 < b.len() {
+            if b[i] == b'{' && matches!(b[i + 1], b'{' | b'%' | b'#') {
+                o = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        let Some(o) = o else { break };
+        let closer = match b[o + 1] {
+            b'%' => "%}",
+            b'#' => "#}",
+            _ => "}}",
+        };
+        let content_start = o + 2;
+        let content_end = rest[content_start..]
+            .find(closer)
+            .map(|r| content_start + r)
+            .unwrap_or(rest.len());
+        em.feed(&rest[..content_start]);
+        feed_strip_wt_pairs(&rest[content_start..content_end], &mut em);
+        rest = &rest[content_end..];
+    }
+    em.feed(rest);
+    em.finish()
 }
 
 #[cfg(test)]
@@ -1293,6 +1793,50 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_listing_scan() {
+        // \n -> <w:br/>
+        assert_eq!(
+            resolve_listing("<w:p><w:r><w:t>a\nb</w:t></w:r></w:p>"),
+            "<w:p><w:r><w:t>a</w:t><w:br/><w:t xml:space=\"preserve\">b</w:t></w:r></w:p>"
+        );
+        // \t -> tab run, run properties copied
+        assert_eq!(
+            resolve_listing("<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>a\tb</w:t></w:r></w:p>"),
+            "<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>a</w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:tab/></w:r><w:r><w:rPr><w:b/></w:rPr><w:t xml:space=\"preserve\">b</w:t></w:r></w:p>"
+        );
+        // \x07 -> new paragraph, paragraph properties copied
+        assert_eq!(
+            resolve_listing("<w:p><w:pPr><w:jc/></w:pPr><w:r><w:t>a\u{7}b</w:t></w:r></w:p>"),
+            "<w:p><w:pPr><w:jc/></w:pPr><w:r><w:t>a</w:t></w:r></w:p><w:p><w:pPr><w:jc/></w:pPr><w:r><w:t xml:space=\"preserve\">b</w:t></w:r></w:p>"
+        );
+        // \x0c -> page break paragraph
+        assert_eq!(
+            resolve_listing("<w:p><w:r><w:t>a\u{c}b</w:t></w:r></w:p>"),
+            "<w:p><w:r><w:t>a</w:t></w:r></w:p><w:p><w:r><w:br w:type=\"page\"/></w:r></w:p><w:p><w:r><w:t xml:space=\"preserve\">b</w:t></w:r></w:p>"
+        );
+        // w:t with attributes; paragraph with attributes
+        assert_eq!(
+            resolve_listing("<w:p x=\"1\"><w:r><w:t xml:space=\"preserve\">a\nb</w:t></w:r></w:p>"),
+            "<w:p x=\"1\"><w:r><w:t xml:space=\"preserve\">a</w:t><w:br/><w:t xml:space=\"preserve\">b</w:t></w:r></w:p>"
+        );
+        // identity: no listing chars
+        let s = "<w:p><w:r><w:t>plain</w:t></w:r></w:p>";
+        assert!(matches!(resolve_listing(s), Cow::Borrowed(_)));
+        // <w:pPr>/<w:rPr>/<w:tab> are not paragraph/run/text openings
+        assert_eq!(
+            resolve_listing("<w:pPr><w:jc/></w:pPr><w:tab/>\n"),
+            "<w:pPr><w:jc/></w:pPr><w:tab/>\n"
+        );
+        // paragraph without close tag: verbatim
+        assert_eq!(resolve_listing("<w:p><w:r><w:t>a\nb"), "<w:p><w:r><w:t>a\nb");
+        // listing char outside <w:t> (but inside a paragraph) is untouched
+        assert_eq!(
+            resolve_listing("<w:p>\n<w:r><w:t>x</w:t></w:r></w:p>"),
+            "<w:p>\n<w:r><w:t>x</w:t></w:r></w:p>"
+        );
+    }
+
+    #[test]
     fn test_clean_tags_scan_edges() {
         // 闭合符取第一个 }} 或 %}，与开符类型无关
         assert_eq!(clean_tags_scan("{{ a &lt; b %}"), "{{ a < b %}");
@@ -1318,5 +1862,162 @@ mod tests {
         // 恒等
         let s = "<w:p><w:r><w:t>plain</w:t></w:r></w:p>";
         assert_eq!(clean_tags_scan(s), s);
+    }
+
+    // ------------------------------------------------------------------
+    // fused_jinja_scan 等价性：单趟融合扫描必须产生与按序执行三个旧 pass
+    // 完全一致的输出（gate 语义与 patch_xml 一致，逐 pass 条件应用）
+    // ------------------------------------------------------------------
+
+    /// 参考实现：按 patch_xml 的 gate 逻辑逐 pass 条件应用三个旧扫描函数
+    fn ref_three_passes(xml: &str) -> String {
+        let mut s = xml.to_string();
+        if contains_any(&s, &["{{", "{%", "{#"]) {
+            s = strip_tags_in_jinja_scan(&s);
+        }
+        if s.contains("<w:t>") && contains_any(&s, &["{{", "{%"]) {
+            s = space_preserve_scan(&s);
+        }
+        if contains_any(&s, &["{{", "{%"]) {
+            s = clean_tags_scan(&s);
+        }
+        s
+    }
+
+    fn assert_fused_equiv(xml: &str) {
+        assert_eq!(fused_jinja_scan(xml), ref_three_passes(xml), "input: {:?}", xml);
+    }
+
+    /// 现有 strip/space/clean 单元测试与 patch_xml 端到端测试的全部输入
+    #[test]
+    fn test_fused_jinja_equiv_existing_inputs() {
+        let inputs = [
+            // strip_tags_in_jinja_scan 测试输入
+            "{{ x </w:t></w:r><w:r><w:t>+ y }}",
+            "{% a </w:t><w:t xml:space=\"preserve\">b %}",
+            "pre {{ x </w:t><w:t>y",
+            "{{ a </w:t> b }}",
+            "{{ a }}</w:t><w:t>{{ b </w:t><w:t>c }}",
+            "{{ a </w:t><w:t/>b }}",
+            "{# n </w:t><w:t>x #}",
+            // space_preserve_scan 测试输入
+            "<w:t>{{ x }}</w:t>",
+            "<w:t>{% if x %}</w:t>",
+            "<w:t>a</w:t><w:t>{{b}}</w:t>",
+            "<w:t>a</w:t>{{ x }}<w:t>b</w:t>",
+            "<w:t xml:space=\"preserve\">{{x}}</w:t>",
+            // clean_tags_scan 测试输入
+            "{{ a &lt; b %}",
+            "{% a &gt; b }}",
+            "{{}}",
+            "{%%}",
+            "{{ a &lt; b",
+            "x &lt; {{ a &lt; b }} y &lt;",
+            "{{ &#8216;x&#8216; }}",
+            "{{ \u{2018}a\u{2019}\u{201c}b\u{201d} }}",
+            "{{ \u{201a} }}",
+            // patch_xml 端到端测试输入
+            "<w:p><w:r><w:t>{{ x </w:t></w:r><w:r><w:t>+ y }}</w:t></w:r></w:p>",
+            "<w:p><w:r><w:t>{</w:t></w:r><w:r><w:t>{ x }</w:t></w:r></w:p>",
+            "<w:tc><w:tcPr><w:gridSpan w:val=\"9\"/></w:tcPr><w:r><w:t>{% colspan span %}</w:t></w:r></w:tc>",
+            "<w:tc><w:tcPr><w:shd w:val=\"clear\" w:fill=\"FF0000\"/></w:tcPr><w:r><w:t>{% cellbg color %}</w:t></w:r></w:tc>",
+            "<w:body><w:p><w:r><w:t>{{r rt }}</w:t></w:r></w:p></w:body>",
+            "<w:p><w:r><w:t>text</w:t></w:r></w:p><w:p><w:r><w:t>{%- if x %}</w:t></w:r></w:p>",
+            "<w:p><w:r><w:t>{% endif -%}</w:t></w:r></w:p><w:p><w:r><w:t>next</w:t></w:r></w:p>",
+            "<w:p><w:r><w:t>{%p if x %}</w:t></w:r></w:p>",
+            "<w:tr><w:tc><w:p><w:r><w:t>{{tr row }}</w:t></w:r></w:p></w:tc></w:tr>",
+            "<w:p><w:r><w:t>{#p note #}</w:t></w:r></w:p>",
+            "<w:tc><w:tcPr></w:tcPr><w:r><w:t>{% vm %}content</w:t></w:r></w:tc>",
+            "<w:tc><w:tcPr></w:tcPr><w:r><w:t>a{% hm %}b</w:t></w:r></w:tc>",
+            "<w:tc><w:tcPr><w:gridSpan w:val=\"3\"/></w:tcPr><w:r><w:t>{% hm %}</w:t></w:r></w:tc>",
+            "<w:p><w:r><w:t>{{ x &lt; y }}</w:t></w:r></w:p>",
+            "<w:p><w:r><w:t>{{ \u{201c}s\u{201d} }}</w:t></w:r></w:p>",
+            // gate 不满足：三个旧 pass 都不会被调用，融合扫描同样恒等
+            "<w:p><w:r><w:t>plain</w:t></w:r></w:p>",
+            "<w:t>no markers here</w:t>",
+            "",
+        ];
+        for x in inputs {
+            assert_fused_equiv(x);
+        }
+    }
+
+    /// 合成边界情况：跨 run 拆分、无闭符、闭符规则分歧、{# 内嵌 {{、
+    /// jinja 内容里孤立的 <w:t>（retro 升级路径）、carry 跨 feed 边界等
+    #[test]
+    fn test_fused_jinja_equiv_edge_cases() {
+        let inputs = [
+            // clean 开符不含 {#，但 {# 区域内的 {{ 子开符会被 clean 处理
+            "{# {{ a &lt; b }} #}",
+            "{# a {{ b }} c #}",
+            "{# a {{ b #} c }}",
+            "{{ a {# b }} c #}",
+            // clean 闭符（第一个 }}/%}）先于 strip 闭符（按开符类型）
+            "{% a }} b %}",
+            "{{ a %} b }}",
+            "{% a &lt; }} b &gt; %}",
+            // jinja 内容里孤立的 <w:t>（无前置 </w:t>，strip 不删）：
+            // 它是 clean 区域内的 space_preserve 候选
+            "{{ a <w:t> b }}",
+            "{{ a <w:t> {% b %} c }}",
+            // retro 路径：<w:t> 在 clean 区域内，触发它的 {% 在区域关闭后
+            "{{ a <w:t> b }} {% c %}",
+            "<w:t>{{ a <w:t> b }}</w:t>",
+            "{{ <w:t> x &lt; y }} z {% w %}",
+            // 多个 retro/触发交错
+            "{{ <w:t> }}t{% u %}{{ <w:t> }}v{% w %}",
+            // 跨 run 拆分标签 + space/clean 组合
+            "<w:p><w:r><w:t>{{ x </w:t></w:r><w:r><w:t>&lt; y }}</w:t></w:r></w:p>",
+            "<w:t>{{ a </w:t></w:r><w:r><w:t>\u{201c}b\u{201d} }}</w:t>",
+            // strip 拼接出新的 {{（旧 strip 看不到，但 space/clean 能看到）
+            "{{ a {</w:t><w:t>{ b }}",
+            "{{ x </w:t><w:t>{ }}",
+            // {%- / -%} 对这三个 pass 无特殊语义，照常处理
+            "{%- if x %}",
+            "<w:t>{%- x -%}</w:t>",
+            // 无闭符：strip 到 EOF 照常剥离；clean 无闭符则整体原样
+            "pre {{ x </w:t><w:t>y",
+            "{{ a &lt; b",
+            "<w:t>{{ a </w:t><w:t> &lt; b",
+            // 紧邻多个标签、空标签
+            "{{ a }}{% b %}{# c #}",
+            "{{}}{%%}{##}",
+            // 嵌套引号与智能引号、&#8216;
+            "{{ \"a\" &#8216;b&#8216; \u{2018}c\u{2019} }}",
+            "{% if a == \u{201c}x\u{201d} and b &lt; 2 %}",
+            // 多字节字符环绕 token（carry 不得切开 UTF-8 字符）
+            "<w:t>中文{{ x }}日本語</w:t>",
+            "{{ x </w:t><w:t>é }}",
+            // carry 边界：feed 片段以 { 或 <w:t 结尾（由 strip 切分产生）
+            "{{ a {</w:t><w:t>{ b }}",
+            "{{ a </w:t><w:t",
+            "{% k </w:t><w:t",
+            // EOF 时 pending <w:t> 未触发：保持原样
+            "<w:t>{{ x }}</w:t><w:t>tail",
+            "<w:t>plain</w:t><w:t>{{ y }}",
+            // 连续 <w:t>：前一个区域无触发
+            "<w:t>a<w:t>{{ b }}",
+            // closer 紧贴 opener
+            "<w:t>{{}}</w:t>",
+            "<w:t>{% x %}{% y %}</w:t>",
+        ];
+        for x in inputs {
+            assert_fused_equiv(x);
+        }
+    }
+
+    /// 长文档等价性（同时作为性能冒烟测试）：大量 run + 周期性跨 run
+    /// 拆分的 jinja 标签
+    #[test]
+    fn test_fused_jinja_equiv_long() {
+        let mut long = String::new();
+        for i in 0..5_000 {
+            if i % 7 == 3 {
+                long.push_str("<w:p><w:r><w:t>{{ x </w:t></w:r><w:r><w:t>+ &lt; y }}</w:t></w:r></w:p>");
+            } else {
+                long.push_str("<w:p><w:r><w:t>t</w:t></w:r></w:p>");
+            }
+        }
+        assert_fused_equiv(&long);
     }
 }
