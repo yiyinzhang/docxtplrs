@@ -35,7 +35,7 @@ pub enum Deferred {
 
 #[derive(Debug, Default)]
 pub struct TplCore {
-    pub original_bytes: Vec<u8>,
+    pub original_bytes: std::sync::Arc<[u8]>,
     pub package: Option<Package>,
     /// pristine package parsed once from original_bytes; reload clones it
     /// (memcpy) instead of re-inflating the whole zip on every render
@@ -104,6 +104,12 @@ pub struct TplCore {
     /// bumped whenever filters/tests/functions/globals/loader/gettext change,
     /// invalidating env_caches (env_options are compared by value instead)
     pub env_gen: u64,
+    /// per-part cache of the pure preprocessing chain (decode entities ->
+    /// patch_xml -> paragraph newlines -> trans/bool/engine rewrites):
+    /// part -> (raw source hash, preprocessed hash, preprocessed source).
+    /// Repeated renders of an unchanged part skip the whole chain (several
+    /// full-document scans + copies); Rc-shared so reuse is a refcount bump.
+    pub preproc_cache: HashMap<String, (u64, u64, std::rc::Rc<str>)>,
 }
 
 /// A cached jinja environment plus the content hashes of the part templates
@@ -138,7 +144,7 @@ pub type CtxFn<'a> = dyn Fn(&mut TplCore, &str) -> Result<Value, String> + 'a;
 impl TplCore {
     pub fn new(template_bytes: Vec<u8>) -> TplCore {
         TplCore {
-            original_bytes: template_bytes,
+            original_bytes: template_bytes.into(),
             ..Default::default()
         }
     }
@@ -150,7 +156,7 @@ impl TplCore {
             self.package = Some(match &self.original_package {
                 Some(p) => p.clone(),
                 None => {
-                    let pkg = Package::from_bytes(&self.original_bytes)?;
+                    let pkg = Package::from_bytes_arc(self.original_bytes.clone())?;
                     self.original_package = Some(pkg.clone());
                     pkg
                 }
@@ -407,12 +413,10 @@ impl TplCore {
         autoescape: bool,
         make_ctx: &CtxFn,
     ) -> Result<String, String> {
-        let decoded = decode_text_entities(src_xml);
-        let patched = patch_xml(&decoded);
         let prev = crate::pybridge::set_current_render(self as *mut TplCore, part);
         let result = (|| {
             let ctx = make_ctx(self, part)?;
-            let dst = self.render_part_jinja(part, &patched, ctx, autoescape)?;
+            let dst = self.render_part_jinja(part, src_xml, ctx, autoescape)?;
             let dst = resolve_listing(&dst);
             self.materialize_deferred(part, dst.into_owned())
         })();
@@ -441,10 +445,11 @@ impl TplCore {
         self.env_caches[idx].as_mut().unwrap()
     }
 
-    /// Render the patched xml of one part through the cached jinja env,
-    /// reusing the compiled template when the preprocessed source is
-    /// unchanged (content-hash keyed); compiling a multi-MB document part
-    /// is one of the remaining O(size) costs of a repeated render.
+    /// Render one part's raw xml through the cached jinja env. The pure
+    /// preprocessing chain (decode entities -> patch_xml -> paragraph
+    /// newlines -> trans/bool/engine rewrites) is cached per part keyed by
+    /// the raw source hash, and the compiled template by the preprocessed
+    /// hash, so a repeated render of an unchanged part skips both.
     fn render_part_jinja(
         &mut self,
         part: &str,
@@ -452,11 +457,24 @@ impl TplCore {
         ctx: Value,
         autoescape: bool,
     ) -> Result<String, String> {
-        let src = add_paragraph_newlines(src_xml);
-        let src = preprocess_trans(&src);
-        let src = preprocess_bool_compare(&src);
-        let src = preprocess_engine_features(&src);
-        let hash = fxhash64(src.as_bytes());
+        let src_hash = fxhash64(src_xml.as_bytes());
+        let (hash, src) = match self.preproc_cache.get(part) {
+            Some((h, ph, s)) if *h == src_hash => (*ph, s.clone()),
+            _ => {
+                let decoded = decode_text_entities(src_xml);
+                let patched = patch_xml(&decoded);
+                let s = add_paragraph_newlines(&patched);
+                let s = preprocess_trans(&s);
+                let s = preprocess_bool_compare(&s);
+                let s = preprocess_engine_features(&s);
+                let rc: std::rc::Rc<str> = s.into_owned().into();
+                let ph = fxhash64(rc.as_bytes());
+                self.preproc_cache
+                    .insert(part.to_string(), (src_hash, ph, rc.clone()));
+                (ph, rc)
+            }
+        };
+        let src: &str = &src;
         let compile_err = {
             let cache = self.jinja_env(autoescape);
             if cache.tpl_hashes.get(part) == Some(&hash) {
@@ -684,7 +702,7 @@ impl TplCore {
 
     pub fn undeclared_variables(&mut self, context_keys: Option<HashSet<String>>) -> Result<Vec<String>, String> {
         // Build on a temporary package so current state is untouched
-        let pkg = Package::from_bytes(&self.original_bytes)?;
+        let pkg = Package::from_bytes_arc(self.original_bytes.clone())?;
         let mut xml = String::new();
         if let Some(doc) = pkg.get_string(DOCUMENT_PART) {
             xml.push_str(&patch_xml(&decode_text_entities(&doc)));
@@ -843,18 +861,18 @@ impl TplCore {
             let mut swapped: Vec<(usize, Vec<u8>)> = Vec::new();
             {
                 let pkg = self.package.as_mut().ok_or_else(|| "package not loaded".to_string())?;
-                for (idx, (name, data, _compression, _mtime)) in pkg.entries.iter_mut().enumerate() {
-                    let new = if let Some(new) = self.zipname_to_replace.get(name) {
+                for (idx, entry) in pkg.entries.iter_mut().enumerate() {
+                    let new = if let Some(new) = self.zipname_to_replace.get(&entry.name) {
                         Some(new.clone())
-                    } else if name.starts_with("word/media/") {
-                        self.crc_to_new_media.get(&crc32(data)).cloned()
-                    } else if name.starts_with("word/embeddings/") {
-                        self.crc_to_new_embedded.get(&crc32(data)).cloned()
+                    } else if entry.name.starts_with("word/media/") {
+                        self.crc_to_new_media.get(&crc32(entry.bytes())).cloned()
+                    } else if entry.name.starts_with("word/embeddings/") {
+                        self.crc_to_new_embedded.get(&crc32(entry.bytes())).cloned()
                     } else {
                         None
                     };
                     if let Some(new) = new {
-                        swapped.push((idx, std::mem::replace(data, new)));
+                        swapped.push((idx, entry.swap_bytes(new)));
                     }
                 }
             }
@@ -865,7 +883,7 @@ impl TplCore {
                 .to_bytes()?;
             let pkg = self.package.as_mut().unwrap();
             for (idx, old) in swapped {
-                pkg.entries[idx].1 = old;
+                pkg.entries[idx].swap_bytes(old);
             }
             bytes
         } else {
@@ -2708,11 +2726,12 @@ fn fix_tables_docpr_cnvpr(
     };
     match doc {
         Some(mut doc) => {
-            let mut changed = fix_tables_elem(&mut doc.root);
-            changed |= fix_docpr_elem(&mut doc.root, docx_ids_index);
-            if let Some(next) = cnvpr_next {
-                changed |= fix_cnvpr_elem(&mut doc.root, next);
-            }
+            // single fused tree walk for tables + docPr + cNvPr; the docPr and
+            // cNvPr passes are skipped entirely when the raw xml contains no
+            // such elements (pure-table documents avoid the extra traversal)
+            let docpr_idx = if has_docpr { Some(docx_ids_index) } else { None };
+            let cnvpr_idx = if has_cnvpr { cnvpr_next } else { None };
+            let changed = fix_elem_fused(&mut doc.root, docpr_idx, cnvpr_idx);
             if !changed {
                 // grid widths and ids were already consistent: skip the
                 // whole serialize (the expensive half of this pass)
@@ -2866,29 +2885,36 @@ fn regex_fix_tables(xml: &str) -> String {
     out
 }
 
-fn fix_docpr_elem(el: &mut Element, idx: &mut u32) -> bool {
-    let mut changed = false;
-    if el.name == "wp:docPr" {
-        *idx += 1;
-        el.set_attr("id", &idx.to_string());
-        changed = true;
-    }
-    for c in el.children.iter_mut() {
-        if let Node::Elem(e) = c {
-            changed |= fix_docpr_elem(e, idx);
-        }
-    }
-    changed
-}
-
-fn fix_tables_elem(el: &mut Element) -> bool {
+/// Fused single-pass tree walk combining fix_tables_elem + fix_docpr_elem +
+/// fix_cnvpr_elem. `docpr_idx`/`cnvpr_next` are None when the corresponding
+/// element kind is known absent (gated by the caller's raw-string contains
+/// checks), turning those passes into no-ops without walking the tree.
+fn fix_elem_fused(
+    el: &mut Element,
+    mut docpr_idx: Option<&mut u32>,
+    mut cnvpr_next: Option<&mut u32>,
+) -> bool {
     let mut changed = false;
     if el.name == "w:tbl" {
         changed |= fix_one_table(el);
     }
+    if let Some(idx) = docpr_idx.as_deref_mut() {
+        if el.name == "wp:docPr" {
+            *idx += 1;
+            el.set_attr("id", &idx.to_string());
+            changed = true;
+        }
+    }
+    if let Some(next) = cnvpr_next.as_deref_mut() {
+        if el.name == "pic:cNvPr" {
+            el.set_attr("id", &next.to_string());
+            *next += 1;
+            changed = true;
+        }
+    }
     for c in el.children.iter_mut() {
         if let Node::Elem(e) = c {
-            changed |= fix_tables_elem(e);
+            changed |= fix_elem_fused(e, docpr_idx.as_deref_mut(), cnvpr_next.as_deref_mut());
         }
     }
     changed
@@ -2923,14 +2949,6 @@ fn fix_one_table(tbl: &mut Element) -> bool {
     // count stats across all descendant rows (immutable pass)
     let mut rows: Vec<&Element> = Vec::new();
     tbl.iter_descendants("w:tr", &mut rows);
-    let mut to_add = 0usize;
-    for r in &rows {
-        let cells = r.find_all("w:tc");
-        if n_columns + to_add < cells.len() {
-            to_add = cells.len() - n_columns;
-        }
-    }
-
     let get_cell_len = |cell: &Element| -> usize {
         if let Some(tcpr) = cell.find("w:tcPr") {
             if let Some(gs) = tcpr.find("w:gridSpan") {
@@ -2941,9 +2959,15 @@ fn fix_one_table(tbl: &mut Element) -> bool {
         }
         1
     };
+    // single loop over rows: max missing columns and max grid-span-adjusted
+    // cell count (merged from two loops that each re-collected w:tc vecs)
+    let mut to_add = 0usize;
     let mut cells_len_max = 0usize;
     for r in &rows {
         let cells = r.find_all("w:tc");
+        if n_columns + to_add < cells.len() {
+            to_add = cells.len() - n_columns;
+        }
         let len: usize = cells.iter().map(|c| get_cell_len(c)).sum();
         cells_len_max = cells_len_max.max(len);
     }

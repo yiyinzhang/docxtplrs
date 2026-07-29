@@ -178,7 +178,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-docxtplrs = "0.1.9"
+docxtplrs = "0.1.10"
 minijinja = "2"
 ```
 
@@ -215,7 +215,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # in another uv project
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.9-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.10-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # or editable (local development)
 uv add --editable /path/to/docxtplrs
 ```
@@ -518,7 +518,7 @@ debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会�
 
 ```toml
 [dependencies]
-docxtplrs = "0.1.9"
+docxtplrs = "0.1.10"
 minijinja = "2"
 ```
 
@@ -556,7 +556,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # 在其他 uv 项目中
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.9-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.10-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # 或本地开发模式（editable）
 uv add --editable /path/to/docxtplrs
 ```

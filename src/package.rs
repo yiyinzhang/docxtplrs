@@ -228,11 +228,91 @@ fn normalize_path(p: &str) -> String {
     segs.join("/")
 }
 
+/// One zip entry: name, payload, original compression method, mtime.
+///
+/// The payload is `Arc`-shared, so cloning a `Package` (per-render reload)
+/// is a refcount bump per entry instead of a full memcpy of every blob.
+/// Payloads of unmodified, already-compressed media entries (png/jpg/…) are
+/// kept as the raw deflate stream (`Packed`) and inflated lazily on first
+/// access: loading a media-heavy docx no longer inflates every image, and
+/// `to_bytes` raw-copies the untouched stream without inflating it either.
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub name: String,
+    data: EntryData,
+    pub compression: zip::CompressionMethod,
+    pub mtime: Option<zip::DateTime>,
+}
+
+#[derive(Debug, Clone)]
+enum EntryData {
+    Ready(std::sync::Arc<[u8]>),
+    Packed {
+        raw: std::sync::Arc<[u8]>,
+        /// uncompressed size (capacity hint)
+        size: usize,
+        cell: std::cell::OnceCell<std::sync::Arc<[u8]>>,
+    },
+}
+
+/// Inflate a raw deflate stream. Corrupt streams yield an empty payload
+/// (they can only come from a corrupt source zip; previously such a zip
+/// failed at load time instead).
+fn inflate_raw(raw: &[u8], size: usize) -> std::sync::Arc<[u8]> {
+    let mut dec = flate2::read::DeflateDecoder::new(raw);
+    let mut out = Vec::with_capacity(size);
+    if dec.read_to_end(&mut out).is_err() {
+        out.clear();
+    }
+    out.into()
+}
+
+impl Entry {
+    /// decompressed payload (inflates packed entries on first access)
+    pub fn bytes(&self) -> &[u8] {
+        match &self.data {
+            EntryData::Ready(b) => b,
+            EntryData::Packed { raw, size, cell } => {
+                cell.get_or_init(|| inflate_raw(raw, *size)).as_ref()
+            }
+        }
+    }
+
+    /// uncompressed length without forcing inflation
+    fn data_len(&self) -> usize {
+        match &self.data {
+            EntryData::Ready(b) => b.len(),
+            EntryData::Packed { size, .. } => *size,
+        }
+    }
+
+    /// true while the payload is still the untouched raw deflate stream
+    fn is_packed(&self) -> bool {
+        matches!(&self.data, EntryData::Packed { cell, .. } if cell.get().is_none())
+    }
+
+    fn set_bytes(&mut self, data: Vec<u8>) {
+        self.data = EntryData::Ready(data.into());
+    }
+
+    /// replace the payload, returning the previous (materialized) bytes
+    pub fn swap_bytes(&mut self, data: Vec<u8>) -> Vec<u8> {
+        let old = std::mem::replace(&mut self.data, EntryData::Ready(data.into()));
+        match old {
+            EntryData::Ready(b) => b.to_vec(),
+            EntryData::Packed { raw, size, cell } => match cell.into_inner() {
+                Some(b) => b.to_vec(),
+                None => inflate_raw(&raw, size).to_vec(),
+            },
+        }
+    }
+}
+
 /// In-memory docx package
 #[derive(Debug, Clone)]
 pub struct Package {
-    /// ordered zip entries (name, bytes, original compression method, mtime)
-    pub entries: Vec<(String, Vec<u8>, zip::CompressionMethod, Option<zip::DateTime>)>,
+    /// ordered zip entries
+    pub entries: Vec<Entry>,
     pub index: HashMap<String, usize>,
     /// lazily built sha1 hex per word/media/* entry (image dedup); kept in
     /// sync by `set`
@@ -240,6 +320,9 @@ pub struct Package {
     /// parsed .rels per part (parse once per part; write-through on
     /// save_rels, invalidated by direct `set` of the .rels entry)
     rels_cache: std::cell::RefCell<HashMap<String, std::rc::Rc<Rels>>>,
+    /// original zip bytes: lets `to_bytes` raw-copy untouched packed media
+    /// entries without inflating them
+    source: Option<std::sync::Arc<[u8]>>,
 }
 
 /// Detect the encoding of an XML part from BOM / xml declaration.
@@ -335,30 +418,69 @@ pub fn encode_part_owned(content: String, encoding: &str) -> Vec<u8> {
 
 impl Package {
     pub fn from_bytes(data: &[u8]) -> Result<Package, String> {
+        Self::from_archive(data, None)
+    }
+
+    /// from_bytes sharing the original zip bytes (no copy): untouched packed
+    /// media entries can be raw-copied from it at save time
+    pub fn from_bytes_arc(data: std::sync::Arc<[u8]>) -> Result<Package, String> {
+        let src = data.clone();
+        Self::from_archive(&data, Some(src))
+    }
+
+    fn from_archive(data: &[u8], source: Option<std::sync::Arc<[u8]>>) -> Result<Package, String> {
         let cursor = Cursor::new(data);
         let mut zip = zip::ZipArchive::new(cursor).map_err(|e| e.to_string())?;
         let mut entries = Vec::with_capacity(zip.len());
         let mut index = HashMap::new();
         for i in 0..zip.len() {
-            let mut f = zip.by_index(i).map_err(|e| e.to_string())?;
-            let name = f.name().to_string();
-            let compression = f.compression();
-            let mtime = f.last_modified();
-            let mut buf = Vec::with_capacity(f.size() as usize);
-            f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+            let (name, compression, mtime, size) = {
+                let f = zip.by_index(i).map_err(|e| e.to_string())?;
+                (
+                    f.name().to_string(),
+                    f.compression(),
+                    f.last_modified(),
+                    f.size() as usize,
+                )
+            };
+            // already-compressed media stays as the raw deflate stream until
+            // first access: loading a media-heavy docx skips inflating it
+            let lazy = compression == zip::CompressionMethod::Deflated
+                && incompressible_entry(&name);
+            let data = if lazy {
+                let mut f = zip.by_index_raw(i).map_err(|e| e.to_string())?;
+                let mut raw = Vec::with_capacity(f.compressed_size() as usize);
+                f.read_to_end(&mut raw).map_err(|e| e.to_string())?;
+                EntryData::Packed {
+                    raw: raw.into(),
+                    size,
+                    cell: std::cell::OnceCell::new(),
+                }
+            } else {
+                let mut f = zip.by_index(i).map_err(|e| e.to_string())?;
+                let mut buf = Vec::with_capacity(size);
+                f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+                EntryData::Ready(buf.into())
+            };
             index.insert(name.clone(), entries.len());
-            entries.push((name, buf, compression, mtime));
+            entries.push(Entry {
+                name,
+                data,
+                compression,
+                mtime,
+            });
         }
         Ok(Package {
             entries,
             index,
             media_sha1: HashMap::new(),
             rels_cache: std::cell::RefCell::new(HashMap::new()),
+            source,
         })
     }
 
     pub fn get(&self, name: &str) -> Option<&[u8]> {
-        self.index.get(name).map(|&i| self.entries[i].1.as_slice())
+        self.index.get(name).map(|&i| self.entries[i].bytes())
     }
 
     pub fn get_string(&self, name: &str) -> Option<String> {
@@ -388,7 +510,7 @@ impl Package {
             self.rels_cache.borrow_mut().remove(name);
         }
         if let Some(&i) = self.index.get(name) {
-            self.entries[i].1 = data;
+            self.entries[i].set_bytes(data);
         } else {
             let compression = if incompressible_entry(name) {
                 zip::CompressionMethod::Stored
@@ -396,7 +518,12 @@ impl Package {
                 zip::CompressionMethod::Deflated
             };
             self.index.insert(name.to_string(), self.entries.len());
-            self.entries.push((name.to_string(), data, compression, None));
+            self.entries.push(Entry {
+                name: name.to_string(),
+                data: EntryData::Ready(data.into()),
+                compression,
+                mtime: None,
+            });
         }
     }
 
@@ -407,29 +534,50 @@ impl Package {
     pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
         // rough output estimate: compressed sizes are unknown, but total
         // uncompressed size is a safe upper bound for most docx
-        let est: usize = self.entries.iter().map(|(_, d, _, _)| d.len()).sum();
+        let est: usize = self.entries.iter().map(|e| e.data_len()).sum();
         let mut cursor = Cursor::new(Vec::with_capacity(est));
         {
             let mut writer = zip::ZipWriter::new(&mut cursor);
             let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
-            for (name, data, compression, mtime) in &self.entries {
-                if name.ends_with('/') {
+            // source archive for raw-copying untouched packed media entries
+            // (no inflate + no re-deflate; opened only when needed)
+            let mut src_zip = match &self.source {
+                Some(bytes) if self.entries.iter().any(|e| e.is_packed()) => {
+                    zip::ZipArchive::new(Cursor::new(&bytes[..])).ok()
+                }
+                _ => None,
+            };
+            for entry in &self.entries {
+                if entry.name.ends_with('/') {
                     continue; // skip directory entries (python-docx doesn't write them)
+                }
+                if entry.is_packed() {
+                    if let Some(z) = src_zip.as_mut() {
+                        match z.by_name(&entry.name) {
+                            Ok(f) => {
+                                writer.raw_copy_file(f).map_err(|e| e.to_string())?;
+                                continue;
+                            }
+                            Err(e) => return Err(e.to_string()),
+                        }
+                    }
                 }
                 // already-compressed payloads are stored verbatim: deflate
                 // on them is ~0% gain for the dominant save cost
-                let method = if incompressible_entry(name) {
+                let method = if incompressible_entry(&entry.name) {
                     zip::CompressionMethod::Stored
                 } else {
-                    *compression
+                    entry.compression
                 };
                 let mut options = options.compression_method(method);
-                if let Some(dt) = mtime {
-                    options = options.last_modified_time(*dt);
+                if let Some(dt) = entry.mtime {
+                    options = options.last_modified_time(dt);
                 }
-                writer.start_file(name, options).map_err(|e| e.to_string())?;
-                writer.write_all(data).map_err(|e| e.to_string())?;
+                writer
+                    .start_file(&entry.name, options)
+                    .map_err(|e| e.to_string())?;
+                writer.write_all(entry.bytes()).map_err(|e| e.to_string())?;
             }
             writer.finish().map_err(|e| e.to_string())?;
         }
@@ -516,10 +664,10 @@ impl Package {
     /// entries are computed once and cached (updated by `set`), so inserting
     /// N images costs N blob hashes instead of N × all-media hashing.
     pub fn find_image_by_sha1(&mut self, sha1: &str) -> Option<String> {
-        for (name, data, _, _) in &self.entries {
-            if name.starts_with("word/media/") && !self.media_sha1.contains_key(name) {
-                let h = sha1_hex(data);
-                self.media_sha1.insert(name.clone(), h);
+        for entry in &self.entries {
+            if entry.name.starts_with("word/media/") && !self.media_sha1.contains_key(&entry.name) {
+                let h = sha1_hex(entry.bytes());
+                self.media_sha1.insert(entry.name.clone(), h);
             }
         }
         self.media_sha1
@@ -531,8 +679,8 @@ impl Package {
     /// Next available /word/media/imageN.<ext> partname
     pub fn next_image_partname(&self, ext: &str) -> String {
         let mut used: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for (name, _, _, _) in &self.entries {
-            if let Some(rest) = name.strip_prefix("word/media/image") {
+        for entry in &self.entries {
+            if let Some(rest) = entry.name.strip_prefix("word/media/image") {
                 let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                 if let Ok(n) = num_str.parse::<u32>() {
                     used.insert(n);
@@ -883,8 +1031,8 @@ mod tests {
         assert!(pkg.contains("word/styles.xml"));
         assert!(!pkg.contains("word/missing.xml"));
         assert!(pkg.get("word/missing.xml").is_none());
-        assert_eq!(pkg.entries[0].2, zip::CompressionMethod::Stored);
-        assert_eq!(pkg.entries[1].2, zip::CompressionMethod::Deflated);
+        assert_eq!(pkg.entries[0].compression, zip::CompressionMethod::Stored);
+        assert_eq!(pkg.entries[1].compression, zip::CompressionMethod::Deflated);
 
         let out = pkg.to_bytes().unwrap();
         let mut za = zip::ZipArchive::new(Cursor::new(&out)).unwrap();
@@ -936,12 +1084,12 @@ mod tests {
         pkg.set("a.xml", b"new".to_vec());
         assert_eq!(pkg.get("a.xml"), Some(&b"new"[..]));
         assert_eq!(pkg.entries.len(), 1);
-        assert_eq!(pkg.entries[0].2, zip::CompressionMethod::Stored);
+        assert_eq!(pkg.entries[0].compression, zip::CompressionMethod::Stored);
         // new entry: appended at the end with Deflated
         pkg.set("b.xml", b"x".to_vec());
         assert_eq!(pkg.entries.len(), 2);
-        assert_eq!(pkg.entries[1].0, "b.xml");
-        assert_eq!(pkg.entries[1].2, zip::CompressionMethod::Deflated);
+        assert_eq!(pkg.entries[1].name, "b.xml");
+        assert_eq!(pkg.entries[1].compression, zip::CompressionMethod::Deflated);
         assert_eq!(pkg.get("b.xml"), Some(&b"x"[..]));
     }
 
@@ -990,6 +1138,48 @@ mod tests {
         let rels = pkg.rels("word/document.xml");
         assert!(rels.get("rId5").is_none());
         assert!(rels.get("rId9").is_some());
+    }
+
+    #[test]
+    fn test_package_packed_media_lazy_roundtrip() {
+        // incompressible payload so zip deflate is stored-ish but still Deflated
+        let payload: Vec<u8> = (0..100_000u32).map(|i| (i * 2654435761) as u8).collect();
+        let zip = build_zip(&[
+            ("word/document.xml", b"<doc/>", zip::CompressionMethod::Deflated),
+            ("word/media/big.png", &payload, zip::CompressionMethod::Deflated),
+        ]);
+        let pkg = Package::from_bytes_arc(zip.as_slice().into()).unwrap();
+        // media entry stays packed until accessed
+        let idx = pkg.index["word/media/big.png"];
+        assert!(pkg.entries[idx].is_packed());
+        // first access inflates lazily and yields the original bytes
+        assert_eq!(pkg.get("word/media/big.png"), Some(&payload[..]));
+
+        // untouched packed entries are raw-copied at save: identical payload,
+        // and the png keeps its Deflated method (raw stream copied verbatim)
+        let pkg2 = Package::from_bytes_arc(zip.as_slice().into()).unwrap();
+        let out = pkg2.to_bytes().unwrap();
+        let mut za = zip::ZipArchive::new(Cursor::new(&out)).unwrap();
+        let mut buf = Vec::new();
+        za.by_name("word/media/big.png").unwrap().read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, payload);
+        assert_eq!(
+            za.by_name("word/media/big.png").unwrap().compression(),
+            zip::CompressionMethod::Deflated
+        );
+
+        // overwritten media falls back to the normal Stored write path
+        let mut pkg3 = Package::from_bytes_arc(zip.as_slice().into()).unwrap();
+        pkg3.set("word/media/big.png", b"newpng".to_vec());
+        let out3 = pkg3.to_bytes().unwrap();
+        let mut za3 = zip::ZipArchive::new(Cursor::new(&out3)).unwrap();
+        assert_eq!(
+            za3.by_name("word/media/big.png").unwrap().compression(),
+            zip::CompressionMethod::Stored
+        );
+        let mut buf3 = Vec::new();
+        za3.by_name("word/media/big.png").unwrap().read_to_end(&mut buf3).unwrap();
+        assert_eq!(buf3, b"newpng");
     }
 
     #[test]
@@ -1081,7 +1271,7 @@ mod tests {
         let media: Vec<&String> = pkg
             .entries
             .iter()
-            .map(|(n, _, _, _)| n)
+            .map(|e| &e.name)
             .filter(|n| n.starts_with("word/media/"))
             .collect();
         assert_eq!(media.len(), 2);

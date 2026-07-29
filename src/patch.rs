@@ -118,16 +118,21 @@ fn merge_split_braces_scan(xml: &str) -> String {
     let mut copied = 0usize; // xml[..copied] already flushed to out
     let mut i = 0usize;
     while i < n {
+        // jump to the next candidate delimiter byte (SIMD memchr): open side
+        // '{' ; close side one of '%','}','#'
+        let next = match (
+            memchr::memchr3(b'{', b'%', b'#', &b[i..]),
+            memchr::memchr(b'}', &b[i..]),
+        ) {
+            (Some(a), Some(bb)) => i + a.min(bb),
+            (Some(a), None) => i + a,
+            (None, Some(bb)) => i + bb,
+            (None, None) => break,
+        };
+        i = next;
         let c = b[i];
         // open side: '{' ... one of '{','%','#' ; close side: one of '%','}','#' ... '}'
-        let open_side = match c {
-            b'{' => true,
-            b'%' | b'}' | b'#' => false,
-            _ => {
-                i += 1;
-                continue;
-            }
-        };
+        let open_side = c == b'{';
         // consume consecutive complete `<...>` tags starting at i+1
         let mut j = i + 1;
         while j < n && b[j] == b'<' {
@@ -739,13 +744,28 @@ fn dash_merge_next_scan(xml: &str) -> String {
 /// find `<w:y>` elements containing a `{%y `% / `{{y `% (or `{#y `) tag and
 /// replace the whole element with the bare tag — linear-time equivalent of
 /// docxtpl's regexes.
+///
+/// Marker-first implementation: jinja markers (`{%tr ` etc.) are extremely
+/// rare compared to `<w:y` elements, so we locate markers first (memmem) and
+/// resolve only the elements that enclose them, instead of probing every
+/// element opening in the document.
+///
+/// Exact equivalence with the element-first scan (see git history): the
+/// original walk processes element openings left to right; an element whose
+/// region (up to its first close tag) contains a marker is checked against
+/// the EARLIEST marker in that region; on success the whole region is
+/// replaced by the bare tag and scanning resumes after it; on failure
+/// scanning resumes just after the opening tag, so the same marker is tried
+/// again against the next enclosing open. For a marker at position p the
+/// opens that enclose it form a chain o1 < o2 < ... < ok (for o < o' the
+/// first close after o is <= the first close after o'), and the element-first
+/// walk tries them leftmost-first. The code below collects that chain by
+/// walking backwards from p, then replays the same checks in the same order.
 pub fn element_tag_scan(xml: &str, y: &str, comment: bool) -> String {
     let open_prefix = format!("<w:{}", y);
     let close_tag = format!("</w:{}>", y);
-    let mut out = String::with_capacity(xml.len());
-    let mut i = 0usize;
 
-    // markers to look for inside the element, e.g. "{%tr " / "{{tr " / "{#tr "
+    // markers to look for, e.g. "{%tr " / "{{tr " / "{#tr "
     let m_var = format!("{{{{{} ", y);
     let m_stmt = format!("{{%{} ", y);
     let m_comment = format!("{{#{} ", y);
@@ -755,69 +775,99 @@ pub fn element_tag_scan(xml: &str, y: &str, comment: bool) -> String {
         vec![(m_var.as_str(), "}}"), (m_stmt.as_str(), "%}")]
     };
 
-    while i < xml.len() {
-        // find next `<w:y` opening followed by ' ' or '>'
-        let Some(rel) = xml[i..].find(&open_prefix) else {
-            break;
-        };
-        let open = i + rel;
-        let after_open = open + open_prefix.len();
-        let ok_open = xml[after_open..]
-            .chars()
-            .next()
-            .map(|c| c == ' ' || c == '>')
-            .unwrap_or(false);
-        if !ok_open {
-            out.push_str(&xml[i..after_open]);
-            i = after_open;
+    // collect all marker occurrences (rare) in document order
+    let mut hits: Vec<(usize, &str, &str)> = Vec::new();
+    for (marker, close_tok) in &markers {
+        let mut from = 0usize;
+        while let Some(rel) = xml[from..].find(marker) {
+            hits.push((from + rel, marker, close_tok));
+            from += rel + 1;
+        }
+    }
+    if hits.is_empty() {
+        return xml.to_string();
+    }
+    hits.sort_unstable_by_key(|h| h.0);
+
+    let forbidden: &[char] = if comment { &['#', '}'] } else { &['%', '}'] };
+    let mut out = String::with_capacity(xml.len());
+    let mut copied = 0usize; // everything before `copied` already emitted
+    let mut i = 0usize; // element-first scan position lower bound
+    let mut mi = 0usize; // first unprocessed marker
+
+    while mi < hits.len() {
+        let (p, marker, close_tok) = hits[mi];
+        if p < i {
+            mi += 1; // inside an already-consumed region or skipped open tag
             continue;
         }
-        // element region: up to the first close tag (docxtpl regex behavior)
-        let region_end = xml[after_open..]
-            .find(&close_tag)
-            .map(|c| after_open + c + close_tag.len())
-            .unwrap_or(xml.len());
-        let region = &xml[open..region_end];
-
-        // earliest marker inside the region
-        let mut best: Option<(usize, &str, &str)> = None;
-        for (marker, close_tok) in &markers {
-            if let Some(mp) = region.find(marker) {
-                if best.map(|(b, _, _)| mp < b).unwrap_or(true) {
-                    best = Some((mp, marker, close_tok));
+        // chain of valid opens enclosing p: nearest-first walk backwards
+        let mut chain: Vec<(usize, usize, usize)> = Vec::new(); // (open, after_open, region_end)
+        let mut cursor = p;
+        loop {
+            // nearest valid `<w:y` open before `cursor`
+            let mut end = cursor;
+            let open = loop {
+                let Some(o) = xml[..end].rfind(&open_prefix) else {
+                    break None;
+                };
+                let after = o + open_prefix.len();
+                if matches!(xml.as_bytes().get(after), Some(b' ') | Some(b'>')) {
+                    break Some(o);
                 }
+                end = o; // e.g. `<w:pPr`: not an opening of w:p
+            };
+            let Some(open) = open else { break };
+            if open < i {
+                break; // already consumed/skipped by the element-first walk
+            }
+            let after_open = open + open_prefix.len();
+            let region_end = xml[after_open..]
+                .find(&close_tag)
+                .map(|c| after_open + c + close_tag.len())
+                .unwrap_or(xml.len());
+            if region_end <= p {
+                break; // nearest open does not enclose p: no open does
+            }
+            chain.push((open, after_open, region_end));
+            cursor = open;
+        }
+        // try the chain leftmost-first, like the element-first walk
+        let mut handled = false;
+        for &(open, _after_open, region_end) in chain.iter().rev() {
+            let region = &xml[open..region_end];
+            let after_marker = p - open + marker.len();
+            // close token must appear before any '%'/'}' (statement) or
+            // '#'/'}' (comment), matching [^}%]* / [^}#]* of the regex
+            let inner = region[after_marker..]
+                .find(close_tok)
+                .map(|close_rel| &region[after_marker..after_marker + close_rel]);
+            let ok = inner
+                .map(|inner| !inner.chars().any(|c| forbidden.contains(&c)))
+                .unwrap_or(false);
+            if ok {
+                // emit: everything before the element + bare tag; skip region
+                out.push_str(&xml[copied..open]);
+                out.push_str(&marker[..2]);
+                out.push(' ');
+                out.push_str(inner.unwrap());
+                out.push_str(close_tok);
+                copied = region_end;
+                i = region_end;
+                handled = true;
+                break;
             }
         }
-        let Some((mpos, marker, close_tok)) = best else {
-            // no tag in this element; emit the opening tag and continue inside
-            out.push_str(&xml[i..after_open]);
-            i = after_open;
-            continue;
-        };
-        let after_marker = mpos + marker.len();
-        // close token must appear before any '%'/'}' (statement) or '#'/'}'
-        // (comment), matching [^}%]* / [^}#]* from the original regex
-        let forbidden: &[char] = if comment { &['#', '}'] } else { &['%', '}'] };
-        let Some(close_rel) = region[after_marker..].find(close_tok) else {
-            out.push_str(&xml[i..after_open]);
-            i = after_open;
-            continue;
-        };
-        let inner = &region[after_marker..after_marker + close_rel];
-        if inner.chars().any(|c| forbidden.contains(&c)) {
-            out.push_str(&xml[i..after_open]);
-            i = after_open;
-            continue;
+        if !handled {
+            // whole chain failed: the walk resumes just after the nearest
+            // failed opening tag (markers inside it are skipped via p < i)
+            if let Some(&(_open, after_open, _)) = chain.first() {
+                i = after_open;
+            }
         }
-        // emit: everything before the element + bare tag; skip whole element
-        out.push_str(&xml[i..open]);
-        out.push_str(&marker[..2]);
-        out.push(' ');
-        out.push_str(inner);
-        out.push_str(close_tok);
-        i = region_end;
+        mi += 1;
     }
-    out.push_str(&xml[i.min(xml.len())..]);
+    out.push_str(&xml[copied..]);
     out
 }
 
@@ -839,12 +889,16 @@ fn strip_tags_in_jinja_scan(xml: &str) -> String {
         // earliest opener among {% {# {{
         let mut o = None;
         let mut i = 0usize;
-        while i + 1 < b.len() {
-            if b[i] == b'{' && matches!(b[i + 1], b'{' | b'%' | b'#') {
-                o = Some(i);
+        while let Some(rel) = memchr::memchr(b'{', &b[i..]) {
+            let p = i + rel;
+            if p + 1 >= b.len() {
                 break;
             }
-            i += 1;
+            if matches!(b[p + 1], b'{' | b'%' | b'#') {
+                o = Some(p);
+                break;
+            }
+            i = p + 1;
         }
         let Some(o) = o else { break };
         let closer = match b[o + 1] {
@@ -1267,13 +1321,27 @@ impl FusedEmitter {
         let mut plain_start = 0usize;
         let mut i = 0usize;
         while i < n {
+            // jump to the next candidate byte (SIMD memchr): '<' or '{',
+            // plus '}'/'%' while inside a clean region
+            let hay = &b[i..];
+            let next = if self.cbuf.is_some() {
+                match (
+                    memchr::memchr3(b'<', b'{', b'}', hay),
+                    memchr::memchr(b'%', hay),
+                ) {
+                    (Some(a), Some(bb)) => i + a.min(bb),
+                    (Some(a), None) => i + a,
+                    (None, Some(bb)) => i + bb,
+                    (None, None) => break,
+                }
+            } else {
+                match memchr::memchr2(b'<', b'{', hay) {
+                    Some(a) => i + a,
+                    None => break,
+                }
+            };
+            i = next;
             let c = b[i];
-            let candidate =
-                c == b'<' || c == b'{' || (self.cbuf.is_some() && (c == b'}' || c == b'%'));
-            if !candidate {
-                i += 1;
-                continue;
-            }
             let avail = n - i;
             let (tok, len) = match c {
                 b'<' if avail >= 5 => {
@@ -1350,10 +1418,14 @@ fn feed_strip_wt_pairs(s: &str, em: &mut FusedEmitter) {
         // earliest "<w:t>" or "<w:t ...>" opening tag after the close tag
         let mut j = close_start + 6;
         let open_end = loop {
+            let Some(lt) = memchr::memchr(b'<', &b[j..]) else {
+                break None;
+            };
+            j += lt;
             if j + 5 > b.len() {
                 break None;
             }
-            if b[j] == b'<' && b[j + 1..].starts_with(b"w:t") {
+            if b[j + 1..].starts_with(b"w:t") {
                 if b[j + 4] == b'>' {
                     break Some(j + 5);
                 }
@@ -2021,3 +2093,4 @@ mod tests {
         assert_fused_equiv(&long);
     }
 }
+
