@@ -363,8 +363,14 @@ impl PyDocxTemplate {
     }
 
     /// Return the current (rendered) document xml.
-    fn get_xml(&self) -> PyResult<String> {
-        self.core.borrow_mut().get_xml().map_err(to_pyerr)
+    fn get_xml(&self, py: Python<'_>) -> PyResult<String> {
+        // flush + serialize is pure Rust: run it detached from the GIL
+        let core = AssertSend(&self.core);
+        py.detach(move || {
+            let core = core; // capture AssertSend as a whole
+            core.0.borrow_mut().get_xml()
+        })
+        .map_err(to_pyerr)
     }
 
     fn write_xml(&self, filename: &str) -> PyResult<()> {
@@ -374,8 +380,14 @@ impl PyDocxTemplate {
     }
 
     /// Return the docx as bytes (rendered state).
-    fn get_docx_bytes(&self) -> PyResult<Vec<u8>> {
-        self.core.borrow_mut().save_bytes().map_err(to_pyerr)
+    fn get_docx_bytes(&self, py: Python<'_>) -> PyResult<Vec<u8>> {
+        // zip compression is pure Rust: run it detached from the GIL
+        let core = AssertSend(&self.core);
+        py.detach(move || {
+            let core = core; // capture AssertSend as a whole
+            core.0.borrow_mut().save_bytes()
+        })
+        .map_err(to_pyerr)
     }
 
     /// Undeclared jinja variables used in the template.

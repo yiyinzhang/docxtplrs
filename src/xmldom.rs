@@ -5,10 +5,93 @@
 use quick_xml::events::{BytesDecl, Event};
 use quick_xml::Reader;
 
+/// Interned element/attribute name. Cloning is an Rc refcount bump, and
+/// `Document::parse` deduplicates names through an intern table: a multi-MB
+/// docx (tens of thousands of elements sharing a few dozen distinct names)
+/// would otherwise allocate a fresh String per element and per attribute
+/// key (~740k allocations on large renders, dominating xmldom parse time).
+///
+/// `Deref<Target = str>` and `PartialEq<&str>` keep existing call sites
+/// (`el.name == "w:p"`, `el.name.starts_with(..)`, `format!("{}", el.name)`)
+/// working unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Name(pub std::rc::Rc<str>);
+
+impl Name {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for Name {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for Name {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Name {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for Name {
+    fn from(s: &str) -> Self {
+        Name(std::rc::Rc::from(s))
+    }
+}
+
+impl From<String> for Name {
+    fn from(s: String) -> Self {
+        Name(s.into())
+    }
+}
+
+impl PartialEq<&str> for Name {
+    fn eq(&self, other: &&str) -> bool {
+        &*self.0 == *other
+    }
+}
+
+impl PartialEq<Name> for &str {
+    fn eq(&self, other: &Name) -> bool {
+        *self == &*other.0
+    }
+}
+
+impl PartialEq<&str> for &Name {
+    fn eq(&self, other: &&str) -> bool {
+        &***self as &str == *other
+    }
+}
+
+/// Name dedup table used during parse.
+#[derive(Default)]
+struct Interner(std::collections::HashSet<std::rc::Rc<str>>);
+
+impl Interner {
+    fn intern(&mut self, raw: &[u8]) -> Name {
+        let s = String::from_utf8_lossy(raw);
+        if let Some(rc) = self.0.get(s.as_ref()) {
+            return Name(rc.clone());
+        }
+        let rc: std::rc::Rc<str> = s.as_ref().into();
+        self.0.insert(rc.clone());
+        Name(rc)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Element {
-    pub name: String,
-    pub attrs: Vec<(String, String)>,
+    pub name: Name,
+    pub attrs: Vec<(Name, String)>,
     pub children: Vec<Node>,
 }
 
@@ -74,7 +157,7 @@ fn escape_attr(s: &str, out: &mut String) {
 impl Element {
     pub fn new(name: &str) -> Self {
         Element {
-            name: name.to_string(),
+            name: name.into(),
             attrs: Vec::new(),
             children: Vec::new(),
         }
@@ -91,7 +174,7 @@ impl Element {
         if let Some(slot) = self.attrs.iter_mut().find(|(k, _)| k == name) {
             slot.1 = value.to_string();
         } else {
-            self.attrs.push((name.to_string(), value.to_string()));
+            self.attrs.push((name.into(), value.to_string()));
         }
     }
 
@@ -183,15 +266,16 @@ impl Document {
         let mut prolog = String::new();
         let mut stack: Vec<Element> = Vec::new();
         let mut root: Option<Element> = None;
+        let mut interner = Interner::default();
 
         loop {
             match reader.read_event().map_err(|e| e.to_string())? {
                 Event::Start(e) => {
-                    let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                    let name = interner.intern(e.name().as_ref());
                     let mut attrs = Vec::new();
                     for a in e.attributes() {
                         let a = a.map_err(|e| e.to_string())?;
-                        let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+                        let key = interner.intern(a.key.as_ref());
                         let val = a
                             .decode_and_unescape_value(reader.decoder())
                             .map_err(|e| e.to_string())?
@@ -205,11 +289,11 @@ impl Document {
                     });
                 }
                 Event::Empty(e) => {
-                    let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                    let name = interner.intern(e.name().as_ref());
                     let mut attrs = Vec::new();
                     for a in e.attributes() {
                         let a = a.map_err(|e| e.to_string())?;
-                        let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+                        let key = interner.intern(a.key.as_ref());
                         let val = a
                             .decode_and_unescape_value(reader.decoder())
                             .map_err(|e| e.to_string())?
@@ -354,7 +438,7 @@ mod tests {
         // insertion order is preserved
         assert_eq!(
             e.attrs,
-            vec![("x".to_string(), "1".to_string()), ("y".to_string(), "2".to_string())]
+            vec![("x".into(), "1".to_string()), ("y".into(), "2".to_string())]
         );
     }
 

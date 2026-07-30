@@ -98,6 +98,37 @@ where
 }
 
 /// simple literal replacement with $ group references
+/// Single-sweep replacement for `contains_any(xml, &["{<","%<","}<","#<"])`:
+/// a match is a '<' directly preceded by a jinja delimiter byte. 4 memmem
+/// sweeps collapse into one SIMD memchr scan.
+fn gate_delim_tag(xml: &str) -> bool {
+    let b = xml.as_bytes();
+    let mut i = 0usize;
+    while let Some(rel) = memchr::memchr(b'<', &b[i..]) {
+        let p = i + rel;
+        if p > 0 && matches!(b[p - 1], b'{' | b'%' | b'}' | b'#') {
+            return true;
+        }
+        i = p + 1;
+    }
+    false
+}
+
+/// Single-sweep replacement for `contains_any(xml, &["{{","{%","{#"])`:
+/// a match is a '{' directly followed by one of '{','%','#'.
+fn gate_jinja_open(xml: &str) -> bool {
+    let b = xml.as_bytes();
+    let mut i = 0usize;
+    while let Some(rel) = memchr::memchr(b'{', &b[i..]) {
+        let p = i + rel;
+        if matches!(b.get(p + 1), Some(b'{') | Some(b'%') | Some(b'#')) {
+            return true;
+        }
+        i = p + 1;
+    }
+    false
+}
+
 /// True when `hay` contains at least one of `needles`.
 #[inline]
 fn contains_any(hay: &str, needles: &[&str]) -> bool {
@@ -294,7 +325,7 @@ pub fn patch_xml(src_xml: &str) -> Cow<'_, str> {
     // (hand-rolled linear scan; fancy_regex spends ~20ms/500KB here even when
     // nothing matches)
     // gate: a match requires a delimiter directly followed by a tag
-    let mut xml: Cow<'_, str> = if contains_any(src_xml, &["{<", "%<", "}<", "#<"]) {
+    let mut xml: Cow<'_, str> = if gate_delim_tag(src_xml) {
         Cow::Owned(timed!("merge_split_braces", merge_split_braces_scan(src_xml)))
     } else {
         Cow::Borrowed(src_xml)
@@ -322,12 +353,20 @@ pub fn patch_xml(src_xml: &str) -> Cow<'_, str> {
     // that interleaving, so templates with those (rare) markers keep the
     // original three-pass sequence below.
     let mut cell_directive = xml.contains("colspan") || xml.contains("cellbg");
-    if contains_any(&xml, &["{{", "{%", "{#"]) {
+    // directive gates precomputed on the post-jinja-pass string (saves the
+    // re-scan in the colspan/cellbg branches below)
+    let mut gate_colspan: Option<bool> = None;
+    let mut gate_cellbg: Option<bool> = None;
+    if gate_jinja_open(&xml) {
         if cell_directive {
             pass!("strip_tags_in_jinja", strip_tags_in_jinja_scan(&xml));
         } else {
             let fused = timed!("fused_jinja", fused_jinja_scan(&xml));
-            if fused.contains("colspan") || fused.contains("cellbg") {
+            // compute both directive gates in one shot: the gate pair below
+            // re-checks the same string
+            let fused_colspan = fused.contains("colspan");
+            let fused_cellbg = fused.contains("cellbg");
+            if fused_colspan || fused_cellbg {
                 // pathological: the marker was formed across a stripped run
                 // split — redo with the original pass order so colspan/cellbg
                 // still run between strip_tags_in_jinja and space_preserve
@@ -335,12 +374,14 @@ pub fn patch_xml(src_xml: &str) -> Cow<'_, str> {
                 cell_directive = true;
             } else {
                 xml = Cow::Owned(fused);
+                gate_colspan = Some(false);
+                gate_cellbg = Some(false);
             }
         }
     }
 
     // manage table cell colspan
-    if xml.contains("colspan") {
+    if gate_colspan.unwrap_or_else(|| xml.contains("colspan")) {
     pass!("colspan", sub(
         r"(?s)(<w:tc[ >](?:(?!<w:tc[ >]).)*)\{%\s*colspan\s+([^%]*)\s*%\}(.*?</w:tc>)",
         |m| {
@@ -368,7 +409,9 @@ pub fn patch_xml(src_xml: &str) -> Cow<'_, str> {
     }
 
     // manage table cell background color
-    if xml.contains("cellbg") {
+    // (valid when the colspan gate above was precomputed false: the colspan
+    // pass then skipped and the string is unchanged)
+    if gate_cellbg.unwrap_or_else(|| xml.contains("cellbg")) {
     pass!("cellbg", sub(
         r"(?s)(<w:tc[ >](?:(?!<w:tc[ >]).)*)\{%\s*cellbg\s+([^%]*)\s*%\}(.*?</w:tc>)",
         |m| {
@@ -573,25 +616,80 @@ fn find_first_elem<'a>(s: &'a str, open: &str, close: &str) -> Option<&'a str> {
 /// scans (the backtracking VM dominated render time for listing-heavy
 /// templates): for each `<w:p>` containing a listing char, rewrite \t, \n,
 /// \x07, \x0c inside its `<w:t>` elements.
+///
+/// Marker-first: listing chars are rare, so we locate them with SIMD memchr
+/// and resolve only the enclosing paragraph (nearest valid `<w:p` open whose
+/// region, up to the first `</w:p>`, contains the char — `<w:p>` never
+/// nests). Paragraphs without listing chars are bulk-copied instead of being
+/// walked one by one. Chars outside any paragraph (e.g. newlines left
+/// between paragraphs by the jinja newline pass) pass through verbatim,
+/// exactly like the sequential scan's gap copying.
 fn resolve_listing_scan(xml: &str) -> String {
-    let mut out = String::with_capacity(xml.len());
-    let mut rest = xml;
-    while let Some((ps, pe)) = find_open_tag(rest, "<w:p") {
-        // non-greedy up to the FIRST </w:p>; without one no match is
-        // possible here or anywhere further
-        let Some(close) = rest[pe..].find("</w:p>") else { break };
-        let para_end = pe + close + "</w:p>".len();
-        let whole = &rest[ps..para_end];
-        out.push_str(&rest[..ps]);
-        // fast path: a paragraph without listing chars is verbatim
-        if whole.contains(['\t', '\n', '\u{7}', '\u{c}']) {
-            resolve_paragraph_scan(whole, &mut out);
-        } else {
-            out.push_str(whole);
+    let b = xml.as_bytes();
+    let n = b.len();
+    let mut out = String::with_capacity(n);
+    let mut copied = 0usize; // xml[..copied] already flushed to out
+    let mut i = 0usize;
+    while i < n {
+        // next listing char (SIMD memchr): \t \n \x07 \x0c
+        let next = match (
+            memchr::memchr3(b'\t', b'\n', 0x07, &b[i..]),
+            memchr::memchr(0x0c, &b[i..]),
+        ) {
+            (Some(a), Some(bb)) => i + a.min(bb),
+            (Some(a), None) => i + a,
+            (None, Some(bb)) => i + bb,
+            (None, None) => break,
+        };
+        // enclosing paragraph: the sequential scan processes opens left to
+        // right, so the char's paragraph is the LEFTMOST valid open (at or
+        // after `copied`) whose region — up to the first `</w:p>` — contains
+        // it. For opens o1 < o2 the first close after o1 is <= the first
+        // close after o2, so the enclosing opens form a chain; walk it
+        // backwards from the nearest open to find the leftmost member.
+        let mut end = next;
+        let mut para: Option<(usize, usize)> = None; // (open_start, region_end)
+        loop {
+            let mut open = None;
+            while let Some(ps) = xml[..end].rfind("<w:p") {
+                let after = ps + 4;
+                if matches!(b.get(after), Some(b' ') | Some(b'>')) {
+                    open = Some((ps, after));
+                    break;
+                }
+                end = ps; // e.g. `<w:pPr`: not an opening of w:p
+            }
+            let Some((ps, after)) = open else { break };
+            if ps < copied {
+                break; // already consumed by the sequential walk
+            }
+            let Some(close) = xml[after..].find("</w:p>") else {
+                // without a close no later paragraph can have one either:
+                // everything left passes through verbatim
+                out.push_str(&xml[copied..]);
+                return out;
+            };
+            let para_end = after + close + "</w:p>".len();
+            if para_end <= next {
+                break; // nearest open does not enclose the char: no open does
+            }
+            para = Some((ps, para_end));
+            end = ps;
         }
-        rest = &rest[para_end..];
+        match para {
+            Some((ps, para_end)) => {
+                // rewrite the paragraph, bulk-copy everything before it
+                out.push_str(&xml[copied..ps]);
+                resolve_paragraph_scan(&xml[ps..para_end], &mut out);
+                copied = para_end;
+                i = para_end;
+            }
+            None => {
+                i = next + 1; // char outside any paragraph: verbatim
+            }
+        }
     }
-    out.push_str(rest);
+    out.push_str(&xml[copied..]);
     out
 }
 
@@ -1156,6 +1254,9 @@ struct FusedEmitter {
     /// clean-region content accumulator: Some while inside `{{`/`{%` .. first
     /// `}}`/`%}`; cleaned with clean_tag_content when the region closes
     cbuf: Option<String>,
+    /// kept buffer for the next clean region (jinja tags come in thousands;
+    /// reusing one allocation avoids a fresh String per tag)
+    cbuf_spare: String,
     /// undecided token prefix carried across feed() boundaries (<=4 ASCII)
     carry: Vec<u8>,
     /// a `<w:t>` was seen but not yet emitted: its space_preserve decision is
@@ -1172,6 +1273,7 @@ impl FusedEmitter {
         FusedEmitter {
             out: String::with_capacity(cap),
             cbuf: None,
+            cbuf_spare: String::new(),
             carry: Vec::new(),
             pending_wt: false,
             hold: String::new(),
@@ -1201,13 +1303,16 @@ impl FusedEmitter {
     fn flush_pending(&mut self, tag: &str) {
         debug_assert!(self.pending_wt);
         self.pending_wt = false;
-        let hold = std::mem::take(&mut self.hold);
+        let mut hold = std::mem::take(&mut self.hold);
         let dest = match &mut self.cbuf {
             Some(b) => b,
             None => &mut self.out,
         };
         dest.push_str(tag);
         dest.push_str(&hold);
+        // keep hold's allocation for the next pending region
+        hold.clear();
+        self.hold = hold;
     }
 
     /// exact `<w:t>` seen in the stream
@@ -1237,14 +1342,15 @@ impl FusedEmitter {
             Some(b) => b.push_str(two),
             None => {
                 self.out.push_str(two);
-                self.cbuf = Some(String::new());
+                // reuse the previous region's buffer (capacity, no alloc)
+                self.cbuf = Some(std::mem::take(&mut self.cbuf_spare));
             }
         }
     }
 
     /// `}}` or `%}` seen while inside a clean region
     fn on_clean_close(&mut self, two: &str) {
-        let buf = self.cbuf.take().unwrap();
+        let mut buf = self.cbuf.take().unwrap();
         if self.pending_wt {
             // The pending `<w:t>` sits inside this region but its
             // space_preserve decision is still open (a later opener, before
@@ -1258,13 +1364,18 @@ impl FusedEmitter {
             clean_tag_content(&buf, &mut self.out);
             self.retro_wt = Some(self.out.len());
             self.out.push_str(WT_PLAIN);
-            let hold = std::mem::take(&mut self.hold);
+            let mut hold = std::mem::take(&mut self.hold);
             clean_tag_content(&hold, &mut self.out);
+            hold.clear();
+            self.hold = hold;
         } else {
             clean_tag_content(&buf, &mut self.out);
         }
         // the closer is not consumed by clean_tags: it is plain outside text
         self.out.push_str(two);
+        // keep the buffer for the next clean region
+        buf.clear();
+        self.cbuf_spare = buf;
     }
 
     fn on_token(&mut self, tok: Tok, text: &str) {
@@ -2093,4 +2204,5 @@ mod tests {
         assert_fused_equiv(&long);
     }
 }
+
 

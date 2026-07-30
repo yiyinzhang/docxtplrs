@@ -171,6 +171,27 @@ CPython 3.13 — release builds are faster still):
   (~25x)**), `.rels` lookups are `Rc`-shared, style-id resolution and
   subdoc bookmark renumbering are cached, and the render pipeline skips
   footnotes/core-property work when there are no template tags.
+- **Scanner & allocation round** — the remaining hot scanners are
+  SIMD-vectorized (`memchr` jumps between candidate bytes instead of
+  per-byte loops), the row/paragraph/run element strip locates the rare
+  jinja markers first instead of probing every element open, and
+  `resolve_listing` rewrites only paragraphs that actually contain listing
+  characters, so multi-MB documents are bulk-copied between hits. xmldom
+  element/attribute names are interned (`Rc<str>` over the few dozen
+  distinct names in a docx: parse allocations **740k → 445k, -40%**), and
+  the fused jinja emitter reuses its per-tag buffers (`patch_xml`
+  allocations **20.5k → 31**). Zip entries keep `Arc`-shared payloads — a
+  per-render reload is a refcount bump instead of a full copy — and
+  already-compressed media stay as the raw deflate stream end-to-end
+  (inflated lazily on first access, raw-copied back at save); compression
+  runs on the faster zlib-ng backend, and `get_docx_bytes()`/`get_xml()`
+  also run detached from the GIL. The pure per-part preprocessing chain
+  (entity decode + patch_xml + rewrites) is cached keyed by raw source
+  hash, so a repeated `render()` skips it entirely. On the 8.9MB document
+  (Rust, release build): patch_xml **148ms → 57ms**, table/docPr fix
+  **234ms → 118ms**, save **103ms → ~35ms**, e2e render
+  **673ms → 348ms (-48%)**; repeated render on the 4.2MB media template
+  **0.9ms → 0.4ms**.
 
 ### 1. Usage as a Rust crate
 
@@ -178,7 +199,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-docxtplrs = "0.1.10"
+docxtplrs = "0.1.11"
 minijinja = "2"
 ```
 
@@ -215,7 +236,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # in another uv project
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.10-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.11-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # or editable (local development)
 uv add --editable /path/to/docxtplrs
 ```
@@ -511,6 +532,20 @@ debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会�
   顺序读取 2000 个段落文本：**17.4ms → 0.7ms（约 25 倍）**），`.rels` 查找
   改为 `Rc` 共享，styleId 解析与 subdoc bookmark 重编号带缓存，渲染管线在
   footnotes/core 属性无模板标签时整体跳过。
+- **扫描器与分配轮**：剩余热点扫描器全部 SIMD 化（`memchr` 在候选字节间跳跃，
+  替代逐字节循环），行/段落/run 元素剥离改为先定位稀少的 jinja 标记再反查包围
+  元素（不再探测每个元素开标签），`resolve_listing` 只重写真正含 listing 字符的
+  段落（多 MB 文档在命中点之间整块拷贝）。xmldom 元素名/属性名改为 intern 共享
+  （`Rc<str>`，docx 中不同名字仅几十种：parse 分配 **74 万 → 44.5 万，-40%**），
+  融合的 jinja 发射器复用每标签缓冲（`patch_xml` 分配 **2.05 万 → 31**）。zip
+  条目负载改为 `Arc` 共享——render 重载从全量拷贝变为引用计数自增——已压缩媒体
+  全程保留原始 deflate 流（首次访问才解压，save 时原样拷贝回写）；压缩切换到
+  更快的 zlib-ng 后端，`get_docx_bytes()`/`get_xml()` 同样脱离 GIL 执行。纯函数
+  的 per-part 预处理链（实体解码 + patch_xml + 各重写 pass）按原始源串哈希缓存，
+  重复 `render()` 时整链跳过。8.9MB 文档（Rust，release 构建）：patch_xml
+  **148ms → 57ms**，表格/docPr 修复 **234ms → 118ms**，save
+  **103ms → 约 35ms**，端到端渲染 **673ms → 348ms（-48%）**；4.2MB 媒体模板
+  重复 render **0.9ms → 0.4ms**。
 
 ### 1. Rust 用法
 
@@ -518,7 +553,7 @@ debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会�
 
 ```toml
 [dependencies]
-docxtplrs = "0.1.10"
+docxtplrs = "0.1.11"
 minijinja = "2"
 ```
 
@@ -556,7 +591,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # 在其他 uv 项目中
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.10-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.11-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # 或本地开发模式（editable）
 uv add --editable /path/to/docxtplrs
 ```

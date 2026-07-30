@@ -139,7 +139,7 @@ impl PyXmlElement {
     /// The element tag, e.g. "w:settings".
     #[getter]
     fn tag(&self, py: Python<'_>) -> PyResult<String> {
-        self.read(py, |e| e.name.clone())
+        self.read(py, |e| e.name.to_string())
     }
 
     /// Serialized XML of this element (including children).
@@ -172,7 +172,7 @@ impl PyXmlElement {
         let pairs = self.read(py, |e| e.attrs.clone())?;
         let d = PyDict::new(py);
         for (k, v) in pairs {
-            d.set_item(k, v)?;
+            d.set_item(k.to_string(), v)?;
         }
         Ok(d.unbind())
     }
