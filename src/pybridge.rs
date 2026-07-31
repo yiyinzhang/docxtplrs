@@ -168,15 +168,11 @@ pub fn py_to_value(
         }
         // Nested dicts are wrapped lazily: preserves insertion order on
         // iteration (jinja2 semantics) and defers nested materialization.
-        return Ok(Value::from_object(PyWrapper {
-            obj: obj.clone().unbind(),
-        }));
+        return Ok(Value::from_object(PyWrapper::new(obj.clone().unbind())));
     }
     if obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyTuple>() {
         // sequences are wrapped lazily (jinja2 repr / iteration semantics)
-        return Ok(Value::from_object(PyWrapper {
-            obj: obj.clone().unbind(),
-        }));
+        return Ok(Value::from_object(PyWrapper::new(obj.clone().unbind())));
     }
     // honor the __html__ protocol (jinja2 treats such objects as safe)
     if let Ok(html) = obj.call_method0("__html__") {
@@ -185,9 +181,7 @@ pub fn py_to_value(
         }
     }
     // arbitrary python object: wrap for lazy attribute/method access
-    Ok(Value::from_object(PyWrapper {
-        obj: obj.clone().unbind(),
-    }))
+    Ok(Value::from_object(PyWrapper::new(obj.clone().unbind())))
 }
 
 /// Convert a minijinja value back to a Python object (for call args).
@@ -310,6 +304,21 @@ impl Object for PyNoneObj {
 #[derive(Debug)]
 pub struct PyWrapper {
     pub obj: Py<PyAny>,
+    /// dict item cache: materialized on the first item lookup (one GIL attach
+    /// for the whole dict instead of one attach per attribute access —
+    /// loop-heavy templates look up thousands of attributes). Frozen once
+    /// built: a dict mutated mid-render keeps its first-seen values. Values
+    /// are Option to mirror convert_shallow failures (lookup -> undefined).
+    dict_cache: std::sync::Mutex<Option<std::collections::HashMap<String, Option<Value>>>>,
+}
+
+impl PyWrapper {
+    fn new(obj: Py<PyAny>) -> PyWrapper {
+        PyWrapper {
+            obj,
+            dict_cache: std::sync::Mutex::new(None),
+        }
+    }
 }
 
 impl fmt::Display for PyWrapper {
@@ -377,9 +386,7 @@ fn convert_shallow(obj: &Bound<'_, PyAny>) -> Option<Value> {
         return Some(Value::from(String::from_utf8_lossy(b.as_bytes()).to_string()));
     }
     if obj.is_instance_of::<PyDict>() || obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyTuple>() {
-        return Some(Value::from_object(PyWrapper {
-            obj: obj.clone().unbind(),
-        }));
+        return Some(Value::from_object(PyWrapper::new(obj.clone().unbind())));
     }
     // route through the active render core when available (so that deferred
     // values like InlineImage register correctly), otherwise use a scratch core
@@ -413,16 +420,40 @@ impl Object for PyWrapper {
             let obj = self.obj.bind(py);
             if let Some(name) = key.as_str() {
                 if let Ok(dict) = obj.cast::<PyDict>() {
-                    // dicts: item access first; PyDict::get_item reports a
-                    // miss without raising (avoids a KeyError + getattr
-                    // AttributeError pair per undefined lookup)
-                    match dict.get_item(name) {
-                        Ok(Some(item)) => return convert_shallow(&item),
-                        Ok(None) => {}
-                        Err(_) => return None,
+                    // dicts: item access first. The whole dict is materialized
+                    // once (single attach) and later lookups are cache hits
+                    // with no GIL round-trip at all.
+                    {
+                        let mut c = self.dict_cache.lock().unwrap();
+                        if c.is_none() {
+                            let mut m = std::collections::HashMap::with_capacity(dict.len());
+                            for (k, v) in dict.iter() {
+                                if let Ok(ks) = k.extract::<String>() {
+                                    m.insert(ks, convert_shallow(&v));
+                                }
+                            }
+                            *c = Some(m);
+                        }
                     }
-                    if let Ok(attr) = obj.getattr(name) {
-                        return convert_shallow(&attr);
+                    let hit = self
+                        .dict_cache
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .get(name)
+                        .cloned();
+                    match hit {
+                        Some(Some(v)) => return Some(v),
+                        // conversion failed at materialization: undefined
+                        Some(None) => return None,
+                        // no such item: fall back to attribute access (dict
+                        // subclass attrs), like PyDict::get_item's miss
+                        None => {
+                            if let Ok(attr) = obj.getattr(name) {
+                                return convert_shallow(&attr);
+                            }
+                        }
                     }
                 } else {
                     // attribute access first (like jinja2 getattr)

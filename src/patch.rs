@@ -470,18 +470,51 @@ pub fn patch_xml(src_xml: &str) -> Cow<'_, str> {
     // {%y xxx %} / {{y xxx}} / {#y xxx #} template tag by the tag alone
     // without any surrounding <w:y> tags (hand-rolled linear scan; the
     // original tempered-dot regex overflows the backtrack stack on large
-    // documents)
-    for y in ["tr", "tc", "p", "r"] {
-        let m1 = format!("{{{{{} ", y);
-        let m2 = format!("{{%{} ", y);
-        if xml.contains(&m1) || xml.contains(&m2) {
-            pass!("element_tag_scan", element_tag_scan(&xml, y, false));
+    // documents). Marker positions are collected with aho-corasick sweeps;
+    // a pass that replaces elements SHIFTS all later positions, so the
+    // remaining buckets are re-collected on the new string (matches the
+    // original per-y gate + collect-on-current-string semantics).
+    {
+        const YS: [&str; 4] = ["tr", "tc", "p", "r"];
+        let pats: Vec<String> = YS
+            .iter()
+            .flat_map(|y| [format!("{{{{{} ", y), format!("{{%{} ", y)])
+            .chain(YS[..3].iter().map(|y| format!("{{#{} ", y)))
+            .collect();
+        let ac = aho_corasick::AhoCorasick::new(&pats).unwrap();
+        let mut buckets: [Vec<usize>; 11] = Default::default();
+        fn collect(xml: &str, ac: &aho_corasick::AhoCorasick, from: usize, buckets: &mut [Vec<usize>; 11]) {
+            for b in buckets.iter_mut().skip(from) {
+                b.clear();
+            }
+            for m in ac.find_iter(xml.as_bytes()) {
+                let pi = m.pattern().as_usize();
+                if pi >= from {
+                    buckets[pi].push(m.start());
+                }
+            }
         }
-    }
-    for y in ["tr", "tc", "p"] {
-        let m = format!("{{#{} ", y);
-        if xml.contains(&m) {
-            pass!("element_tag_scan", element_tag_scan(&xml, y, true));
+        collect(&xml, &ac, 0, &mut buckets);
+        for (i, y) in YS.iter().enumerate() {
+            let mut pos = std::mem::take(&mut buckets[2 * i]);
+            pos.extend_from_slice(&buckets[2 * i + 1]);
+            if !pos.is_empty() {
+                pos.sort_unstable();
+                let (new, changed) = element_tag_scan_hits(&xml, y, false, &pos);
+                xml = Cow::Owned(new);
+                if changed {
+                    collect(&xml, &ac, 2 * i + 2, &mut buckets);
+                }
+            }
+        }
+        for (j, y) in YS[..3].iter().enumerate() {
+            if !buckets[8 + j].is_empty() {
+                let (new, changed) = element_tag_scan_hits(&xml, y, true, &buckets[8 + j]);
+                xml = Cow::Owned(new);
+                if changed {
+                    collect(&xml, &ac, 8 + j + 1, &mut buckets);
+                }
+            }
         }
     }
 
@@ -860,45 +893,58 @@ fn dash_merge_next_scan(xml: &str) -> String {
 /// walk tries them leftmost-first. The code below collects that chain by
 /// walking backwards from p, then replays the same checks in the same order.
 pub fn element_tag_scan(xml: &str, y: &str, comment: bool) -> String {
-    let open_prefix = format!("<w:{}", y);
-    let close_tag = format!("</w:{}>", y);
-
-    // markers to look for, e.g. "{%tr " / "{{tr " / "{#tr "
+    // collect marker occurrences (rare) in document order
     let m_var = format!("{{{{{} ", y);
     let m_stmt = format!("{{%{} ", y);
     let m_comment = format!("{{#{} ", y);
-    let markers: Vec<(&str, &str)> = if comment {
-        vec![(m_comment.as_str(), "#}")]
+    let pats: &[String] = if comment {
+        std::slice::from_ref(&m_comment)
     } else {
-        vec![(m_var.as_str(), "}}"), (m_stmt.as_str(), "%}")]
+        &[m_var, m_stmt]
     };
-
-    // collect all marker occurrences (rare) in document order
-    let mut hits: Vec<(usize, &str, &str)> = Vec::new();
-    for (marker, close_tok) in &markers {
+    let mut positions: Vec<usize> = Vec::new();
+    for pat in pats {
         let mut from = 0usize;
-        while let Some(rel) = xml[from..].find(marker) {
-            hits.push((from + rel, marker, close_tok));
+        while let Some(rel) = xml[from..].find(pat.as_str()) {
+            positions.push(from + rel);
             from += rel + 1;
         }
     }
-    if hits.is_empty() {
+    if positions.is_empty() {
         return xml.to_string();
     }
-    hits.sort_unstable_by_key(|h| h.0);
+    positions.sort_unstable();
+    element_tag_scan_hits(xml, y, comment, &positions).0
+}
 
-    let forbidden: &[char] = if comment { &['#', '}'] } else { &['%', '}'] };
+/// element_tag_scan with pre-collected (sorted) marker positions: patch_xml
+/// gathers every y's markers in a single aho-corasick sweep and calls this
+/// directly, skipping both the per-y gate sweeps and the collection scans.
+/// Returns the new string and whether any element was actually replaced
+/// (callers that chain multiple y passes must re-collect positions then).
+fn element_tag_scan_hits(xml: &str, y: &str, comment: bool, positions: &[usize]) -> (String, bool) {
+    let open_prefix = format!("<w:{}", y);
+    let close_tag = format!("</w:{}>", y);
+    // `{%y `/`{{y `/`{#y `: two delimiter bytes + y + space
+    let marker_len = y.len() + 3;
+
     let mut out = String::with_capacity(xml.len());
     let mut copied = 0usize; // everything before `copied` already emitted
     let mut i = 0usize; // element-first scan position lower bound
-    let mut mi = 0usize; // first unprocessed marker
+    let mut any_replaced = false;
 
-    while mi < hits.len() {
-        let (p, marker, close_tok) = hits[mi];
+    for &p in positions {
         if p < i {
-            mi += 1; // inside an already-consumed region or skipped open tag
-            continue;
+            continue; // inside an already-consumed region or skipped open tag
         }
+        // marker kind from its second byte ('{' / '%' / '#')
+        let (close_tok, forbidden): (&str, &[char]) = if comment {
+            ("#}", &['#', '}'])
+        } else if xml.as_bytes().get(p + 1) == Some(&b'{') {
+            ("}}", &['%', '}'])
+        } else {
+            ("%}", &['%', '}'])
+        };
         // chain of valid opens enclosing p: nearest-first walk backwards
         let mut chain: Vec<(usize, usize, usize)> = Vec::new(); // (open, after_open, region_end)
         let mut cursor = p;
@@ -932,9 +978,8 @@ pub fn element_tag_scan(xml: &str, y: &str, comment: bool) -> String {
         }
         // try the chain leftmost-first, like the element-first walk
         let mut handled = false;
-        for &(open, _after_open, region_end) in chain.iter().rev() {
-            let region = &xml[open..region_end];
-            let after_marker = p - open + marker.len();
+        for &(open, _after_open, region_end) in chain.iter().rev() {            let region = &xml[open..region_end];
+            let after_marker = p - open + marker_len;
             // close token must appear before any '%'/'}' (statement) or
             // '#'/'}' (comment), matching [^}%]* / [^}#]* of the regex
             let inner = region[after_marker..]
@@ -946,13 +991,14 @@ pub fn element_tag_scan(xml: &str, y: &str, comment: bool) -> String {
             if ok {
                 // emit: everything before the element + bare tag; skip region
                 out.push_str(&xml[copied..open]);
-                out.push_str(&marker[..2]);
+                out.push_str(&xml[p..p + 2]);
                 out.push(' ');
                 out.push_str(inner.unwrap());
                 out.push_str(close_tok);
                 copied = region_end;
                 i = region_end;
                 handled = true;
+                any_replaced = true;
                 break;
             }
         }
@@ -963,10 +1009,9 @@ pub fn element_tag_scan(xml: &str, y: &str, comment: bool) -> String {
                 i = after_open;
             }
         }
-        mi += 1;
     }
     out.push_str(&xml[copied..]);
-    out
+    (out, any_replaced)
 }
 
 /// Hand-rolled linear equivalent of the strip_tags_in_jinja pass:
@@ -1432,36 +1477,28 @@ impl FusedEmitter {
         let mut plain_start = 0usize;
         let mut i = 0usize;
         while i < n {
-            // jump to the next candidate byte (SIMD memchr): '<' or '{',
-            // plus '}'/'%' while inside a clean region
+            // jump to the next event point: the exact `<w:t>` tag (memmem —
+            // the hundreds of thousands of other `<...>` tags are skipped at
+            // SIMD speed instead of one candidate check each) or a jinja
+            // delimiter byte ('{', plus '}'/'%' inside a clean region)
             let hay = &b[i..];
-            let next = if self.cbuf.is_some() {
-                match (
-                    memchr::memchr3(b'<', b'{', b'}', hay),
-                    memchr::memchr(b'%', hay),
-                ) {
-                    (Some(a), Some(bb)) => i + a.min(bb),
-                    (Some(a), None) => i + a,
-                    (None, Some(bb)) => i + bb,
-                    (None, None) => break,
-                }
+            let p_wt = memchr::memmem::find(hay, b"<w:t>");
+            let p_brace = if self.cbuf.is_some() {
+                memchr::memchr3(b'{', b'}', b'%', hay)
             } else {
-                match memchr::memchr2(b'<', b'{', hay) {
-                    Some(a) => i + a,
-                    None => break,
-                }
+                memchr::memchr(b'{', hay)
+            };
+            let next = match (p_wt, p_brace) {
+                (Some(a), Some(bb)) => i + a.min(bb),
+                (Some(a), None) => i + a,
+                (None, Some(bb)) => i + bb,
+                (None, None) => break,
             };
             i = next;
             let c = b[i];
             let avail = n - i;
             let (tok, len) = match c {
-                b'<' if avail >= 5 => {
-                    if &b[i..i + 5] == b"<w:t>" {
-                        (Some(Tok::Wt), 5)
-                    } else {
-                        (None, 1)
-                    }
-                }
+                b'<' => (Some(Tok::Wt), 5), // memmem matched the exact tag
                 b'{' if avail >= 2 => {
                     if b[i + 1] == b'{' || b[i + 1] == b'%' {
                         (Some(Tok::Open), 2)
@@ -1470,7 +1507,7 @@ impl FusedEmitter {
                     }
                 }
                 b'}' | b'%' if avail >= 2 => {
-                    // only reached inside a clean region (see `candidate`)
+                    // only reached inside a clean region (see p_brace)
                     if b[i + 1] == b'}' {
                         (Some(Tok::Close), 2)
                     } else {
@@ -1494,7 +1531,20 @@ impl FusedEmitter {
                 }
             }
         }
-        self.push_plain(&s[plain_start..]);
+        // tail: the piece may end with a proper prefix of `<w:t>` (memmem
+        // only surfaces full matches): stash it so the next feed can
+        // complete the token
+        let rem = &s[plain_start..];
+        let rb = rem.as_bytes();
+        let mut split = rb.len();
+        for l in (1..=4usize.min(rb.len())).rev() {
+            if rb[rb.len() - l..] == b"<w:t>"[..l] {
+                split = rb.len() - l;
+                break;
+            }
+        }
+        self.push_plain(&rem[..split]);
+        self.carry.extend_from_slice(&rb[split..]);
     }
 
     fn finish(mut self) -> String {
@@ -1718,6 +1768,33 @@ mod tests {
         // 后面根本没有 `<w:t>`；空输入
         assert_eq!(dash_merge_next_scan("-%}junk"), "-%}junk");
         assert_eq!(dash_merge_next_scan(""), "");
+    }
+
+    /// element_tag AC 驱动：多个 y 混合 + 非 ASCII 文本时，前一趟替换
+    /// 移位后必须重新收集位置（回归：曾用失效位置切片导致 char boundary panic）
+    #[test]
+    fn test_element_tag_multi_y_cjk() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "<w:p><w:r><w:t>{%p 断 %}</w:t></w:r></w:p><w:tr><w:tc><w:p>{%tr for x in rows %}</w:p></w:tc></w:tr>",
+                "{% 断 %}{% for x in rows %}",
+            ),
+            (
+                "<w:tr><w:p>{%tr 断 %}</w:p></w:tr><w:p>{%p x %}</w:p>",
+                "{% 断 %}{% x %}",
+            ),
+            (
+                "<w:tc><w:p>{%tc 断 %}</w:p></w:tc><w:p>{%p y %}</w:p>",
+                "{% 断 %}{% y %}",
+            ),
+            (
+                "<w:p>{%p 断 %}</w:p><w:p>{%p 中文 %}</w:p><w:tr>{%tr z %}</w:tr>",
+                "{% 断 %}{% 中文 %}{% z %}",
+            ),
+        ];
+        for (input, expect) in cases {
+            assert_eq!(patch_xml(input).as_ref(), *expect, "input: {}", input);
+        }
     }
 
     /// element_tag_scan：含 `{%y `/`{{y `/`{#y ` 标签的 `<w:y>` 元素
@@ -2204,5 +2281,6 @@ mod tests {
         assert_fused_equiv(&long);
     }
 }
+
 
 

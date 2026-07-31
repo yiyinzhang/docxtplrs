@@ -310,8 +310,11 @@ impl TplCore {
         let ctx_once: &CtxFn = &|_core, _part| Ok(ctx.clone());
 
         // Body
-        let src = self.pkg()?.get_string(DOCUMENT_PART)
+        let src_bytes = self
+            .pkg()?
+            .get_arc(DOCUMENT_PART)
             .ok_or_else(|| "word/document.xml not found".to_string())?;
+        let src = crate::package::decode_part_cow(&src_bytes);
         // fix tables / docPr / cNvPr ids only after every part has rendered:
         // used_subdoc is final by then, so the body is parsed+serialized once
         let body_rendered = self.render_part_with(DOCUMENT_PART, &src, autoescape, ctx_once)?;
@@ -320,10 +323,10 @@ impl TplCore {
         for uri in [rel_type::HEADER, rel_type::FOOTER] {
             let parts = self.header_footer_parts(uri);
             for part in parts {
-                let src = match self.pkg()?.get_string(&part) {
-                    Some(s) => s,
-                    None => continue,
+                let Some(src_bytes) = self.pkg()?.get_arc(&part) else {
+                    continue;
                 };
+                let src = crate::package::decode_part_cow(&src_bytes);
                 let rendered = self.render_part_with(&part, &src, autoescape, ctx_once)?;
                 self.set_part_rendered(&part, rendered);
             }
@@ -2713,6 +2716,12 @@ fn fix_tables_docpr_cnvpr(
         }
         return Ok(s);
     }
+    // pure-table case (no docPr/cNvPr work): a read-only string scan decides
+    // whether any table grid actually needs fixing — the common case after
+    // rendering is "no", which skips the full DOM parse+walk entirely
+    if !has_docpr && cnvpr_next.is_none() && tables_fix_scan(xml) == TblScan::NoFix {
+        return Ok(xml.to_string());
+    }
     // If the rendered xml is not well-formed (e.g. unescaped values without
     // autoescape), attempt recovery first (docxtpl uses an lxml recover-mode
     // parser). As a last resort, apply regex-based fixes so table grids and
@@ -3061,4 +3070,460 @@ fn fix_one_table(tbl: &mut Element) -> bool {
         }
     }
     changed
+}
+
+// ---------------- table grid fix pre-scan ----------------
+
+/// Outcome of the read-only string scan that decides whether any table needs
+/// grid fixes (see fix_tables_docpr_cnvpr).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TblScan {
+    /// every table's grid is consistent with its rows: no DOM round-trip needed
+    NoFix,
+    /// at least one table would be modified by fix_one_table
+    NeedsFix,
+    /// unusual construct: fall back to the DOM path
+    Bail,
+}
+
+/// Streaming, allocation-free equivalent of running fix_one_table's
+/// *decision* on every `w:tbl` in the document. Replicates the DOM version's
+/// semantics exactly:
+/// - the grid is the FIRST direct `w:tblGrid` child (a table without one is
+///   never fixed); gridCols are its direct children, `w:w` parsed as f64
+///   with 0.0 on failure;
+/// - every descendant `w:tr` (including rows of nested tables) contributes
+///   its direct `w:tc` children count and the gridSpan-adjusted cell sum
+///   (first direct `w:tcPr` > first direct `w:gridSpan` > `w:val` as usize,
+///   else 1);
+/// - changed iff (max_cells - n_columns > 0 && width_sum > 0 && n_columns > 0)
+///   or (columns_len(after the simulated add) - cells_len_max > 0).
+/// Anything unusual (comments, CDATA, doctype, entities inside the two
+/// attribute values we must parse, malformed markup) bails to the DOM path.
+fn tables_fix_scan(xml: &str) -> TblScan {
+    let b = xml.as_bytes();
+    let n = b.len();
+
+    struct TblStats {
+        has_grid: bool,
+        n_columns: usize,
+        width_sum: f64,
+        max_cells: usize,
+        cells_len_max: usize,
+    }
+    enum Frame {
+        Table(usize),
+        Grid(usize),
+        Tr { cells: usize, len_sum: usize },
+        Tc { seen_tcpr: bool, span: Option<usize> },
+        TcPr { seen_gs: bool },
+        Other(usize, usize), // name byte range into xml
+    }
+
+    let mut stack: Vec<Frame> = Vec::with_capacity(16);
+    let mut tbls: Vec<TblStats> = Vec::new();
+
+    // apply a finished row's stats to every enclosing table
+    macro_rules! apply_row {
+        ($stack:expr, $tbls:expr, $cells:expr, $len_sum:expr) => {
+            for fr in $stack.iter() {
+                if let Frame::Table(idx) = fr {
+                    let t = &mut $tbls[*idx];
+                    t.max_cells = t.max_cells.max($cells);
+                    t.cells_len_max = t.cells_len_max.max($len_sum);
+                }
+            }
+        };
+    }
+
+    let mut i = 0usize;
+    while i < n {
+        let Some(rel) = memchr::memchr(b'<', &b[i..]) else { break };
+        let lt = i + rel;
+        if lt + 1 >= n {
+            return TblScan::Bail;
+        }
+        i = match b[lt + 1] {
+            b'?' => match xml[lt + 2..].find("?>") {
+                Some(k) => lt + 2 + k + 2,
+                None => return TblScan::Bail,
+            },
+            b'!' => {
+                if xml[lt..].starts_with("<!--") {
+                    match xml[lt + 4..].find("-->") {
+                        Some(k) => lt + 4 + k + 3,
+                        None => return TblScan::Bail,
+                    }
+                } else if xml[lt..].starts_with("<![CDATA[") {
+                    match xml[lt + 9..].find("]]>") {
+                        Some(k) => lt + 9 + k + 3,
+                        None => return TblScan::Bail,
+                    }
+                } else {
+                    return TblScan::Bail; // doctype etc.
+                }
+            }
+            b'/' => {
+                // end tag: `</name S? >`
+                let mut j = lt + 2;
+                let name_start = j;
+                while j < n && !b[j].is_ascii_whitespace() && b[j] != b'>' {
+                    j += 1;
+                }
+                let name = &xml[name_start..j];
+                while j < n && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j >= n || b[j] != b'>' || name.is_empty() {
+                    return TblScan::Bail;
+                }
+                let Some(frame) = stack.pop() else {
+                    return TblScan::Bail;
+                };
+                let matches = match &frame {
+                    Frame::Table(_) => name == "w:tbl",
+                    Frame::Grid(_) => name == "w:tblGrid",
+                    Frame::Tr { .. } => name == "w:tr",
+                    Frame::Tc { .. } => name == "w:tc",
+                    Frame::TcPr { .. } => name == "w:tcPr",
+                    Frame::Other(s, e) => name == &xml[*s..*e],
+                };
+                if !matches {
+                    return TblScan::Bail;
+                }
+                match frame {
+                    Frame::Tr { cells, len_sum } => apply_row!(stack, tbls, cells, len_sum),
+                    Frame::Tc { span, .. } => {
+                        // parent is the row that pushed this cell
+                        if let Some(Frame::Tr { len_sum, .. }) = stack.last_mut() {
+                            *len_sum += span.unwrap_or(1);
+                        }
+                    }
+                    Frame::Table(idx) => {
+                        let t = &tbls[idx];
+                        if t.has_grid {
+                            let ncols = t.n_columns;
+                            let to_add = t.max_cells.saturating_sub(ncols);
+                            let executed = to_add > 0 && t.width_sum > 0.0 && ncols > 0;
+                            let columns_len = if executed { ncols + to_add } else { ncols };
+                            let to_remove = columns_len.saturating_sub(t.cells_len_max);
+                            if executed || (to_remove > 0 && columns_len > 0) {
+                                return TblScan::NeedsFix;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                j + 1
+            }
+            _ => {
+                // start / empty tag: name up to a delimiter
+                let mut j = lt + 1;
+                let name_start = j;
+                while j < n && !b[j].is_ascii_whitespace() && b[j] != b'/' && b[j] != b'>' {
+                    j += 1;
+                }
+                if j == name_start {
+                    return TblScan::Bail;
+                }
+                let name = &xml[name_start..j];
+                // find '>' respecting quoted attribute values
+                let mut q: Option<u8> = None;
+                while j < n {
+                    let c = b[j];
+                    match q {
+                        Some(qq) => {
+                            if c == qq {
+                                q = None;
+                            }
+                        }
+                        None => match c {
+                            b'"' | b'\'' => q = Some(c),
+                            b'>' => break,
+                            _ => {}
+                        },
+                    }
+                    j += 1;
+                }
+                if j >= n {
+                    return TblScan::Bail; // unterminated tag
+                }
+                // self-closing: optional whitespace then '/' right before '>'
+                let mut k = j;
+                while k > name_start && b[k - 1].is_ascii_whitespace() {
+                    k -= 1;
+                }
+                let self_closing = k > name_start && b[k - 1] == b'/';
+                let attrs = &xml[name_start + name.len()..k - (self_closing as usize)];
+
+                // attribute value used for gridCol width / gridSpan val:
+                // first occurrence wins (quick-xml iteration order); an
+                // entity inside the value bails (the DOM decodes it first)
+                macro_rules! attr_f64 {
+                    ($attr:literal) => {
+                        match find_attr(attrs, $attr) {
+                            AttrRes::Found(v) => {
+                                if v.contains('&') {
+                                    return TblScan::Bail;
+                                }
+                                v.parse::<f64>().unwrap_or(0.0)
+                            }
+                            AttrRes::Absent => 0.0,
+                            AttrRes::Bad => return TblScan::Bail,
+                        }
+                    };
+                }
+                macro_rules! attr_usize {
+                    ($attr:literal) => {
+                        match find_attr(attrs, $attr) {
+                            AttrRes::Found(v) => {
+                                if v.contains('&') {
+                                    return TblScan::Bail;
+                                }
+                                v.parse::<usize>().ok()
+                            }
+                            AttrRes::Absent => None,
+                            AttrRes::Bad => return TblScan::Bail,
+                        }
+                    };
+                }
+
+                match name {
+                    "w:tbl" => {
+                        if self_closing {
+                            // gridless table: never fixed
+                        } else {
+                            tbls.push(TblStats {
+                                has_grid: false,
+                                n_columns: 0,
+                                width_sum: 0.0,
+                                max_cells: 0,
+                                cells_len_max: 0,
+                            });
+                            stack.push(Frame::Table(tbls.len() - 1));
+                        }
+                    }
+                    "w:tblGrid" => {
+                        let direct = matches!(stack.last(), Some(Frame::Table(_)));
+                        if self_closing {
+                            if let Some(Frame::Table(idx)) = stack.last() {
+                                tbls[*idx].has_grid = true;
+                            }
+                        } else if direct {
+                            let idx = match stack.last() {
+                                Some(Frame::Table(idx)) => *idx,
+                                _ => unreachable!(),
+                            };
+                            if tbls[idx].has_grid {
+                                // fix_one_table only uses the FIRST tblGrid
+                                stack.push(Frame::Other(name_start, name_start + name.len()));
+                            } else {
+                                tbls[idx].has_grid = true;
+                                stack.push(Frame::Grid(idx));
+                            }
+                        } else {
+                            stack.push(Frame::Other(name_start, name_start + name.len()));
+                        }
+                    }
+                    "w:gridCol" => {
+                        if let Some(Frame::Grid(idx)) = stack.last() {
+                            let idx = *idx;
+                            tbls[idx].n_columns += 1;
+                            tbls[idx].width_sum += attr_f64!("w:w");
+                        }
+                        if !self_closing {
+                            stack.push(Frame::Other(name_start, name_start + name.len()));
+                        }
+                    }
+                    "w:tr" => {
+                        if self_closing {
+                            apply_row!(stack, tbls, 0usize, 0usize);
+                        } else {
+                            stack.push(Frame::Tr { cells: 0, len_sum: 0 });
+                        }
+                    }
+                    "w:tc" => {
+                        let direct = matches!(stack.last(), Some(Frame::Tr { .. }));
+                        if self_closing {
+                            if let Some(Frame::Tr { cells, len_sum }) = stack.last_mut() {
+                                *cells += 1;
+                                *len_sum += 1;
+                            }
+                        } else if direct {
+                            if let Some(Frame::Tr { cells, .. }) = stack.last_mut() {
+                                *cells += 1;
+                            }
+                            stack.push(Frame::Tc { seen_tcpr: false, span: None });
+                        } else {
+                            stack.push(Frame::Other(name_start, name_start + name.len()));
+                        }
+                    }
+                    "w:tcPr" => {
+                        let first = matches!(stack.last(), Some(Frame::Tc { seen_tcpr: false, .. }));
+                        if self_closing {
+                            if let Some(Frame::Tc { seen_tcpr, .. }) = stack.last_mut() {
+                                if !*seen_tcpr {
+                                    *seen_tcpr = true;
+                                }
+                            }
+                        } else if first {
+                            if let Some(Frame::Tc { seen_tcpr, .. }) = stack.last_mut() {
+                                *seen_tcpr = true;
+                            }
+                            stack.push(Frame::TcPr { seen_gs: false });
+                        } else {
+                            stack.push(Frame::Other(name_start, name_start + name.len()));
+                        }
+                    }
+                    "w:gridSpan" => {
+                        let first = matches!(stack.last(), Some(Frame::TcPr { seen_gs: false }));
+                        if first {
+                            if let Some(Frame::TcPr { seen_gs }) = stack.last_mut() {
+                                *seen_gs = true;
+                            }
+                            let v = attr_usize!("w:val").unwrap_or(1);
+                            // the cell frame sits below the tcPr frame
+                            let m = stack.len();
+                            if m >= 2 {
+                                if let Frame::Tc { span, .. } = &mut stack[m - 2] {
+                                    *span = Some(v);
+                                }
+                            }
+                        }
+                        if !self_closing {
+                            stack.push(Frame::Other(name_start, name_start + name.len()));
+                        }
+                    }
+                    _ => {
+                        if !self_closing {
+                            stack.push(Frame::Other(name_start, name_start + name.len()));
+                        }
+                    }
+                }
+                j + 1
+            }
+        };
+    }
+    if !stack.is_empty() {
+        return TblScan::Bail; // unclosed elements: the DOM path recovers
+    }
+    TblScan::NoFix
+}
+
+/// Result of the lenient attribute lookup used by tables_fix_scan.
+enum AttrRes<'a> {
+    Found(&'a str),
+    Absent,
+    Bad,
+}
+
+/// First attribute with `name` in a start tag's attribute region
+/// (`a="v" b='v'` pairs, quick-xml order). Lenient like quick-xml about
+/// whitespace; anything malformed yields Bad (the caller bails to DOM).
+fn find_attr<'a>(attrs: &'a str, name: &str) -> AttrRes<'a> {
+    let b = attrs.as_bytes();
+    let n = b.len();
+    let mut i = 0usize;
+    loop {
+        while i < n && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= n {
+            return AttrRes::Absent;
+        }
+        let name_start = i;
+        while i < n && b[i] != b'=' && !b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let aname = &attrs[name_start..i];
+        while i < n && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= n || b[i] != b'=' {
+            return AttrRes::Bad;
+        }
+        i += 1;
+        while i < n && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= n || (b[i] != b'"' && b[i] != b'\'') {
+            return AttrRes::Bad;
+        }
+        let q = b[i];
+        i += 1;
+        let val_start = i;
+        while i < n && b[i] != q {
+            i += 1;
+        }
+        if i >= n {
+            return AttrRes::Bad;
+        }
+        if aname == name {
+            return AttrRes::Found(&attrs[val_start..i]);
+        }
+        i += 1;
+    }
+}
+
+
+/// tables_fix_scan：畸形输入一律 Bail（交给 DOM/recover 路径），
+    /// 边界语义与 fix_one_table 的判定严格一致
+    #[cfg(test)]
+    mod tbl_scan_tests {
+    use super::*;
+
+    #[test]
+    fn spot_malformed() {
+        // unclosed table/cell -> bail (DOM recover path handles it)
+        assert_eq!(
+            tables_fix_scan("<w:tbl><w:tblGrid><w:gridCol w:w=\"100\"/></w:tblGrid><w:tr><w:tc></w:tc></w:tr>"),
+            TblScan::Bail
+        );
+        // mismatched end tag -> bail
+        assert_eq!(
+            tables_fix_scan("<w:tbl><w:tr></w:tbl>"),
+            TblScan::Bail
+        );
+        // unterminated tag -> bail
+        assert_eq!(tables_fix_scan("<w:tbl><w:tr"), TblScan::Bail);
+        // text that looks like a tag start -> bail
+        assert_eq!(tables_fix_scan("<w:p>a < b</w:p>"), TblScan::Bail);
+        // entity inside a parsed attr value -> bail
+        assert_eq!(
+            tables_fix_scan("<w:tbl><w:tblGrid><w:gridCol w:w=\"4&amp;0\"/></w:tblGrid></w:tbl>"),
+            TblScan::Bail
+        );
+        // doctype -> bail
+        assert_eq!(tables_fix_scan("<!DOCTYPE x><w:tbl></w:tbl>"), TblScan::Bail);
+        // well-formed no-fix cases
+        assert_eq!(
+            tables_fix_scan("<w:document><w:body><w:tbl><w:tblGrid><w:gridCol w:w=\"4000\"/><w:gridCol w:w=\"4000\"/></w:tblGrid><w:tr><w:tc><w:p/></w:tc><w:tc><w:p/></w:tc></w:tr></w:tbl></w:body></w:document>"),
+            TblScan::NoFix
+        );
+        // needs fix: more cells than gridCols (with nonzero widths)
+        assert_eq!(
+            tables_fix_scan("<w:tbl><w:tblGrid><w:gridCol w:w=\"4000\"/></w:tblGrid><w:tr><w:tc/><w:tc/></w:tr></w:tbl>"),
+            TblScan::NeedsFix
+        );
+        // no fix when widths are all zero/unparseable (write-back condition fails)
+        assert_eq!(
+            tables_fix_scan("<w:tbl><w:tblGrid><w:gridCol w:w=\"0\"/></w:tblGrid><w:tr><w:tc/><w:tc/></w:tr></w:tbl>"),
+            TblScan::NoFix
+        );
+        // needs fix: more gridCols than cells
+        assert_eq!(
+            tables_fix_scan("<w:tbl><w:tblGrid><w:gridCol w:w=\"1\"/><w:gridCol w:w=\"1\"/></w:tblGrid><w:tr><w:tc/></w:tr></w:tbl>"),
+            TblScan::NeedsFix
+        );
+        // gridSpan makes the row fit the grid
+        assert_eq!(
+            tables_fix_scan("<w:tbl><w:tblGrid><w:gridCol w:w=\"1\"/><w:gridCol w:w=\"1\"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:gridSpan w:val=\"2\"/></w:tcPr></w:tc></w:tr></w:tbl>"),
+            TblScan::NoFix
+        );
+        // nested table rows count toward the outer table too
+        assert_eq!(
+            tables_fix_scan("<w:tbl><w:tblGrid><w:gridCol w:w=\"1\"/></w:tblGrid><w:tr><w:tc><w:tbl><w:tblGrid><w:gridCol w:w=\"1\"/></w:tblGrid><w:tr><w:tc/><w:tc/></w:tr></w:tbl></w:tc></w:tr></w:tbl>"),
+            TblScan::NeedsFix
+        );
+    }
 }

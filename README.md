@@ -192,6 +192,22 @@ CPython 3.13 — release builds are faster still):
   **234ms → 118ms**, save **103ms → ~35ms**, e2e render
   **673ms → 348ms (-48%)**; repeated render on the 4.2MB media template
   **0.9ms → 0.4ms**.
+- **Structural scan & bridge round** — the table/docPr fix first runs a
+  read-only string scan that decides whether any table grid actually needs
+  changes (exactly replicating `fix_one_table`'s decision logic, nested
+  tables and gridSpan sums included) and skips the full DOM parse+walk when
+  grids are consistent — which they almost always are after rendering
+  (**118ms → 16ms** on the 8.9MB document). Element-tag markers
+  (`{%tr %}`/`{%p %}`/…) are collected in a single aho-corasick sweep
+  instead of 11 memmem gate scans (patch_xml **57ms → 35ms**), the fused
+  jinja emitter locates exact `<w:t>` tags with memmem instead of checking
+  every `<`, unmodified package entries are raw-copied at save (not just
+  media), and part sources are decoded zero-copy on the UTF-8 fast path.
+  On the Python side, dict attribute access is materialized once per dict
+  (one GIL attach) instead of once per lookup: re-rendering the 8.9MB
+  document **185ms → 50ms**, full cycle **367ms → 226ms**, and the
+  small-template speedup vs docxtpl is now **~15-28x**. Overall e2e render
+  on the 8.9MB benchmark: **348ms → ~190ms** (Rust, release build).
 
 ### 1. Usage as a Rust crate
 
@@ -199,7 +215,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-docxtplrs = "0.1.11"
+docxtplrs = "0.1.12"
 minijinja = "2"
 ```
 
@@ -236,7 +252,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # in another uv project
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.11-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.12-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # or editable (local development)
 uv add --editable /path/to/docxtplrs
 ```
@@ -546,6 +562,17 @@ debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会�
   **148ms → 57ms**，表格/docPr 修复 **234ms → 118ms**，save
   **103ms → 约 35ms**，端到端渲染 **673ms → 348ms（-48%）**；4.2MB 媒体模板
   重复 render **0.9ms → 0.4ms**。
+- **结构扫描与桥接轮**：表格/docPr 修复先跑一趟只读字符串扫描，精确复刻
+  `fix_one_table` 的判定逻辑（含嵌套表与 gridSpan 求和），判断是否有表格真的
+  需要修复——渲染后网格几乎总是完好的，此时整个 DOM 解析+遍历直接跳过
+  （8.9MB 文档上 **118ms → 16ms**）。元素标记（`{%tr %}`/`{%p %}` 等）由一趟
+  aho-corasick 多模式扫描统一收集，替代 11 趟 memmem 门控（patch_xml
+  **57ms → 35ms**）；融合的 jinja 发射器改用 memmem 精确定位 `<w:t>`，不再逐个
+  检查 `<`；未修改的包条目在 save 时一律原样拷贝（不再仅限媒体）；part 源串在
+  UTF-8 快路径零拷贝解码。Python 侧 dict 属性访问改为每个 dict 一次 GIL 获取
+  批量物化（不再每个属性一次）：8.9MB 文档重复 render **185ms → 50ms**，完整
+  周期 **367ms → 226ms**，小模板对 docxtpl 提速比升至 **约 15-28 倍**。8.9MB
+  基准端到端渲染：**348ms → 约 190ms**（Rust，release 构建）。
 
 ### 1. Rust 用法
 
@@ -553,7 +580,7 @@ debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会�
 
 ```toml
 [dependencies]
-docxtplrs = "0.1.11"
+docxtplrs = "0.1.12"
 minijinja = "2"
 ```
 
@@ -591,7 +618,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # 在其他 uv 项目中
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.11-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.12-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # 或本地开发模式（editable）
 uv add --editable /path/to/docxtplrs
 ```

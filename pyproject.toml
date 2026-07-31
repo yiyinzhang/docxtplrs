@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "docxtplrs"
-version = "0.1.11"
+version = "0.1.12"
 description = "Rust implementation of python-docx-template (docxtpl) with Python bindings"
 readme = "README.md"
 requires-python = ">=3.13"

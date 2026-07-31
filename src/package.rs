@@ -242,6 +242,10 @@ pub struct Entry {
     data: EntryData,
     pub compression: zip::CompressionMethod,
     pub mtime: Option<zip::DateTime>,
+    /// true while the payload is byte-identical to the source zip entry it
+    /// was loaded from (set()/swap_bytes() clear it): such entries can be
+    /// raw-copied at save time without de/compression
+    pristine: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -286,17 +290,35 @@ impl Entry {
         }
     }
 
-    /// true while the payload is still the untouched raw deflate stream
-    fn is_packed(&self) -> bool {
-        matches!(&self.data, EntryData::Packed { cell, .. } if cell.get().is_none())
+    /// true while the payload can be raw-copied from the source archive:
+    /// either still the untouched raw deflate stream, or any uncompressed
+    /// entry that was never modified since load
+    fn raw_copyable(&self) -> bool {
+        match &self.data {
+            EntryData::Packed { cell, .. } => cell.get().is_none(),
+            EntryData::Ready(_) => self.pristine,
+        }
+    }
+
+    /// decompressed payload as a shared Arc (inflates packed entries on
+    /// first access): callers hold no borrow of the Package
+    pub fn bytes_arc(&self) -> std::sync::Arc<[u8]> {
+        match &self.data {
+            EntryData::Ready(b) => b.clone(),
+            EntryData::Packed { raw, size, cell } => {
+                cell.get_or_init(|| inflate_raw(raw, *size)).clone()
+            }
+        }
     }
 
     fn set_bytes(&mut self, data: Vec<u8>) {
         self.data = EntryData::Ready(data.into());
+        self.pristine = false;
     }
 
     /// replace the payload, returning the previous (materialized) bytes
     pub fn swap_bytes(&mut self, data: Vec<u8>) -> Vec<u8> {
+        self.pristine = false;
         let old = std::mem::replace(&mut self.data, EntryData::Ready(data.into()));
         match old {
             EntryData::Ready(b) => b.to_vec(),
@@ -352,7 +374,8 @@ pub fn detect_encoding(blob: &[u8]) -> String {
 }
 
 /// Decode bytes to a string using the part's declared encoding.
-pub fn decode_part(blob: &[u8]) -> String {
+/// Zero-copy on the UTF-8 fast path (nearly every docx part).
+pub fn decode_part_cow(blob: &[u8]) -> std::borrow::Cow<'_, str> {
     let enc = detect_encoding(blob);
     let (blob, bom_len) = match enc.as_str() {
         "utf-16le" | "utf-16be" => (&blob[blob.len().min(2)..], 2),
@@ -363,7 +386,12 @@ pub fn decode_part(blob: &[u8]) -> String {
     let encoding = encoding_rs::Encoding::for_label(enc.as_bytes())
         .unwrap_or(encoding_rs::UTF_8);
     let (cow, _, _) = encoding.decode(blob);
-    cow.into_owned()
+    cow
+}
+
+/// Decode bytes to a string using the part's declared encoding.
+pub fn decode_part(blob: &[u8]) -> String {
+    decode_part_cow(blob).into_owned()
 }
 
 /// Encode a string for storage, honoring the part's declared encoding.
@@ -468,6 +496,7 @@ impl Package {
                 data,
                 compression,
                 mtime,
+                pristine: true,
             });
         }
         Ok(Package {
@@ -485,6 +514,18 @@ impl Package {
 
     pub fn get_string(&self, name: &str) -> Option<String> {
         self.get(name).map(|b| decode_part(b))
+    }
+
+    /// get_cow without the full-content copy on the UTF-8 fast path
+    /// (render of a multi-MB document part otherwise memcpy's it once)
+    pub fn get_cow(&self, name: &str) -> Option<std::borrow::Cow<'_, str>> {
+        self.get(name).map(decode_part_cow)
+    }
+
+    /// entry payload as a shared Arc (refcount bump; the Package stays
+    /// unborrowed, so callers can mutate it while reading the bytes)
+    pub fn get_arc(&self, name: &str) -> Option<std::sync::Arc<[u8]>> {
+        self.index.get(name).map(|&i| self.entries[i].bytes_arc())
     }
 
     /// declared encoding of a part's current bytes
@@ -523,6 +564,7 @@ impl Package {
                 data: EntryData::Ready(data.into()),
                 compression,
                 mtime: None,
+                pristine: false,
             });
         }
     }
@@ -540,10 +582,10 @@ impl Package {
             let mut writer = zip::ZipWriter::new(&mut cursor);
             let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
-            // source archive for raw-copying untouched packed media entries
-            // (no inflate + no re-deflate; opened only when needed)
+            // source archive for raw-copying untouched entries (no inflate
+            // + no re-deflate; opened only when needed)
             let mut src_zip = match &self.source {
-                Some(bytes) if self.entries.iter().any(|e| e.is_packed()) => {
+                Some(bytes) if self.entries.iter().any(|e| e.raw_copyable()) => {
                     zip::ZipArchive::new(Cursor::new(&bytes[..])).ok()
                 }
                 _ => None,
@@ -552,7 +594,7 @@ impl Package {
                 if entry.name.ends_with('/') {
                     continue; // skip directory entries (python-docx doesn't write them)
                 }
-                if entry.is_packed() {
+                if entry.raw_copyable() {
                     if let Some(z) = src_zip.as_mut() {
                         match z.by_name(&entry.name) {
                             Ok(f) => {
@@ -1141,6 +1183,35 @@ mod tests {
     }
 
     #[test]
+    fn test_package_pristine_xml_raw_copied_and_dirty_rewritten() {
+        let zip = build_zip(&[
+            ("word/document.xml", b"<doc/>", zip::CompressionMethod::Deflated),
+            ("word/styles.xml", b"<styles/>", zip::CompressionMethod::Deflated),
+        ]);
+        let mut pkg = Package::from_bytes_arc(zip.as_slice().into()).unwrap();
+        // touch only document.xml; styles.xml stays pristine
+        pkg.set("word/document.xml", b"<doc>changed</doc>".to_vec());
+        let out = pkg.to_bytes().unwrap();
+        let mut za = zip::ZipArchive::new(Cursor::new(&out)).unwrap();
+        let mut buf = Vec::new();
+        za.by_name("word/document.xml").unwrap().read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"<doc>changed</doc>");
+        let mut buf2 = Vec::new();
+        za.by_name("word/styles.xml").unwrap().read_to_end(&mut buf2).unwrap();
+        assert_eq!(buf2, b"<styles/>");
+        // both deflated (styles raw-copied from the deflated source)
+        assert_eq!(
+            za.by_name("word/styles.xml").unwrap().compression(),
+            zip::CompressionMethod::Deflated
+        );
+
+        // a fully pristine package raw-copies everything: document.xml keeps
+        // the source's exact deflate stream
+        let pkg2 = Package::from_bytes_arc(zip.as_slice().into()).unwrap();
+        assert_eq!(pkg2.to_bytes().unwrap(), zip);
+    }
+
+    #[test]
     fn test_package_packed_media_lazy_roundtrip() {
         // incompressible payload so zip deflate is stored-ish but still Deflated
         let payload: Vec<u8> = (0..100_000u32).map(|i| (i * 2654435761) as u8).collect();
@@ -1151,7 +1222,7 @@ mod tests {
         let pkg = Package::from_bytes_arc(zip.as_slice().into()).unwrap();
         // media entry stays packed until accessed
         let idx = pkg.index["word/media/big.png"];
-        assert!(pkg.entries[idx].is_packed());
+        assert!(pkg.entries[idx].raw_copyable());
         // first access inflates lazily and yields the original bytes
         assert_eq!(pkg.get("word/media/big.png"), Some(&payload[..]));
 
