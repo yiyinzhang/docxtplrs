@@ -1,17 +1,24 @@
 //! docxtplrs: Rust implementation of python-docx-template (docxtpl)
 //! with Python bindings via PyO3.
 
+#[cfg(feature = "python")]
 mod doccomments;
+#[cfg(feature = "python")]
 mod docmodel;
+#[cfg(feature = "python")]
 mod docmodel_add;
 pub mod gettext;
 pub mod image;
 mod inline_image;
+#[cfg(feature = "python")]
 mod jutils;
 pub mod package;
 pub mod patch;
+#[cfg(feature = "python")]
 mod pybridge;
+#[cfg(feature = "python")]
 mod pyclasses;
+#[cfg(feature = "python")]
 mod pyxml;
 pub mod richtext;
 mod subdoc;
@@ -19,11 +26,13 @@ mod subdocbuilder;
 pub mod template;
 pub mod xmldom;
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
+#[cfg(feature = "python")]
 #[pymodule]
 fn docxtplrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("__version__", "0.1.12")?;
+    m.add("__version__", "0.2.0")?;
 
     m.add_class::<pyclasses::PyDocxTemplate>()?;
     m.add_class::<pyclasses::PyRichText>()?;

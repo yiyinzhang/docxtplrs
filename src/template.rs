@@ -5,6 +5,7 @@ use crate::package::{crc32, rel_type, resolve_target, Package};
 use crate::patch::{decode_text_entities, patch_xml, resolve_listing, sub_str};
 use crate::xmldom::{Document, Element, Node};
 use minijinja::{AutoEscape, Environment, Value};
+#[cfg(feature = "python")]
 use pyo3::prelude::PyAnyMethods as _;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -55,10 +56,15 @@ pub struct TplCore {
     /// python object id -> deferred index (per render)
     pub deferred_by_oid: HashMap<usize, usize>,
     /// user-registered jinja customizations (python callables)
+    #[cfg(feature = "python")]
     pub custom_filters: Vec<(String, pyo3::Py<pyo3::PyAny>)>,
+    #[cfg(feature = "python")]
     pub custom_tests: Vec<(String, pyo3::Py<pyo3::PyAny>)>,
+    #[cfg(feature = "python")]
     pub custom_functions: Vec<(String, pyo3::Py<pyo3::PyAny>)>,
+    #[cfg(feature = "python")]
     pub custom_globals: Vec<(String, pyo3::Py<pyo3::PyAny>)>,
+    #[cfg(feature = "python")]
     pub template_loader: Option<pyo3::Py<pyo3::PyAny>>,
     /// set when a subdoc was materialized during the current render
     pub used_subdoc: bool,
@@ -416,6 +422,7 @@ impl TplCore {
         autoescape: bool,
         make_ctx: &CtxFn,
     ) -> Result<String, String> {
+        #[cfg(feature = "python")]
         let prev = crate::pybridge::set_current_render(self as *mut TplCore, part);
         let result = (|| {
             let ctx = make_ctx(self, part)?;
@@ -423,6 +430,7 @@ impl TplCore {
             let dst = resolve_listing(&dst);
             self.materialize_deferred(part, dst.into_owned())
         })();
+        #[cfg(feature = "python")]
         crate::pybridge::restore_current_render(prev);
         result
     }
@@ -610,7 +618,7 @@ impl TplCore {
         let name = "docProps/core.xml";
         // python-docx always provides a core properties part
         if self.package.as_ref().map(|p| !p.contains(name)).unwrap_or(false) {
-            crate::docmodel::ensure_core_part(self.package.as_mut().unwrap());
+            crate::package::ensure_core_part(self.package.as_mut().unwrap());
         }
         let src = match self.pkg()?.get_string(name) {
             Some(s) => s,
@@ -629,6 +637,7 @@ impl TplCore {
             "dc:subject",
             "dc:title",
         ];
+        #[cfg(feature = "python")]
         let prev = crate::pybridge::set_current_render(self as *mut TplCore, name);
         let result = (|| -> Result<(), String> {
             let ctx = make_ctx(self, name)?;
@@ -661,6 +670,7 @@ impl TplCore {
             }
             Ok(())
         })();
+        #[cfg(feature = "python")]
         crate::pybridge::restore_current_render(prev);
         result
     }
@@ -1100,35 +1110,51 @@ pub fn make_env(autoescape: bool, core: &TplCore) -> Environment<'static> {
         if matches!(value.kind(), minijinja::value::ValueKind::Bool) {
             return value.is_true();
         }
-        value
+        #[cfg(feature = "python")]
+        return value
             .as_object()
             .and_then(|o| o.downcast_ref::<crate::pybridge::PyBoolObj>())
             .map(|b| b.0)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        #[cfg(not(feature = "python"))]
+        false
     });
     env.add_test("false", |value: Value| -> bool {
         if matches!(value.kind(), minijinja::value::ValueKind::Bool) {
             return !value.is_true();
         }
-        value
+        #[cfg(feature = "python")]
+        return value
             .as_object()
             .and_then(|o| o.downcast_ref::<crate::pybridge::PyBoolObj>())
             .map(|b| !b.0)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        #[cfg(not(feature = "python"))]
+        false
     });
     env.add_test("boolean", |value: Value| -> bool {
-        matches!(value.kind(), minijinja::value::ValueKind::Bool)
-            || value
-                .as_object()
-                .map(|o| o.downcast_ref::<crate::pybridge::PyBoolObj>().is_some())
-                .unwrap_or(false)
+        if matches!(value.kind(), minijinja::value::ValueKind::Bool) {
+            return true;
+        }
+        #[cfg(feature = "python")]
+        return value
+            .as_object()
+            .map(|o| o.downcast_ref::<crate::pybridge::PyBoolObj>().is_some())
+            .unwrap_or(false);
+        #[cfg(not(feature = "python"))]
+        false
     });
     env.add_test("none", |value: Value| -> bool {
-        matches!(value.kind(), minijinja::value::ValueKind::None)
-            || value
-                .as_object()
-                .map(|o| o.downcast_ref::<crate::pybridge::PyNoneObj>().is_some())
-                .unwrap_or(false)
+        if matches!(value.kind(), minijinja::value::ValueKind::None) {
+            return true;
+        }
+        #[cfg(feature = "python")]
+        return value
+            .as_object()
+            .map(|o| o.downcast_ref::<crate::pybridge::PyNoneObj>().is_some())
+            .unwrap_or(false);
+        #[cfg(not(feature = "python"))]
+        false
     });
     env.add_test("eq_true", |value: Value| -> bool {
         test_eq_true(&value)
@@ -1138,9 +1164,11 @@ pub fn make_env(autoescape: bool, core: &TplCore) -> Environment<'static> {
     });
     env.add_test("callable", |value: Value| -> bool {
         if let Some(o) = value.as_object() {
+            #[cfg(feature = "python")]
             if let Some(w) = o.downcast_ref::<crate::pybridge::PyWrapper>() {
                 return pyo3::Python::attach(|py| w.obj.bind(py).is_callable());
             }
+            let _ = &o;
             // minijinja objects (macros/functions) are callable
             return true;
         }
@@ -1153,6 +1181,7 @@ pub fn make_env(autoescape: bool, core: &TplCore) -> Environment<'static> {
         if matches!(value.kind(), minijinja::value::ValueKind::Map) {
             return true;
         }
+        #[cfg(feature = "python")]
         if let Some(object) = value.as_object() {
             if let Some(wrapper) = object.downcast_ref::<crate::pybridge::PyWrapper>() {
                 return pyo3::Python::attach(|py| {
@@ -1168,6 +1197,7 @@ pub fn make_env(autoescape: bool, core: &TplCore) -> Environment<'static> {
             return true;
         }
         if let Some(object) = value.as_object() {
+            #[cfg(feature = "python")]
             if let Some(wrapper) = object.downcast_ref::<crate::pybridge::PyWrapper>() {
                 return pyo3::Python::attach(|py| {
                     let o = wrapper.obj.bind(py);
@@ -1176,6 +1206,7 @@ pub fn make_env(autoescape: bool, core: &TplCore) -> Environment<'static> {
                         || o.cast::<pyo3::types::PyString>().is_ok()
                 });
             }
+            let _ = &object;
             return value.try_iter().is_ok();
         }
         false
@@ -1232,12 +1263,14 @@ pub fn make_env(autoescape: bool, core: &TplCore) -> Environment<'static> {
     }
 
     // user-registered filters / tests / functions / globals (python callables)
+    #[cfg(feature = "python")]
     for (name, callable) in &core.custom_filters {
         let callable = pyo3::Python::attach(|py| callable.clone_ref(py));
         env.add_filter(name.clone(), move |args: minijinja::value::Rest<Value>, kwargs: minijinja::value::Kwargs| {
             call_python_variadic(&callable, &args.0, &kwargs)
         });
     }
+    #[cfg(feature = "python")]
     for (name, callable) in &core.custom_tests {
         let callable = pyo3::Python::attach(|py| callable.clone_ref(py));
         env.add_test(name.clone(), move |args: minijinja::value::Rest<Value>, kwargs: minijinja::value::Kwargs| {
@@ -1245,16 +1278,19 @@ pub fn make_env(autoescape: bool, core: &TplCore) -> Environment<'static> {
                 .map(|v| v.is_true())
         });
     }
+    #[cfg(feature = "python")]
     for (name, callable) in &core.custom_functions {
         let callable = pyo3::Python::attach(|py| callable.clone_ref(py));
         env.add_function(name.clone(), move |args: minijinja::value::Rest<Value>, kwargs: minijinja::value::Kwargs| {
             call_python_variadic(&callable, &args.0, &kwargs)
         });
     }
+    #[cfg(feature = "python")]
     for (name, value) in &core.custom_globals {
         let v = crate::pybridge::py_to_value_global(value);
         env.add_global(name.clone(), v);
     }
+    #[cfg(feature = "python")]
     if let Some(loader) = &core.template_loader {
         let loader = pyo3::Python::attach(|py| loader.clone_ref(py));
         env.set_loader(make_py_loader(loader));
@@ -1262,6 +1298,7 @@ pub fn make_env(autoescape: bool, core: &TplCore) -> Environment<'static> {
     env
 }
 
+#[cfg(feature = "python")]
 fn make_py_loader(
     loader: pyo3::Py<pyo3::PyAny>,
 ) -> impl Fn(&str) -> Result<Option<String>, minijinja::Error> + Send + Sync + 'static {
@@ -1346,6 +1383,7 @@ fn urlize(s: &str) -> String {
     )
 }
 
+#[cfg(feature = "python")]
 fn call_python_variadic(
     callable: &pyo3::Py<pyo3::PyAny>,
     args: &[Value],
@@ -2437,6 +2475,7 @@ fn percent_format_positional(fmt: &str, args: &[Value]) -> Result<String, miniji
 
 /// Python `== True` semantics: true for booleans True and numbers equal to 1.
 fn test_eq_true(value: &Value) -> bool {
+    #[cfg(feature = "python")]
     if let Some(o) = value.as_object() {
         if let Some(b) = o.downcast_ref::<crate::pybridge::PyBoolObj>() {
             return b.0;
@@ -2453,6 +2492,7 @@ fn test_eq_true(value: &Value) -> bool {
 
 /// Python `== False` semantics.
 fn test_eq_false(value: &Value) -> bool {
+    #[cfg(feature = "python")]
     if let Some(o) = value.as_object() {
         if let Some(b) = o.downcast_ref::<crate::pybridge::PyBoolObj>() {
             return !b.0;

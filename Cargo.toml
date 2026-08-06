@@ -1,6 +1,6 @@
 [package]
 name = "docxtplrs"
-version = "0.1.12"
+version = "0.2.0"
 edition = "2021"
 description = "Rust implementation of python-docx-template (docxtpl): render docx templates with Jinja2 syntax (minijinja), native zip/XML handling, plus optional Python bindings via PyO3"
 license = "LGPL-2.1-or-later"
@@ -22,22 +22,23 @@ exclude = [
 ]
 
 [package.metadata.docs.rs]
-features = []
+features = ["python"]
 
 [lib]
 name = "docxtplrs"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
-extension-module = ["pyo3/extension-module"]
+default = ["python"]
+python = ["dep:pyo3"]
+extension-module = ["python", "pyo3/extension-module"]
 
 [profile.release]
 lto = "fat"
 codegen-units = 1
 
 [dependencies]
-pyo3 = "0.29"
+pyo3 = { version = "0.29", optional = true }
 minijinja = { version = "2", features = ["loader", "unicode", "json", "urlencode"] }
 zip = { version = "2", default-features = false, features = ["deflate-zlib-ng"] }
 fancy-regex = "0.14"

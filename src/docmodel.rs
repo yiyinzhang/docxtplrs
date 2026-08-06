@@ -2280,31 +2280,6 @@ pub const CORE_PROPS: &[(&str, &str)] = &[
     ("modified", "dcterms:modified"),
 ];
 
-const DEFAULT_CORE_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" xmlns:dcmitype=\"http://purl.org/dc/dcmitype/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><dc:creator></dc:creator><cp:lastModifiedBy></cp:lastModifiedBy><cp:revision>1</cp:revision><dcterms:created xsi:type=\"dcterms:W3CDTF\">2000-01-01T00:00:00Z</dcterms:created><dcterms:modified xsi:type=\"dcterms:W3CDTF\">2000-01-01T00:00:00Z</dcterms:modified></cp:coreProperties>";
-
-/// Create the core properties part if missing (python-docx always has one).
-pub fn ensure_core_part(pkg: &mut crate::package::Package) {
-    if pkg.contains("docProps/core.xml") {
-        return;
-    }
-    pkg.set("docProps/core.xml", DEFAULT_CORE_XML.as_bytes().to_vec());
-    pkg.ensure_content_type_override(
-        "docProps/core.xml",
-        "application/vnd.openxmlformats-package.core-properties+xml",
-    );
-    let rels_path = "_rels/.rels";
-    let mut rels = pkg
-        .get_string(rels_path)
-        .map(|x| crate::package::Rels::from_xml(&x))
-        .unwrap_or_default();
-    rels.add(
-        "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties",
-        "docProps/core.xml",
-        false,
-    );
-    pkg.set(rels_path, rels.to_xml().into_bytes());
-}
-
 pub fn get_core_property(core: &mut TplCore, tag: &str) -> String {
     core
         .part_dom("docProps/core.xml")
@@ -2321,7 +2296,7 @@ pub fn set_core_property(core: &mut TplCore, tag: &str, value: &str) -> Result<(
         .map(|p| !p.contains("docProps/core.xml"))
         .unwrap_or(false)
     {
-        ensure_core_part(core.package.as_mut().unwrap());
+        crate::package::ensure_core_part(core.package.as_mut().unwrap());
     }
     {
         let dom = core.part_dom("docProps/core.xml")?;

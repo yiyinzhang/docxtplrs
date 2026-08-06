@@ -749,6 +749,31 @@ impl Package {
     }
 }
 
+const DEFAULT_CORE_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" xmlns:dcmitype=\"http://purl.org/dc/dcmitype/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><dc:creator></dc:creator><cp:lastModifiedBy></cp:lastModifiedBy><cp:revision>1</cp:revision><dcterms:created xsi:type=\"dcterms:W3CDTF\">2000-01-01T00:00:00Z</dcterms:created><dcterms:modified xsi:type=\"dcterms:W3CDTF\">2000-01-01T00:00:00Z</dcterms:modified></cp:coreProperties>";
+
+/// Create the core properties part if missing (python-docx always has one).
+pub fn ensure_core_part(pkg: &mut Package) {
+    if pkg.contains("docProps/core.xml") {
+        return;
+    }
+    pkg.set("docProps/core.xml", DEFAULT_CORE_XML.as_bytes().to_vec());
+    pkg.ensure_content_type_override(
+        "docProps/core.xml",
+        "application/vnd.openxmlformats-package.core-properties+xml",
+    );
+    let rels_path = "_rels/.rels";
+    let mut rels = pkg
+        .get_string(rels_path)
+        .map(|x| Rels::from_xml(&x))
+        .unwrap_or_default();
+    rels.add(
+        "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties",
+        "docProps/core.xml",
+        false,
+    );
+    pkg.set(rels_path, rels.to_xml().into_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1214,7 +1239,9 @@ mod tests {
     #[test]
     fn test_package_packed_media_lazy_roundtrip() {
         // incompressible payload so zip deflate is stored-ish but still Deflated
-        let payload: Vec<u8> = (0..100_000u32).map(|i| (i * 2654435761) as u8).collect();
+        let payload: Vec<u8> = (0..100_000u32)
+            .map(|i| i.wrapping_mul(2654435761) as u8)
+            .collect();
         let zip = build_zip(&[
             ("word/document.xml", b"<doc/>", zip::CompressionMethod::Deflated),
             ("word/media/big.png", &payload, zip::CompressionMethod::Deflated),

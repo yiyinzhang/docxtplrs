@@ -215,9 +215,16 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-docxtplrs = "0.1.12"
+docxtplrs = { version = "0.2.0", default-features = false }  # pure Rust: no PyO3/libpython
 minijinja = "2"
 ```
+
+Cargo features:
+
+| Feature | Default | Purpose |
+|---|---|---|
+| `python` | ✓ | PyO3 bindings and Python interop (Python callables as custom filters/tests/functions/globals, `set_template_loader`). Disable it (`default-features = false`) for a pure-Rust build with no `pyo3`/`libpython` dependency. |
+| `extension-module` | – | Only enabled by maturin when building the Python wheel (implies `python`); never enable it for a Rust binary/library. |
 
 Render a template (see [Quick start](#quick-start--快速开始) for the code).
 
@@ -239,9 +246,10 @@ A runnable example is included:
 cargo run --example render --release -- template.docx out.docx
 ```
 
-> Note: examples link against `libpython` (PyO3). If your Python is uv-managed, run with
+> Note: with default features the examples link against `libpython` (PyO3). If your Python is uv-managed, run with
 > `LD_LIBRARY_PATH=$(python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")`.
-> The `extension-module` cargo feature is only enabled by maturin for the Python wheel build.
+> Built with `--no-default-features` (e.g. `cargo run --no-default-features --example render --release -- ...`)
+> the examples are pure Rust and need no Python at all.
 
 ### 2. Usage as a Python package
 
@@ -252,7 +260,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # in another uv project
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.12-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # or editable (local development)
 uv add --editable /path/to/docxtplrs
 ```
@@ -580,9 +588,16 @@ debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会�
 
 ```toml
 [dependencies]
-docxtplrs = "0.1.12"
+docxtplrs = { version = "0.2.0", default-features = false }  # 纯 Rust：不依赖 PyO3/libpython
 minijinja = "2"
 ```
+
+Cargo features：
+
+| Feature | 默认 | 作用 |
+|---|---|---|
+| `python` | ✓ | PyO3 绑定与 Python 互操作（Python 回调作为自定义 filters/tests/functions/globals、`set_template_loader`）。纯 Rust 场景用 `default-features = false` 关闭，完全不依赖 `pyo3`/`libpython`。 |
+| `extension-module` | – | 仅供 maturin 构建 Python wheel 时启用（隐含 `python`）；Rust 二进制/库切勿启用。 |
 
 渲染模板的代码见[快速开始](#quick-start--快速开始)（中文上下文把 `title`/`items`
 换成中文即可）。
@@ -605,9 +620,10 @@ minijinja = "2"
 cargo run --example render --release -- template.docx out.docx
 ```
 
-> 注意：示例会链接 `libpython`（PyO3）。若 Python 由 uv 管理，请用
+> 注意：默认 features 下示例会链接 `libpython`（PyO3）。若 Python 由 uv 管理，请用
 > `LD_LIBRARY_PATH=$(python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")` 运行。
-> `extension-module` cargo feature 仅在 maturin 构建 Python wheel 时启用。
+> 使用 `--no-default-features` 构建时（如 `cargo run --no-default-features --example render --release -- ...`）
+> 示例为纯 Rust，完全不需要 Python。
 
 ### 2. Python 用法
 
@@ -618,7 +634,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # 在其他 uv 项目中
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.1.12-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # 或本地开发模式（editable）
 uv add --editable /path/to/docxtplrs
 ```
