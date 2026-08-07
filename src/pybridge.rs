@@ -144,6 +144,7 @@ pub fn py_to_value(
         let d = match &b.bytes {
             Some(bytes) => crate::template::Deferred::Subdoc {
                 bytes: Some(std::sync::Arc::from(&bytes[..])),
+                keep_sections: b.keep_sections,
             },
             None => crate::template::Deferred::SubdocBlocks {
                 blocks: std::sync::Arc::new(b.blocks.borrow().clone()),

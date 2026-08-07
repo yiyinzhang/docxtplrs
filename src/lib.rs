@@ -7,6 +7,9 @@ mod doccomments;
 mod docmodel;
 #[cfg(feature = "python")]
 mod docmodel_add;
+#[cfg(feature = "python")]
+mod docmodel_fmt;
+pub mod composer;
 pub mod gettext;
 pub mod image;
 mod inline_image;
@@ -32,7 +35,7 @@ use pyo3::prelude::*;
 #[cfg(feature = "python")]
 #[pymodule]
 fn docxtplrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("__version__", "0.2.0")?;
+    m.add("__version__", "0.2.1")?;
 
     m.add_class::<pyclasses::PyDocxTemplate>()?;
     m.add_class::<pyclasses::PyRichText>()?;
@@ -40,6 +43,7 @@ fn docxtplrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pyclasses::PyListing>()?;
     m.add_class::<pyclasses::PyInlineImage>()?;
     m.add_class::<pyclasses::PySubdoc>()?;
+    m.add_class::<pyclasses::PyComposer>()?;
     m.add_class::<pyclasses::PyLength>()?;
     m.add_class::<pyclasses::PySubParagraph>()?;
     m.add_class::<pyclasses::PySubRun>()?;
@@ -59,6 +63,20 @@ fn docxtplrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<docmodel::PySectionHdrFtr>()?;
     m.add_class::<docmodel::PyStyles>()?;
     m.add_class::<docmodel::PyStyleFont>()?;
+    m.add_class::<docmodel_fmt::PyFont>()?;
+    m.add_class::<docmodel_fmt::PyColorFormat>()?;
+    m.add_class::<docmodel_fmt::PyParagraphFormat>()?;
+    m.add_class::<docmodel_fmt::PyTabStops>()?;
+    m.add_class::<docmodel_fmt::PyTabStop>()?;
+    m.add_class::<docmodel_fmt::PyTableColumn>()?;
+    m.add_class::<docmodel_fmt::PyCellParagraph>()?;
+    m.add_class::<docmodel_fmt::PyHyperlink>()?;
+    m.add_class::<docmodel_fmt::PyCellTable>()?;
+    m.add_class::<docmodel_fmt::PyNestedRow>()?;
+    m.add_class::<docmodel_fmt::PyNestedCell>()?;
+    m.add_class::<docmodel_fmt::PyRenderedPageBreak>()?;
+    m.add_class::<docmodel_fmt::PyPart>()?;
+    m.add_class::<docmodel_fmt::PyField>()?;
     m.add_class::<docmodel::PySettings>()?;
     m.add_class::<doccomments::PyComments>()?;
     m.add_class::<doccomments::PyComment>()?;

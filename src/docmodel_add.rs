@@ -132,7 +132,7 @@ pub fn doc_add_picture(
     .map_err(py_err)
 }
 
-fn read_image_source(obj: &Bound<'_, PyAny>) -> PyResult<(Vec<u8>, Option<String>)> {
+pub(crate) fn read_image_source(obj: &Bound<'_, PyAny>) -> PyResult<(Vec<u8>, Option<String>)> {
     let filename = obj.extract::<String>().ok().and_then(|p| {
         std::path::Path::new(&p)
             .file_name()

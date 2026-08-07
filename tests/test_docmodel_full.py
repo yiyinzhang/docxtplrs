@@ -9,7 +9,7 @@ import pytest
 sys.path.insert(0, "tests")
 from helpers import make_docx, read_docx_part, tp  # noqa: E402
 
-from docxtplrs import DocxTemplate, Inches, Cm  # noqa: E402
+from docxtplrs import DocxTemplate, Inches, Cm, Pt  # noqa: E402
 
 
 def new_tpl(body=None, **kw):
@@ -121,13 +121,13 @@ def test_style_font_full_matrix():
     f.strike = True
     f.small_caps = True
     f.all_caps = True
-    f.color = "#123456"
-    f.size = 22
+    f.color.rgb = "#123456"
+    f.size = Pt(11)  # 22 half-points
     f.name = "Consolas"
     assert f.bold is True and f.italic is True
     assert f.strike is True and f.small_caps is True and f.all_caps is True
-    assert f.color == "123456"  # getter strips the leading '#'
-    assert f.size == 22
+    assert f.color.rgb == "123456"  # getter strips the leading '#'
+    assert f.size.emu == Pt(11).emu
     assert f.name == "Consolas"
     tpl.render({})
     sx = saved_xml(tpl, "word/styles.xml")

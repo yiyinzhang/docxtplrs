@@ -28,6 +28,9 @@ pub enum Deferred {
     },
     Subdoc {
         bytes: Option<std::sync::Arc<[u8]>>,
+        /// preserve the subdoc's section properties (page setup, headers/
+        /// footers) as its own section instead of dropping them
+        keep_sections: bool,
     },
     SubdocBlocks {
         blocks: std::sync::Arc<Vec<crate::subdocbuilder::Block>>,
@@ -391,7 +394,7 @@ impl TplCore {
         Ok(())
     }
 
-    fn header_footer_parts(&mut self, uri: &str) -> Vec<String> {
+    pub(crate) fn header_footer_parts(&mut self, uri: &str) -> Vec<String> {
         let rels = match &self.package {
             Some(p) => p.rels(DOCUMENT_PART),
             None => return Vec::new(),
@@ -600,10 +603,13 @@ impl TplCore {
                 title.as_deref(),
                 descr.as_deref(),
             ),
-            Deferred::Subdoc { bytes } => {
+            Deferred::Subdoc {
+                bytes,
+                keep_sections,
+            } => {
                 self.used_subdoc = true;
                 match bytes {
-                    Some(b) => crate::subdoc::subdoc_xml(self, &b),
+                    Some(b) => crate::subdoc::subdoc_xml_opts(self, &b, keep_sections),
                     None => Ok(String::new()),
                 }
             }
@@ -2727,7 +2733,7 @@ pub fn fix_tables_and_docpr(xml: &str, docx_ids_index: &mut u32) -> Result<Strin
 /// DOM parse/serialize round-trip. The cNvPr pass (docxcompose
 /// renumber_nvpicpr_ids parity) is only wanted when subdocs were merged;
 /// folding it in here saves a second full parse+serialize of the body.
-fn fix_tables_docpr_cnvpr(
+pub(crate) fn fix_tables_docpr_cnvpr(
     xml: &str,
     docx_ids_index: &mut u32,
     cnvpr_next: Option<&mut u32>,
@@ -2805,7 +2811,7 @@ fn fix_tables_docpr_cnvpr(
 }
 
 /// Renumber pic:cNvPr ids sequentially (docxcompose renumber_nvpicpr_ids).
-fn renumber_cnvpr(xml: &str, next_id: &mut u32) -> Option<String> {
+pub(crate) fn renumber_cnvpr(xml: &str, next_id: &mut u32) -> Option<String> {
     if !xml.contains("pic:cNvPr") {
         return None;
     }

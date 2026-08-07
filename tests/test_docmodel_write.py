@@ -10,7 +10,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 from helpers import make_docx, read_docx_part, docx_names, text_of, tp, cell, tr, tbl, make_png
 
-from docxtplrs import DocxTemplate, Cycler, Joiner, generate_lorem_ipsum
+from docxtplrs import DocxTemplate, Cycler, Joiner, generate_lorem_ipsum, Pt
 
 
 def saved_xml(tpl):
@@ -159,8 +159,8 @@ def test_add_style_and_font():
     assert st.name == "My Char Style"
     assert st.style_type == "character"
     st.font.bold = True
-    st.font.size = 28
-    st.font.color = "#FF0000"
+    st.font.size = Pt(14)  # 28 half-points
+    st.font.color.rgb = "#FF0000"
     st.font.name = "Courier New"
     assert st.font.bold is True
     tpl.render({})

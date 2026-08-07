@@ -153,6 +153,16 @@ impl PyParagraph {
         })
     }
 
+
+    /// The package part this object belongs to (minimal facade).
+    #[getter]
+    fn part(&self, py: Python<'_>) -> crate::docmodel_fmt::PyPart {
+        crate::docmodel_fmt::PyPart {
+            tpl: self.tpl.clone_ref(py),
+            part_name: DOCUMENT_PART.to_string(),
+        }
+    }
+
     #[getter]
     fn runs(&self, py: Python<'_>) -> Vec<PyRun> {
         let n = self
@@ -196,6 +206,248 @@ impl PyParagraph {
             index: n,
         })
     }
+
+    /// Paragraph formatting (python-docx paragraph_format).
+    #[getter]
+    fn paragraph_format(&self, py: Python<'_>) -> crate::docmodel_fmt::PyParagraphFormat {
+        crate::docmodel_fmt::PyParagraphFormat {
+            tpl: self.tpl.clone_ref(py),
+            target: crate::docmodel_fmt::PfTarget::Para { index: self.index },
+        }
+    }
+
+    /// Alignment shortcut (WD_ALIGN_PARAGRAPH int; xml name also accepted).
+    #[getter]
+    fn alignment(&self, py: Python<'_>) -> Option<i64> {
+        self.paragraph_format(py).alignment(py)
+    }
+    #[setter]
+    fn set_alignment(&self, py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.paragraph_format(py).set_alignment(py, v)
+    }
+
+    /// Remove all content, keeping the paragraph properties (python-docx clear).
+    fn clear(&self, py: Python<'_>) -> PyResult<()> {
+        self.edit(py, |p| {
+            p.children
+                .retain(|c| matches!(c, Node::Elem(e) if e.name == "w:pPr"));
+        })
+    }
+
+    /// Field codes in this paragraph (w:fldSimple and complex fields).
+    #[getter]
+    fn fields(&self, py: Python<'_>) -> Vec<crate::docmodel_fmt::PyField> {
+        let n = self
+            .read(py, |p| crate::docmodel_fmt::field_spans(p).len())
+            .unwrap_or(0);
+        (0..n)
+            .map(|i| crate::docmodel_fmt::PyField {
+                tpl: self.tpl.clone_ref(py),
+                para: self.index,
+                index: i,
+            })
+            .collect()
+    }
+
+    /// Append a complex field (begin/instrText/separate/cached/end) to this
+    /// paragraph. `instr` e.g. "PAGE" or 'TOC \\o "1-3"'; `cached` is the
+    /// placeholder result shown until the field is updated (set
+    /// `settings.update_fields_on_open = True` to refresh on open).
+    #[pyo3(signature = (instr, cached=""))]
+    fn add_field(&self, py: Python<'_>, instr: &str, cached: &str) -> PyResult<crate::docmodel_fmt::PyField> {
+        let instr = instr.trim().to_string();
+        let cached = cached.to_string();
+        let index = self.edit(py, |p| {
+            let index = crate::docmodel_fmt::field_spans(p).len();
+            let mk = |child: Element| {
+                let mut r = Element::new("w:r");
+                r.children.push(Node::Elem(child));
+                Node::Elem(r)
+            };
+            let mut begin = Element::new("w:fldChar");
+            begin.set_attr("w:fldCharType", "begin");
+            p.children.push(mk(begin));
+            let mut it = Element::new("w:instrText");
+            it.set_attr("xml:space", "preserve");
+            it.children.push(Node::Text(format!(" {} ", instr)));
+            p.children.push(mk(it));
+            let mut sep = Element::new("w:fldChar");
+            sep.set_attr("w:fldCharType", "separate");
+            p.children.push(mk(sep));
+            if !cached.is_empty() {
+                let mut t = Element::new("w:t");
+                t.set_attr("xml:space", "preserve");
+                t.children.push(Node::Text(cached));
+                p.children.push(mk(t));
+            }
+            let mut end = Element::new("w:fldChar");
+            end.set_attr("w:fldCharType", "end");
+            p.children.push(mk(end));
+            index
+        })?;
+        Ok(crate::docmodel_fmt::PyField {
+            tpl: self.tpl.clone_ref(py),
+            para: self.index,
+            index,
+        })
+    }
+
+    /// Hyperlinks in this paragraph (read-only proxies).
+    #[getter]
+    fn hyperlinks(&self, py: Python<'_>) -> Vec<crate::docmodel_fmt::PyHyperlink> {
+        let n = self
+            .read(py, |p| {
+                p.children
+                    .iter()
+                    .filter(|c| matches!(c, Node::Elem(e) if e.name == "w:hyperlink"))
+                    .count()
+            })
+            .unwrap_or(0);
+        (0..n)
+            .map(|i| crate::docmodel_fmt::PyHyperlink {
+                tpl: self.tpl.clone_ref(py),
+                para: self.index,
+                index: i,
+            })
+            .collect()
+    }
+
+    /// True when a rendered page break occurs in this paragraph.
+    #[getter]
+    fn contains_page_break(&self, py: Python<'_>) -> bool {
+        self.read(py, |p| {
+            let mut out = Vec::new();
+            p.iter_descendants("w:lastRenderedPageBreak", &mut out);
+            !out.is_empty()
+        })
+        .unwrap_or(false)
+    }
+
+    /// Rendered page breaks (w:lastRenderedPageBreak markers written by Word
+    /// at save time) in this paragraph.
+    #[getter]
+    fn rendered_page_breaks(&self, py: Python<'_>) -> Vec<crate::docmodel_fmt::PyRenderedPageBreak> {
+        let n = self
+            .read(py, |p| {
+                let mut out = Vec::new();
+                p.iter_descendants("w:lastRenderedPageBreak", &mut out);
+                out.len()
+            })
+            .unwrap_or(0);
+        (0..n)
+            .map(|_| crate::docmodel_fmt::PyRenderedPageBreak {})
+            .collect()
+    }
+
+    /// Runs and hyperlinks of this paragraph in document order.
+    fn iter_inner_content(&self, py: Python<'_>) -> Vec<Py<PyAny>> {
+        let kinds: Vec<bool> = self
+            .read(py, |p| {
+                p.children
+                    .iter()
+                    .filter_map(|c| match c {
+                        Node::Elem(e) if e.name == "w:r" => Some(true),
+                        Node::Elem(e) if e.name == "w:hyperlink" => Some(false),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut ri = 0usize;
+        let mut hi = 0usize;
+        let mut out = Vec::new();
+        for is_run in kinds {
+            if is_run {
+                if let Ok(v) = Py::new(
+                    py,
+                    PyRun {
+                        tpl: self.tpl.clone_ref(py),
+                        para: self.index,
+                        index: ri,
+                    },
+                ) {
+                    out.push(v.into_any());
+                }
+                ri += 1;
+            } else {
+                if let Ok(v) = Py::new(
+                    py,
+                    crate::docmodel_fmt::PyHyperlink {
+                        tpl: self.tpl.clone_ref(py),
+                        para: self.index,
+                        index: hi,
+                    },
+                ) {
+                    out.push(v.into_any());
+                }
+                hi += 1;
+            }
+        }
+        out
+    }
+
+    /// Insert a new paragraph before this one (python-docx
+    /// insert_paragraph_before); returns the new paragraph.
+    #[pyo3(signature = (text=None, style=None))]
+    fn insert_paragraph_before(
+        &self,
+        py: Python<'_>,
+        text: Option<&str>,
+        style: Option<&str>,
+    ) -> PyResult<PyParagraph> {
+        let sid = match style {
+            Some(s) => Some(with_core(&self.tpl, py, |core| {
+                crate::subdocbuilder::resolve_style_id(core, s)
+            })),
+            None => None,
+        };
+        with_core(&self.tpl, py, |core| {
+            let mut found = false;
+            mutate_document(core, |body| {
+                let mut seen = 0usize;
+                let mut pos = None;
+                for (i, c) in body.children.iter().enumerate() {
+                    if matches!(c, Node::Elem(e) if e.name == "w:p") {
+                        if seen == self.index {
+                            pos = Some(i);
+                            break;
+                        }
+                        seen += 1;
+                    }
+                }
+                if let Some(i) = pos {
+                    let mut p = Element::new("w:p");
+                    if let Some(sid) = &sid {
+                        let mut ppr = Element::new("w:pPr");
+                        let mut ps = Element::new("w:pStyle");
+                        ps.set_attr("w:val", sid);
+                        ppr.children.push(Node::Elem(ps));
+                        p.children.push(Node::Elem(ppr));
+                    }
+                    if let Some(t) = text {
+                        if !t.is_empty() {
+                            let mut r = Element::new("w:r");
+                            let mut wt = Element::new("w:t");
+                            wt.set_attr("xml:space", "preserve");
+                            wt.children.push(Node::Text(t.to_string()));
+                            r.children.push(Node::Elem(wt));
+                            p.children.push(Node::Elem(r));
+                        }
+                    }
+                    body.children.insert(i, Node::Elem(p));
+                    found = true;
+                }
+            })
+            .map_err(py_err)?;
+            if !found {
+                return Err(PyValueError::new_err("paragraph not found"));
+            }
+            Ok(PyParagraph {
+                tpl: self.tpl.clone_ref(py),
+                index: self.index,
+            })
+        })
+    }
 }
 
 /// A run inside a paragraph (live proxy).
@@ -225,7 +477,7 @@ impl PyRun {
         })
     }
 
-    fn read<R>(&self, py: Python<'_>, f: impl FnOnce(&Element) -> R) -> Option<R> {
+    pub(crate) fn read<R>(&self, py: Python<'_>, f: impl FnOnce(&Element) -> R) -> Option<R> {
         with_core(&self.tpl, py, |core| {
             let gen = core.doc_gen;
             let mut cur = core.para_cursor;
@@ -361,7 +613,7 @@ pub(crate) fn set_val_tag(r: &mut Element, tag: &str, attr: &str, val: &str) {
     }
 }
 
-fn read_flag(el: &Element, tag: &str) -> Option<bool> {
+pub(crate) fn read_flag(el: &Element, tag: &str) -> Option<bool> {
     let rpr = el.find("w:rPr")?;
     rpr.find(tag).map(|e| {
         !matches!(
@@ -374,6 +626,15 @@ fn read_flag(el: &Element, tag: &str) -> Option<bool> {
 #[pymethods]
 impl PyRun {
 
+    /// The package part this object belongs to (minimal facade).
+    #[getter]
+    fn part(&self, py: Python<'_>) -> crate::docmodel_fmt::PyPart {
+        crate::docmodel_fmt::PyPart {
+            tpl: self.tpl.clone_ref(py),
+            part_name: DOCUMENT_PART.to_string(),
+        }
+    }
+
     #[getter]
     fn text(&self, py: Python<'_>) -> String {
         self.read(py, |r| element_text(r)).unwrap_or_default()
@@ -383,11 +644,8 @@ impl PyRun {
     fn set_text(&self, py: Python<'_>, v: String) -> PyResult<()> {
         self.edit(py, |r| {
             r.children
-                .retain(|c| !matches!(c, Node::Elem(e) if e.name == "w:t"));
-            let mut t = Element::new("w:t");
-            t.set_attr("xml:space", "preserve");
-            t.children.push(Node::Text(v));
-            r.children.push(Node::Elem(t));
+                .retain(|c| !matches!(c, Node::Elem(e) if e.name == "w:t" || e.name == "w:tab" || e.name == "w:br" || e.name == "w:cr"));
+            run_append_text(r, &v);
         })
     }
 
@@ -565,6 +823,306 @@ impl PyRun {
             self.edit(py, |r| set_flag(r, "w:vertAlign", false))
         }
     }
+
+    /// Full python-docx Font facade (tri-state booleans, all 29 properties).
+    #[getter]
+    fn font(&self, py: Python<'_>) -> crate::docmodel_fmt::PyFont {
+        crate::docmodel_fmt::PyFont {
+            tpl: self.tpl.clone_ref(py),
+            target: crate::docmodel_fmt::FontTarget::Run {
+                para: self.para,
+                index: self.index,
+            },
+        }
+    }
+
+    /// Add a break; break_type is a WD_BREAK int (6=line, 7=page, 8=column,
+    /// 9/10/11=textWrapping clear left/right/all).
+    #[pyo3(signature = (break_type=6))]
+    fn add_break(&self, py: Python<'_>, break_type: i64) -> PyResult<()> {
+        self.edit(py, |r| {
+            let mut br = Element::new("w:br");
+            match break_type {
+                7 => br.set_attr("w:type", "page"),
+                8 => br.set_attr("w:type", "column"),
+                9 => {
+                    br.set_attr("w:type", "textWrapping");
+                    br.set_attr("w:clear", "left");
+                }
+                10 => {
+                    br.set_attr("w:type", "textWrapping");
+                    br.set_attr("w:clear", "right");
+                }
+                11 => {
+                    br.set_attr("w:type", "textWrapping");
+                    br.set_attr("w:clear", "all");
+                }
+                _ => {}
+            }
+            r.children.push(Node::Elem(br));
+        })
+    }
+
+    /// Append a tab character (w:tab).
+    fn add_tab(&self, py: Python<'_>) -> PyResult<()> {
+        self.edit(py, |r| r.children.push(Node::Elem(Element::new("w:tab"))))
+    }
+
+    /// Append text (w:t), preserving leading/trailing whitespace.
+    fn add_text(&self, py: Python<'_>, text: &str) -> PyResult<()> {
+        let text = text.to_string();
+        self.edit(py, |r| run_append_text(r, &text))
+    }
+
+    /// Remove all content, keeping run properties (python-docx clear).
+    fn clear(&self, py: Python<'_>) -> PyResult<()> {
+        self.edit(py, |r| {
+            r.children
+                .retain(|c| matches!(c, Node::Elem(e) if e.name == "w:rPr"));
+        })
+    }
+
+    /// True when a rendered page break (w:lastRenderedPageBreak) occurs in
+    /// this run (hard breaks are not counted, python-docx semantics).
+    #[getter]
+    fn contains_page_break(&self, py: Python<'_>) -> bool {
+        self.read(py, |r| {
+            let mut out = Vec::new();
+            r.iter_descendants("w:lastRenderedPageBreak", &mut out);
+            !out.is_empty()
+        })
+        .unwrap_or(false)
+    }
+
+    /// Content items of this run in order (python-docx iter_inner_content):
+    /// contiguous text-ish ranges as strings, drawings as live XmlElement
+    /// proxies, rendered page breaks as RenderedPageBreak markers.
+    fn iter_inner_content(&self, py: Python<'_>) -> Vec<Py<PyAny>> {
+        // element-index path of this run: [body, para, run]
+        let path_and_items: Option<(Vec<usize>, Vec<(bool, usize, String)>)> = with_core(&self.tpl, py, |core| {
+            read_body(core, |body| {
+                // element-child index of the nth w:p
+                let mut seen = 0usize;
+                let mut p_pos = None;
+                for (i, c) in body.children.iter().enumerate() {
+                    if matches!(c, Node::Elem(e) if e.name == "w:p") {
+                        if seen == self.para {
+                            p_pos = Some(i);
+                            break;
+                        }
+                        seen += 1;
+                    }
+                }
+                let p_pos = p_pos?;
+                let p = match &body.children[p_pos] {
+                    Node::Elem(e) => e,
+                    _ => return None,
+                };
+                let mut seen = 0usize;
+                let mut r_pos = None;
+                for (i, c) in p.children.iter().enumerate() {
+                    if matches!(c, Node::Elem(e) if e.name == "w:r") {
+                        if seen == self.index {
+                            r_pos = Some(i);
+                            break;
+                        }
+                        seen += 1;
+                    }
+                }
+                let r_pos = r_pos?;
+                let r = match &p.children[r_pos] {
+                    Node::Elem(e) => e,
+                    _ => return None,
+                };
+                let mut items: Vec<(bool, usize, String)> = Vec::new();
+                let mut cur = String::new();
+                for (i, c) in r.children.iter().enumerate() {
+                    if let Node::Elem(e) = c {
+                        match e.name.as_str() {
+                            "w:t" => cur.push_str(&e.text_content()),
+                            "w:tab" => cur.push('\t'),
+                            "w:br" | "w:cr" => cur.push('\n'),
+                            "w:noBreakHyphen" => cur.push('\u{2011}'),
+                            "w:drawing" => {
+                                if !cur.is_empty() {
+                                    items.push((false, 0, std::mem::take(&mut cur)));
+                                }
+                                items.push((true, i, String::new())); // drawing
+                            }
+                            "w:lastRenderedPageBreak" => {
+                                if !cur.is_empty() {
+                                    items.push((false, 0, std::mem::take(&mut cur)));
+                                }
+                                items.push((true, i, "pb".to_string())); // marker
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if !cur.is_empty() {
+                    items.push((false, 0, cur));
+                }
+                Some((vec![p_pos, r_pos], items))
+            })
+            .flatten()
+        });
+        let Some((tail, items)) = path_and_items else {
+            return Vec::new();
+        };
+        // element index of w:body within w:document (almost always 0)
+        let body_idx = with_core(&self.tpl, py, |core| {
+            core.document_dom().ok().and_then(|dom| {
+                dom.root
+                    .children
+                    .iter()
+                    .filter_map(|c| match c {
+                        Node::Elem(e) => Some(e),
+                        _ => None,
+                    })
+                    .position(|e| e.name == "w:body")
+            })
+        })
+        .unwrap_or(0);
+        let mut base = vec![body_idx];
+        base.extend(tail);
+        let mut out = Vec::new();
+        for (is_elem, pos, text) in items {
+            if !is_elem {
+                out.push(pyo3::types::PyString::new(py, &text).into_any().unbind());
+            } else if text == "pb" {
+                if let Ok(v) = Py::new(py, crate::docmodel_fmt::PyRenderedPageBreak {}) {
+                    out.push(v.into_any());
+                }
+            } else {
+                let mut path = base.clone();
+                path.push(pos);
+                if let Ok(v) = Py::new(
+                    py,
+                    crate::pyxml::PyXmlElement {
+                        tpl: self.tpl.clone_ref(py),
+                        part: DOCUMENT_PART.to_string(),
+                        path,
+                    },
+                ) {
+                    out.push(v.into_any());
+                }
+            }
+        }
+        out
+    }
+
+    /// Append a picture to this run (python-docx run.add_picture).
+    #[pyo3(signature = (image_descriptor, width=None, height=None))]
+    fn add_picture(
+        &self,
+        py: Python<'_>,
+        image_descriptor: &Bound<'_, PyAny>,
+        width: Option<i64>,
+        height: Option<i64>,
+    ) -> PyResult<()> {
+        let (blob, filename) = crate::docmodel_add::read_image_source(image_descriptor)?;
+        let drawing = with_core(&self.tpl, py, |core| -> Result<String, String> {
+            core.init_docx(false)?;
+            crate::inline_image::drawing_xml(
+                core,
+                DOCUMENT_PART,
+                &blob,
+                filename.as_deref(),
+                width,
+                height,
+                None,
+                None,
+                None,
+            )
+        })
+        .map_err(py_err)?;
+        self.edit(py, |r| {
+            if let Ok(frag) = crate::subdoc::parse_body_fragment(&drawing) {
+                r.children.extend(frag.root.children);
+            }
+        })
+    }
+
+    /// Mark the range from this run to `last_run` as belonging to the
+    /// comment `comment_id` (python-docx run.mark_comment_range).
+    fn mark_comment_range(&self, py: Python<'_>, last_run: Bound<'_, PyRun>, comment_id: i64) -> PyResult<()> {
+        let (lpara, lindex) = (last_run.borrow().para, last_run.borrow().index);
+        let id = comment_id.to_string();
+        with_core(&self.tpl, py, |core| {
+            mutate_document(core, |body| {
+                // end marker first so positions for the start marker are stable
+                for (para_idx, run_idx, is_start) in [
+                    (lpara, lindex, false),
+                    (self.para, self.index, true),
+                ] {
+                    let Some(p) = nth_direct(body, "w:p", para_idx) else {
+                        continue;
+                    };
+                    // child position of the nth w:r
+                    let mut seen = 0usize;
+                    let mut pos = None;
+                    for (i, c) in p.children.iter().enumerate() {
+                        if matches!(c, Node::Elem(e) if e.name == "w:r") {
+                            if seen == run_idx {
+                                pos = Some(i);
+                                break;
+                            }
+                            seen += 1;
+                        }
+                    }
+                    let Some(i) = pos else { continue };
+                    if is_start {
+                        let mut cs = Element::new("w:commentRangeStart");
+                        cs.set_attr("w:id", &id);
+                        p.children.insert(i, Node::Elem(cs));
+                    } else {
+                        let mut ce = Element::new("w:commentRangeEnd");
+                        ce.set_attr("w:id", &id);
+                        let mut rr = Element::new("w:r");
+                        let mut cr = Element::new("w:commentReference");
+                        cr.set_attr("w:id", &id);
+                        rr.children.push(Node::Elem(cr));
+                        p.children.insert(i + 1, Node::Elem(rr));
+                        p.children.insert(i + 1, Node::Elem(ce));
+                    }
+                }
+            })
+            .map_err(py_err)
+        })
+    }
+}
+
+/// Append text to a run, expanding \t -> w:tab, \n -> w:br, \r -> w:cr
+/// (python-docx Run.text semantics).
+pub(crate) fn run_append_text(r: &mut Element, text: &str) {
+    let mut buf = String::new();
+    let flush = |r: &mut Element, buf: &mut String| {
+        if buf.is_empty() {
+            return;
+        }
+        let mut t = Element::new("w:t");
+        t.set_attr("xml:space", "preserve");
+        t.children.push(Node::Text(std::mem::take(buf)));
+        r.children.push(Node::Elem(t));
+    };
+    for ch in text.chars() {
+        match ch {
+            '\t' => {
+                flush(r, &mut buf);
+                r.children.push(Node::Elem(Element::new("w:tab")));
+            }
+            '\n' => {
+                flush(r, &mut buf);
+                r.children.push(Node::Elem(Element::new("w:br")));
+            }
+            '\r' => {
+                flush(r, &mut buf);
+                r.children.push(Node::Elem(Element::new("w:cr")));
+            }
+            _ => buf.push(ch),
+        }
+    }
+    flush(r, &mut buf);
 }
 
 /// A table in the document (live proxy).
@@ -575,7 +1133,7 @@ pub struct PyTable {
 }
 
 impl PyTable {
-    fn read<R>(&self, py: Python<'_>, f: impl FnOnce(&Element) -> R) -> Option<R> {
+    pub(crate) fn read<R>(&self, py: Python<'_>, f: impl FnOnce(&Element) -> R) -> Option<R> {
         with_core(&self.tpl, py, |core| {
             let gen = core.doc_gen;
             let mut cur = core.tbl_cursor;
@@ -588,7 +1146,7 @@ impl PyTable {
         })
     }
 
-    fn edit<R>(&self, py: Python<'_>, f: impl FnOnce(&mut Element) -> R) -> PyResult<R> {
+    pub(crate) fn edit<R>(&self, py: Python<'_>, f: impl FnOnce(&mut Element) -> R) -> PyResult<R> {
         with_core(&self.tpl, py, |core| {
             let mut result = None;
             let gen = core.doc_gen;
@@ -607,6 +1165,16 @@ impl PyTable {
 
 #[pymethods]
 impl PyTable {
+
+    /// The package part this object belongs to (minimal facade).
+    #[getter]
+    fn part(&self, py: Python<'_>) -> crate::docmodel_fmt::PyPart {
+        crate::docmodel_fmt::PyPart {
+            tpl: self.tpl.clone_ref(py),
+            part_name: DOCUMENT_PART.to_string(),
+        }
+    }
+
     #[getter]
     fn rows(&self, py: Python<'_>) -> Vec<PyTableRow> {
         let n = self
@@ -695,6 +1263,214 @@ impl PyTable {
             tblpr.find_mut("w:tblStyle").unwrap().set_attr("w:val", &sid);
         })
     }
+
+    /// Table alignment as a WD_TABLE_ALIGNMENT int (xml name also accepted).
+    #[getter]
+    fn alignment(&self, py: Python<'_>) -> Option<i64> {
+        self.read(py, |t| {
+            t.find("w:tblPr")
+                .and_then(|p| p.find("w:jc"))
+                .and_then(|e| e.get_attr("w:val").map(|s| s.to_string()))
+        })
+        .flatten()
+        .map(|s| match s.as_str() {
+            "center" => 1,
+            "right" => 2,
+            _ => 0,
+        })
+    }
+    #[setter]
+    fn set_alignment(&self, py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        let val: Option<&'static str> = if v.is_none() {
+            None
+        } else if let Ok(i) = v.extract::<i64>() {
+            Some(match i {
+                1 => "center",
+                2 => "right",
+                _ => "left",
+            })
+        } else {
+            let s: String = v.extract()?;
+            Some(match s.as_str() {
+                "center" => "center",
+                "right" => "right",
+                _ => "left",
+            })
+        };
+        self.edit(py, |t| {
+            let tblpr = crate::docmodel_fmt::ensure_tblpr(t);
+            match val {
+                Some(x) => {
+                    let jc = crate::docmodel_fmt::ensure_child(tblpr, "w:jc");
+                    jc.set_attr("w:val", x);
+                }
+                None => tblpr
+                    .children
+                    .retain(|c| !matches!(c, Node::Elem(e) if e.name == "w:jc")),
+            }
+        })
+    }
+
+    /// Autofit (tblLayout type=autofit vs fixed; missing -> True).
+    #[getter]
+    fn autofit(&self, py: Python<'_>) -> bool {
+        self.read(py, |t| {
+            t.find("w:tblPr")
+                .and_then(|p| p.find("w:tblLayout"))
+                .and_then(|e| e.get_attr("w:type"))
+                .map(|ty| ty != "fixed")
+                .unwrap_or(true)
+        })
+        .unwrap_or(true)
+    }
+    #[setter]
+    fn set_autofit(&self, py: Python<'_>, v: bool) -> PyResult<()> {
+        self.edit(py, |t| {
+            let tblpr = crate::docmodel_fmt::ensure_tblpr(t);
+            let l = crate::docmodel_fmt::ensure_child(tblpr, "w:tblLayout");
+            l.set_attr("w:type", if v { "autofit" } else { "fixed" });
+        })
+    }
+
+    /// Append a column of the given width (gridCol + one cell per row).
+    fn add_column(&self, py: Python<'_>, width: &Bound<'_, PyAny>) -> PyResult<crate::docmodel_fmt::PyTableColumn> {
+        let emu = crate::pyclasses::extract_length_pub(width)?
+            .ok_or_else(|| PyValueError::new_err("width is required"))?;
+        let twips = (emu / 635).to_string();
+        let col = self.edit(py, |t| {
+            let col = t
+                .find("w:tblGrid")
+                .map(|g| {
+                    g.children
+                        .iter()
+                        .filter(|c| matches!(c, Node::Elem(e) if e.name == "w:gridCol"))
+                        .count()
+                })
+                .unwrap_or(0);
+            // ensure tblGrid right after tblPr
+            if t.find("w:tblGrid").is_none() {
+                let pos = if t.find("w:tblPr").is_some() { 1 } else { 0 };
+                t.children.insert(pos, Node::Elem(Element::new("w:tblGrid")));
+            }
+            let grid = t.find_mut("w:tblGrid").unwrap();
+            let mut gc = Element::new("w:gridCol");
+            gc.set_attr("w:w", &twips);
+            grid.children.push(Node::Elem(gc));
+            for c in t.children.iter_mut() {
+                if let Node::Elem(tr) = c {
+                    if tr.name == "w:tr" {
+                        let mut tc = Element::new("w:tc");
+                        let mut tcpr = Element::new("w:tcPr");
+                        let mut tcw = Element::new("w:tcW");
+                        tcw.set_attr("w:type", "dxa");
+                        tcw.set_attr("w:w", &twips);
+                        tcpr.children.push(Node::Elem(tcw));
+                        tc.children.push(Node::Elem(tcpr));
+                        tc.children.push(Node::Elem(Element::new("w:p")));
+                        tr.children.push(Node::Elem(tc));
+                    }
+                }
+            }
+            col
+        })?;
+        Ok(crate::docmodel_fmt::PyTableColumn {
+            tpl: self.tpl.clone_ref(py),
+            index: self.index,
+            col,
+        })
+    }
+
+    #[getter]
+    fn columns(&self, py: Python<'_>) -> Vec<crate::docmodel_fmt::PyTableColumn> {
+        let n = self
+            .read(py, |t| {
+                t.find("w:tblGrid")
+                    .map(|g| {
+                        g.children
+                            .iter()
+                            .filter(|c| matches!(c, Node::Elem(e) if e.name == "w:gridCol"))
+                            .count()
+                    })
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        (0..n)
+            .map(|col| crate::docmodel_fmt::PyTableColumn {
+                tpl: self.tpl.clone_ref(py),
+                index: self.index,
+                col,
+            })
+            .collect()
+    }
+
+    /// Table direction: 0=ltr, 1=rtl (w:bidiVisual).
+    #[getter]
+    fn table_direction(&self, py: Python<'_>) -> i64 {
+        self.read(py, |t| {
+            t.find("w:tblPr")
+                .map(|p| p.find("w:bidiVisual").is_some() as i64)
+        })
+        .flatten()
+        .unwrap_or(0)
+    }
+    #[setter]
+    fn set_table_direction(&self, py: Python<'_>, v: i64) -> PyResult<()> {
+        self.edit(py, |t| {
+            let tblpr = crate::docmodel_fmt::ensure_tblpr(t);
+            if v == 1 {
+                if tblpr.find("w:bidiVisual").is_none() {
+                    tblpr.children.push(Node::Elem(Element::new("w:bidiVisual")));
+                }
+            } else {
+                tblpr.children
+                    .retain(|c| !matches!(c, Node::Elem(e) if e.name == "w:bidiVisual"));
+            }
+        })
+    }
+
+    /// Cells of column `i` (one per row).
+    fn column_cells(&self, py: Python<'_>, i: usize) -> Vec<PyCell> {
+        let rows = self
+            .read(py, |t| {
+                t.children
+                    .iter()
+                    .filter(|c| matches!(c, Node::Elem(e) if e.name == "w:tr"))
+                    .count()
+            })
+            .unwrap_or(0);
+        (0..rows)
+            .map(|row| PyCell {
+                tpl: self.tpl.clone_ref(py),
+                index: self.index,
+                row,
+                col: i,
+            })
+            .collect()
+    }
+
+    /// Cells of row `i`.
+    fn row_cells(&self, py: Python<'_>, i: usize) -> Vec<PyCell> {
+        let cols = self
+            .read(py, |t| {
+                nth_direct_ref(t, "w:tr", i)
+                    .map(|r| {
+                        r.children
+                            .iter()
+                            .filter(|c| matches!(c, Node::Elem(e) if e.name == "w:tc"))
+                            .count()
+                    })
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        (0..cols)
+            .map(|col| PyCell {
+                tpl: self.tpl.clone_ref(py),
+                index: self.index,
+                row: i,
+                col,
+            })
+            .collect()
+    }
 }
 
 /// A table row (live proxy).
@@ -705,8 +1481,134 @@ pub struct PyTableRow {
     pub row: usize,
 }
 
+impl PyTableRow {
+    fn row_grid_cols(&self, py: Python<'_>, tag: &str) -> i64 {
+        self.read(py, |r| {
+            r.find("w:trPr")
+                .and_then(|p| p.find(tag))
+                .and_then(|e| e.get_attr("w:val"))
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+    }
+
+    fn read<R>(&self, py: Python<'_>, f: impl FnOnce(&Element) -> R) -> Option<R> {
+        PyTable {
+            tpl: self.tpl.clone_ref(py),
+            index: self.index,
+        }
+        .read(py, |t| nth_direct_ref(t, "w:tr", self.row).map(|r| f(r)))
+        .flatten()
+    }
+
+    fn edit<R>(&self, py: Python<'_>, f: impl FnOnce(&mut Element) -> R) -> PyResult<R> {
+        let row = self.row;
+        PyTable {
+            tpl: self.tpl.clone_ref(py),
+            index: self.index,
+        }
+        .edit(py, |t| {
+            nth_direct(t, "w:tr", row)
+                .map(|r| f(r))
+                .ok_or_else(|| "row not found".to_string())
+        })?
+        .map_err(PyValueError::new_err)
+    }
+}
+
 #[pymethods]
 impl PyTableRow {
+    /// Row height (w:trPr/w:trHeight w:val).
+    #[getter]
+    fn height(&self, py: Python<'_>) -> Option<crate::pyclasses::PyLength> {
+        self.read(py, |r| {
+            r.find("w:trPr")
+                .and_then(|p| p.find("w:trHeight"))
+                .and_then(|e| e.get_attr("w:val"))
+                .and_then(|s| s.parse::<i64>().ok())
+        })
+        .flatten()
+        .pipe_map(to_len)
+    }
+    #[setter]
+    fn set_height(&self, py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        let twips = from_len(v)?;
+        self.edit(py, |r| {
+            let trpr = crate::docmodel_fmt::ensure_trpr(r);
+            let h = crate::docmodel_fmt::ensure_child(trpr, "w:trHeight");
+            match twips {
+                Some(t) => h.set_attr("w:val", &t.to_string()),
+                None => h.attrs.retain(|(k, _)| k != "w:val"),
+            }
+        })
+    }
+
+    /// Row height rule as a WD_ROW_HEIGHT_RULE int (0=auto, 1=atLeast,
+    /// 2=exact; xml name also accepted on set).
+    #[getter]
+    fn height_rule(&self, py: Python<'_>) -> Option<i64> {
+        self.read(py, |r| {
+            r.find("w:trPr")
+                .and_then(|p| p.find("w:trHeight"))
+                .and_then(|e| e.get_attr("w:hRule"))
+                .map(|s| match s {
+                    "atLeast" => 1,
+                    "exact" => 2,
+                    _ => 0,
+                })
+        })
+        .flatten()
+    }
+    #[setter]
+    fn set_height_rule(&self, py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        let val: Option<&'static str> = if v.is_none() {
+            None
+        } else if let Ok(i) = v.extract::<i64>() {
+            Some(match i {
+                1 => "atLeast",
+                2 => "exact",
+                _ => "auto",
+            })
+        } else {
+            let s: String = v.extract()?;
+            Some(match s.as_str() {
+                "atLeast" => "atLeast",
+                "exact" => "exact",
+                _ => "auto",
+            })
+        };
+        self.edit(py, |r| {
+            let trpr = crate::docmodel_fmt::ensure_trpr(r);
+            let h = crate::docmodel_fmt::ensure_child(trpr, "w:trHeight");
+            match val {
+                Some(x) => h.set_attr("w:hRule", x),
+                None => h.attrs.retain(|(k, _)| k != "w:hRule"),
+            }
+        })
+    }
+
+
+    /// The package part this object belongs to (minimal facade).
+    #[getter]
+    fn part(&self, py: Python<'_>) -> crate::docmodel_fmt::PyPart {
+        crate::docmodel_fmt::PyPart {
+            tpl: self.tpl.clone_ref(py),
+            part_name: DOCUMENT_PART.to_string(),
+        }
+    }
+
+    /// Grid columns before this row (trPr/gridBefore; default 0).
+    #[getter]
+    fn grid_cols_before(&self, py: Python<'_>) -> i64 {
+        self.row_grid_cols(py, "w:gridBefore")
+    }
+    /// Grid columns after this row (trPr/gridAfter; default 0).
+    #[getter]
+    fn grid_cols_after(&self, py: Python<'_>) -> i64 {
+        self.row_grid_cols(py, "w:gridAfter")
+    }
+
     #[getter]
     fn cells(&self, py: Python<'_>) -> Vec<PyCell> {
         let n = with_core(&self.tpl, py, |core| {
@@ -750,7 +1652,7 @@ pub struct PyCell {
 }
 
 impl PyCell {
-    fn edit<R>(&self, py: Python<'_>, f: impl FnOnce(&mut Element) -> R) -> PyResult<R> {
+    pub(crate) fn edit<R>(&self, py: Python<'_>, f: impl FnOnce(&mut Element) -> R) -> PyResult<R> {
         with_core(&self.tpl, py, |core| {
             let mut result = None;
             let gen = core.doc_gen;
@@ -775,6 +1677,16 @@ impl PyCell {
 
 #[pymethods]
 impl PyCell {
+
+    /// The package part this object belongs to (minimal facade).
+    #[getter]
+    fn part(&self, py: Python<'_>) -> crate::docmodel_fmt::PyPart {
+        crate::docmodel_fmt::PyPart {
+            tpl: self.tpl.clone_ref(py),
+            part_name: DOCUMENT_PART.to_string(),
+        }
+    }
+
     #[getter]
     fn text(&self, py: Python<'_>) -> String {
         with_core(&self.tpl, py, |core| {
@@ -809,6 +1721,322 @@ impl PyCell {
             p.children.push(Node::Elem(r));
             c.children.push(Node::Elem(p));
         })
+    }
+
+    /// Paragraphs in this cell.
+    #[getter]
+    fn paragraphs(&self, py: Python<'_>) -> Vec<crate::docmodel_fmt::PyCellParagraph> {
+        let n = with_core(&self.tpl, py, |core| {
+            read_body(core, |body| {
+                nth_direct_ref(body, "w:tbl", self.index)
+                    .and_then(|t| nth_direct_ref(t, "w:tr", self.row))
+                    .and_then(|r| nth_direct_ref(r, "w:tc", self.col))
+                    .map(|c| {
+                        c.children
+                            .iter()
+                            .filter(|ch| matches!(ch, Node::Elem(e) if e.name == "w:p"))
+                            .count()
+                    })
+            })
+            .flatten()
+        })
+        .unwrap_or(0);
+        (0..n)
+            .map(|para| crate::docmodel_fmt::PyCellParagraph {
+                tpl: self.tpl.clone_ref(py),
+                index: self.index,
+                row: self.row,
+                col: self.col,
+                para,
+            })
+            .collect()
+    }
+
+    /// Append a paragraph to this cell (python-docx cell.add_paragraph).
+    #[pyo3(signature = (text="", style=None))]
+    fn add_paragraph(
+        &self,
+        py: Python<'_>,
+        text: &str,
+        style: Option<&str>,
+    ) -> PyResult<crate::docmodel_fmt::PyCellParagraph> {
+        let sid = match style {
+            Some(s) => Some(with_core(&self.tpl, py, |core| {
+                crate::subdocbuilder::resolve_style_id(core, s)
+            })),
+            None => None,
+        };
+        let text = text.to_string();
+        let para = self.edit(py, |c| {
+            let n = c
+                .children
+                .iter()
+                .filter(|ch| matches!(ch, Node::Elem(e) if e.name == "w:p"))
+                .count();
+            let mut p = Element::new("w:p");
+            if let Some(sid) = &sid {
+                let mut ppr = Element::new("w:pPr");
+                let mut ps = Element::new("w:pStyle");
+                ps.set_attr("w:val", sid);
+                ppr.children.push(Node::Elem(ps));
+                p.children.push(Node::Elem(ppr));
+            }
+            if !text.is_empty() {
+                let mut r = Element::new("w:r");
+                let mut t = Element::new("w:t");
+                t.set_attr("xml:space", "preserve");
+                t.children.push(Node::Text(text.clone()));
+                r.children.push(Node::Elem(t));
+                p.children.push(Node::Elem(r));
+            }
+            c.children.push(Node::Elem(p));
+            n
+        })?;
+        Ok(crate::docmodel_fmt::PyCellParagraph {
+            tpl: self.tpl.clone_ref(py),
+            index: self.index,
+            row: self.row,
+            col: self.col,
+            para,
+        })
+    }
+
+    /// Vertical alignment as a WD_CELL_VERTICAL_ALIGNMENT int (0=top,
+    /// 1=center, 3=bottom, 101=both; xml name also accepted on set).
+    #[getter]
+    fn vertical_alignment(&self, py: Python<'_>) -> Option<i64> {
+        with_core(&self.tpl, py, |core| {
+            read_body(core, |body| {
+                nth_direct_ref(body, "w:tbl", self.index)
+                    .and_then(|t| nth_direct_ref(t, "w:tr", self.row))
+                    .and_then(|r| nth_direct_ref(r, "w:tc", self.col))
+                    .and_then(|c| c.find("w:tcPr"))
+                    .and_then(|p| p.find("w:vAlign"))
+                    .and_then(|e| e.get_attr("w:val"))
+                    .map(|s| match s {
+                        "center" => 1,
+                        "bottom" => 3,
+                        "both" => 101,
+                        _ => 0,
+                    })
+            })
+            .flatten()
+        })
+    }
+    #[setter]
+    fn set_vertical_alignment(&self, py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        let val: Option<&'static str> = if v.is_none() {
+            None
+        } else if let Ok(i) = v.extract::<i64>() {
+            Some(match i {
+                1 => "center",
+                3 => "bottom",
+                101 => "both",
+                _ => "top",
+            })
+        } else {
+            let s: String = v.extract()?;
+            Some(match s.as_str() {
+                "center" => "center",
+                "bottom" => "bottom",
+                "both" => "both",
+                _ => "top",
+            })
+        };
+        self.edit(py, |c| {
+            let tcpr = tcpr_mut(c);
+            match val {
+                Some(x) => {
+                    let va = crate::docmodel_fmt::ensure_child(tcpr, "w:vAlign");
+                    va.set_attr("w:val", x);
+                }
+                None => tcpr
+                    .children
+                    .retain(|ch| !matches!(ch, Node::Elem(e) if e.name == "w:vAlign")),
+            }
+        })
+    }
+
+    /// Cell width (w:tcPr/w:tcW; set forces type=dxa).
+    #[getter]
+    fn width(&self, py: Python<'_>) -> Option<crate::pyclasses::PyLength> {
+        with_core(&self.tpl, py, |core| {
+            read_body(core, |body| {
+                nth_direct_ref(body, "w:tbl", self.index)
+                    .and_then(|t| nth_direct_ref(t, "w:tr", self.row))
+                    .and_then(|r| nth_direct_ref(r, "w:tc", self.col))
+                    .and_then(|c| c.find("w:tcPr"))
+                    .and_then(|p| p.find("w:tcW"))
+                    .and_then(|e| {
+                        if e.get_attr("w:type") == Some("dxa") {
+                            e.get_attr("w:w").and_then(|s| s.parse::<i64>().ok())
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .flatten()
+            .pipe_map(to_len)
+        })
+    }
+    #[setter]
+    fn set_width(&self, py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        let twips = from_len(v)?;
+        self.edit(py, |c| {
+            let tcpr = tcpr_mut(c);
+            let tcw = crate::docmodel_fmt::ensure_child(tcpr, "w:tcW");
+            match twips {
+                Some(t) => {
+                    tcw.set_attr("w:type", "dxa");
+                    tcw.set_attr("w:w", &t.to_string());
+                }
+                None => tcpr
+                    .children
+                    .retain(|ch| !matches!(ch, Node::Elem(e) if e.name == "w:tcW")),
+            }
+        })
+    }
+
+    /// Grid columns spanned by this cell (w:gridSpan; default 1).
+    #[getter]
+    fn grid_span(&self, py: Python<'_>) -> i64 {
+        with_core(&self.tpl, py, |core| {
+            read_body(core, |body| {
+                nth_direct_ref(body, "w:tbl", self.index)
+                    .and_then(|t| nth_direct_ref(t, "w:tr", self.row))
+                    .and_then(|r| nth_direct_ref(r, "w:tc", self.col))
+                    .and_then(|c| c.find("w:tcPr"))
+                    .and_then(|p| p.find("w:gridSpan"))
+                    .and_then(|e| e.get_attr("w:val"))
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(1)
+            })
+            .unwrap_or(1)
+        })
+    }
+
+    /// Tables nested inside this cell.
+    #[getter]
+    fn tables(&self, py: Python<'_>) -> Vec<crate::docmodel_fmt::PyCellTable> {
+        let n = with_core(&self.tpl, py, |core| {
+            read_body(core, |body| {
+                nth_direct_ref(body, "w:tbl", self.index)
+                    .and_then(|t| nth_direct_ref(t, "w:tr", self.row))
+                    .and_then(|r| nth_direct_ref(r, "w:tc", self.col))
+                    .map(|c| {
+                        c.children
+                            .iter()
+                            .filter(|ch| matches!(ch, Node::Elem(e) if e.name == "w:tbl"))
+                            .count()
+                    })
+            })
+            .flatten()
+        })
+        .unwrap_or(0);
+        (0..n)
+            .map(|tindex| crate::docmodel_fmt::PyCellTable {
+                tpl: self.tpl.clone_ref(py),
+                index: self.index,
+                row: self.row,
+                col: self.col,
+                tindex,
+            })
+            .collect()
+    }
+
+    /// Append a rows x cols table to this cell (python-docx cell.add_table).
+    fn add_table(&self, py: Python<'_>, rows: usize, cols: usize) -> PyResult<crate::docmodel_fmt::PyCellTable> {
+        let tindex = self.edit(py, |c| {
+            let n = c
+                .children
+                .iter()
+                .filter(|ch| matches!(ch, Node::Elem(e) if e.name == "w:tbl"))
+                .count();
+            let mut tbl = Element::new("w:tbl");
+            let mut grid = Element::new("w:tblGrid");
+            let w = (8640usize / cols.max(1)).to_string();
+            for _ in 0..cols {
+                let mut gc = Element::new("w:gridCol");
+                gc.set_attr("w:w", &w);
+                grid.children.push(Node::Elem(gc));
+            }
+            tbl.children.push(Node::Elem(grid));
+            for _ in 0..rows {
+                let mut tr = Element::new("w:tr");
+                for _ in 0..cols {
+                    let mut tc = Element::new("w:tc");
+                    tc.children.push(Node::Elem(Element::new("w:p")));
+                    tr.children.push(Node::Elem(tc));
+                }
+                tbl.children.push(Node::Elem(tr));
+            }
+            c.children.push(Node::Elem(tbl));
+            // a cell must end with a paragraph
+            let last_is_p = matches!(c.children.last(), Some(Node::Elem(e)) if e.name == "w:p");
+            if !last_is_p {
+                c.children.push(Node::Elem(Element::new("w:p")));
+            }
+            n
+        })?;
+        Ok(crate::docmodel_fmt::PyCellTable {
+            tpl: self.tpl.clone_ref(py),
+            index: self.index,
+            row: self.row,
+            col: self.col,
+            tindex,
+        })
+    }
+
+    /// Paragraphs and tables of this cell in document order.
+    fn iter_inner_content(&self, py: Python<'_>) -> Vec<Py<PyAny>> {
+        let kinds: Vec<bool> = with_core(&self.tpl, py, |core| {
+            read_body(core, |body| {
+                nth_direct_ref(body, "w:tbl", self.index)
+                    .and_then(|t| nth_direct_ref(t, "w:tr", self.row))
+                    .and_then(|r| nth_direct_ref(r, "w:tc", self.col))
+                    .map(|c| {
+                        c.children
+                            .iter()
+                            .filter_map(|ch| match ch {
+                                Node::Elem(e) if e.name == "w:p" => Some(true),
+                                Node::Elem(e) if e.name == "w:tbl" => Some(false),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .flatten()
+        })
+        .unwrap_or_default();
+        let mut pi = 0usize;
+        let mut ti = 0usize;
+        let mut out = Vec::new();
+        for is_p in kinds {
+            if is_p {
+                if let Ok(v) = Py::new(py, crate::docmodel_fmt::PyCellParagraph {
+                    tpl: self.tpl.clone_ref(py),
+                    index: self.index,
+                    row: self.row,
+                    col: self.col,
+                    para: pi,
+                }) {
+                    out.push(v.into_any());
+                }
+                pi += 1;
+            } else {
+                if let Ok(v) = Py::new(py, crate::docmodel_fmt::PyCellTable {
+                    tpl: self.tpl.clone_ref(py),
+                    index: self.index,
+                    row: self.row,
+                    col: self.col,
+                    tindex: ti,
+                }) {
+                    out.push(v.into_any());
+                }
+                ti += 1;
+            }
+        }
+        out
     }
 
     /// Merge this cell with `other` into one cell spanning the rectangular
@@ -860,7 +2088,7 @@ fn tc_positions(row: &Element) -> Vec<usize> {
         .collect()
 }
 
-fn tcpr_mut(tc: &mut Element) -> &mut Element {
+pub(crate) fn tcpr_mut(tc: &mut Element) -> &mut Element {
     if tc.find("w:tcPr").is_none() {
         tc.children.insert(0, Node::Elem(Element::new("w:tcPr")));
     }
@@ -1037,13 +2265,13 @@ impl PySection {
     }
 }
 
-fn get_twips(sp: &Element, tag: &str, attr: &str) -> Option<i64> {
+pub(crate) fn get_twips(sp: &Element, tag: &str, attr: &str) -> Option<i64> {
     sp.find(tag)
         .and_then(|e| e.get_attr(attr))
         .and_then(|v| v.parse::<i64>().ok())
 }
 
-fn set_twips(sp: &mut Element, tag: &str, attr: &str, v: Option<i64>, defaults: &[(&str, &str)]) {
+pub(crate) fn set_twips(sp: &mut Element, tag: &str, attr: &str, v: Option<i64>, defaults: &[(&str, &str)]) {
     let el = match sp.find_mut(tag) {
         Some(e) => e,
         None => {
@@ -1060,11 +2288,11 @@ fn set_twips(sp: &mut Element, tag: &str, attr: &str, v: Option<i64>, defaults: 
     }
 }
 
-fn to_len(v: Option<i64>) -> Option<crate::pyclasses::PyLength> {
+pub(crate) fn to_len(v: Option<i64>) -> Option<crate::pyclasses::PyLength> {
     v.map(|t| crate::pyclasses::PyLength { emu: t * 635 })
 }
 
-fn from_len(obj: &Bound<'_, PyAny>) -> PyResult<Option<i64>> {
+pub(crate) fn from_len(obj: &Bound<'_, PyAny>) -> PyResult<Option<i64>> {
     crate::pyclasses::extract_length_pub(obj).map(|o| o.map(|emu| emu / 635))
 }
 
@@ -1077,6 +2305,16 @@ impl<T> PipeMap for T {}
 
 #[pymethods]
 impl PySection {
+
+
+    /// The package part this object belongs to (minimal facade).
+    #[getter]
+    fn part(&self, py: Python<'_>) -> crate::docmodel_fmt::PyPart {
+        crate::docmodel_fmt::PyPart {
+            tpl: self.tpl.clone_ref(py),
+            part_name: DOCUMENT_PART.to_string(),
+        }
+    }
 
     #[getter]
     fn page_width(&self, py: Python<'_>) -> Option<crate::pyclasses::PyLength> {
@@ -1261,6 +2499,141 @@ impl PySection {
                     .retain(|c| !matches!(c, Node::Elem(e) if e.name == "w:titlePg"));
             }
         })
+    }
+
+    /// Section start type as a WD_SECTION_START int (0=continuous,
+    /// 1=nextColumn, 2=nextPage, 3=evenPage, 4=oddPage; xml name also
+    /// accepted on set). Missing w:type reads as 2 (next page).
+    #[getter]
+    fn start_type(&self, py: Python<'_>) -> i64 {
+        self.read(py, |sp| {
+            sp.find("w:type")
+                .and_then(|e| e.get_attr("w:val"))
+                .map(|s| match s {
+                    "continuous" => 0,
+                    "nextColumn" => 1,
+                    "evenPage" => 3,
+                    "oddPage" => 4,
+                    _ => 2,
+                })
+                .unwrap_or(2)
+        })
+        .unwrap_or(2)
+    }
+    #[setter]
+    fn set_start_type(&self, py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        let val: Option<&'static str> = if v.is_none() {
+            None
+        } else if let Ok(i) = v.extract::<i64>() {
+            Some(match i {
+                0 => "continuous",
+                1 => "nextColumn",
+                3 => "evenPage",
+                4 => "oddPage",
+                _ => "nextPage",
+            })
+        } else {
+            let s: String = v.extract()?;
+            Some(match s.as_str() {
+                "continuous" => "continuous",
+                "nextColumn" => "nextColumn",
+                "evenPage" => "evenPage",
+                "oddPage" => "oddPage",
+                _ => "nextPage",
+            })
+        };
+        self.edit(py, |sp| match val {
+            // nextPage is the default: drop the element (python-docx)
+            None | Some("nextPage") => sp
+                .children
+                .retain(|c| !matches!(c, Node::Elem(e) if e.name == "w:type")),
+            Some(x) => {
+                let t = crate::docmodel_fmt::ensure_child(sp, "w:type");
+                t.set_attr("w:val", x);
+            }
+        })
+    }
+
+    #[getter]
+    fn header_distance(&self, py: Python<'_>) -> Option<crate::pyclasses::PyLength> {
+        self.read(py, |sp| get_twips(sp, "w:pgMar", "w:header"))
+            .flatten()
+            .pipe_map(to_len)
+    }
+    #[setter]
+    fn set_header_distance(&self, py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        let twips = from_len(v)?;
+        self.edit(py, |sp| set_twips(sp, "w:pgMar", "w:header", twips, &[("w:left", "1800"), ("w:right", "1800"), ("w:top", "1440"), ("w:bottom", "1440")]))
+    }
+    #[getter]
+    fn footer_distance(&self, py: Python<'_>) -> Option<crate::pyclasses::PyLength> {
+        self.read(py, |sp| get_twips(sp, "w:pgMar", "w:footer"))
+            .flatten()
+            .pipe_map(to_len)
+    }
+    #[setter]
+    fn set_footer_distance(&self, py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        let twips = from_len(v)?;
+        self.edit(py, |sp| set_twips(sp, "w:pgMar", "w:footer", twips, &[("w:left", "1800"), ("w:right", "1800"), ("w:top", "1440"), ("w:bottom", "1440")]))
+    }
+    #[getter]
+    fn gutter(&self, py: Python<'_>) -> Option<crate::pyclasses::PyLength> {
+        self.read(py, |sp| get_twips(sp, "w:pgMar", "w:gutter"))
+            .flatten()
+            .pipe_map(to_len)
+    }
+    #[setter]
+    fn set_gutter(&self, py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        let twips = from_len(v)?;
+        self.edit(py, |sp| set_twips(sp, "w:pgMar", "w:gutter", twips, &[("w:left", "1800"), ("w:right", "1800"), ("w:top", "1440"), ("w:bottom", "1440")]))
+    }
+
+    /// Paragraphs and tables of this section in document order. Section
+    /// boundaries are the paragraphs carrying a paragraph-level sectPr; the
+    /// last section ends at the body-level sectPr.
+    pub fn iter_inner_content(&self, py: Python<'_>) -> Vec<Py<PyAny>> {
+        let items: Vec<(bool, usize)> = with_core(&self.tpl, py, |core| {
+            read_body(core, |body| {
+                // section ranges: (is_paragraph, tag_index) per section
+                let mut sections: Vec<Vec<(bool, usize)>> = vec![Vec::new()];
+                let mut pi = 0usize;
+                let mut ti = 0usize;
+                for c in &body.children {
+                    let Node::Elem(e) = c else { continue };
+                    match e.name.as_str() {
+                        "w:p" => {
+                            sections.last_mut().unwrap().push((true, pi));
+                            pi += 1;
+                            let ends_section = e
+                                .find("w:pPr")
+                                .and_then(|ppr| ppr.find("w:sectPr"))
+                                .is_some();
+                            if ends_section {
+                                sections.push(Vec::new());
+                            }
+                        }
+                        "w:tbl" => {
+                            sections.last_mut().unwrap().push((false, ti));
+                            ti += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                sections.get(self.index).cloned().unwrap_or_default()
+            })
+            .unwrap_or_default()
+        });
+        let mut out = Vec::new();
+        for (is_p, idx) in items {
+            if is_p {
+                if let Ok(v) = Py::new(py, PyParagraph { tpl: self.tpl.clone_ref(py), index: idx }) {
+                    out.push(v.into_any());
+                }
+            } else if let Ok(v) = Py::new(py, PyTable { tpl: self.tpl.clone_ref(py), index: idx }) {
+                out.push(v.into_any());
+            }
+        }
+        out
     }
 }
 
@@ -1547,7 +2920,7 @@ pub(crate) fn find_style_el<'a>(root: &'a Element, style_id: &str) -> Option<&'a
     walk(root, style_id)
 }
 
-fn find_style_el_mut<'a>(root: &'a mut Element, style_id: &str) -> Option<&'a mut Element> {
+pub(crate) fn find_style_el_mut<'a>(root: &'a mut Element, style_id: &str) -> Option<&'a mut Element> {
     for c in root.children.iter_mut() {
         if let Node::Elem(e) = c {
             if e.name == "w:style" && e.get_attr("w:styleId") == Some(style_id) {
@@ -1562,7 +2935,7 @@ fn find_style_el_mut<'a>(root: &'a mut Element, style_id: &str) -> Option<&'a mu
 }
 
 impl PyStyle {
-    fn edit<R>(&self, py: Python<'_>, f: impl FnOnce(&mut Element) -> R) -> PyResult<R> {
+    pub(crate) fn edit<R>(&self, py: Python<'_>, f: impl FnOnce(&mut Element) -> R) -> PyResult<R> {
         with_core(&self.tpl, py, |core| {
             let mut result = None;
             with_styles(core, |root| {
@@ -1575,7 +2948,7 @@ impl PyStyle {
         })
     }
 
-    fn read<R>(&self, py: Python<'_>, f: impl FnOnce(&Element) -> R) -> Option<R> {
+    pub(crate) fn read<R>(&self, py: Python<'_>, f: impl FnOnce(&Element) -> R) -> Option<R> {
         with_core(&self.tpl, py, |core| {
             let dom = core.part_dom("word/styles.xml").ok()?;
             find_style_el(&dom.root, &self.style_id).map(|e| f(e))
@@ -1609,6 +2982,16 @@ impl PyDocument {
         }
     }
 
+
+    /// The package part this object belongs to (minimal facade).
+    #[getter]
+    fn part(&self, py: Python<'_>) -> crate::docmodel_fmt::PyPart {
+        crate::docmodel_fmt::PyPart {
+            tpl: self.tpl.clone_ref(py),
+            part_name: DOCUMENT_PART.to_string(),
+        }
+    }
+
     #[getter]
     pub fn paragraphs(&self, py: Python<'_>) -> Vec<PyParagraph> {
         let n = with_core(&self.tpl, py, |core| count_in_body(core, "w:p"));
@@ -1629,6 +3012,41 @@ impl PyDocument {
                 index: i,
             })
             .collect()
+    }
+
+    /// Paragraphs and tables of the document body in document order
+    /// (python-docx iter_inner_content).
+    pub fn iter_inner_content(&self, py: Python<'_>) -> Vec<Py<PyAny>> {
+        let kinds: Vec<bool> = with_core(&self.tpl, py, |core| {
+            read_body(core, |body| {
+                body.children
+                    .iter()
+                    .filter_map(|c| match c {
+                        Node::Elem(e) if e.name == "w:p" => Some(true),
+                        Node::Elem(e) if e.name == "w:tbl" => Some(false),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+        });
+        let mut pi = 0usize;
+        let mut ti = 0usize;
+        let mut out = Vec::new();
+        for is_p in kinds {
+            if is_p {
+                if let Ok(v) = Py::new(py, PyParagraph { tpl: self.tpl.clone_ref(py), index: pi }) {
+                    out.push(v.into_any());
+                }
+                pi += 1;
+            } else {
+                if let Ok(v) = Py::new(py, PyTable { tpl: self.tpl.clone_ref(py), index: ti }) {
+                    out.push(v.into_any());
+                }
+                ti += 1;
+            }
+        }
+        out
     }
 
     #[getter]
@@ -1782,6 +3200,16 @@ impl PyDocument {
 
 #[pymethods]
 impl PyStyle {
+
+    /// The styles package part (minimal facade).
+    #[getter]
+    fn part(&self, py: Python<'_>) -> crate::docmodel_fmt::PyPart {
+        crate::docmodel_fmt::PyPart {
+            tpl: self.tpl.clone_ref(py),
+            part_name: "word/styles.xml".to_string(),
+        }
+    }
+
     #[getter]
     fn name(&self, py: Python<'_>) -> Option<String> {
         self.read(py, |st| style_name_of(st)).flatten()
@@ -1833,12 +3261,130 @@ impl PyStyle {
         })
     }
 
+    /// Full python-docx Font facade over the style's w:rPr.
     #[getter]
-    fn font(&self, py: Python<'_>) -> PyStyleFont {
-        PyStyleFont {
+    fn font(&self, py: Python<'_>) -> crate::docmodel_fmt::PyFont {
+        crate::docmodel_fmt::PyFont {
             tpl: self.tpl.clone_ref(py),
-            style_id: self.style_id.clone(),
+            target: crate::docmodel_fmt::FontTarget::Style {
+                style_id: self.style_id.clone(),
+            },
         }
+    }
+
+    /// Paragraph formatting of the style (python-docx
+    /// ParagraphStyle.paragraph_format).
+    #[getter]
+    fn paragraph_format(&self, py: Python<'_>) -> crate::docmodel_fmt::PyParagraphFormat {
+        crate::docmodel_fmt::PyParagraphFormat {
+            tpl: self.tpl.clone_ref(py),
+            target: crate::docmodel_fmt::PfTarget::Style {
+                style_id: self.style_id.clone(),
+            },
+        }
+    }
+
+    /// Hidden in the UI until used (w:semiHidden; python-docx Style.hidden).
+    #[getter]
+    fn hidden(&self, py: Python<'_>) -> bool {
+        self.read(py, |st| st.find("w:semiHidden").is_some())
+            .unwrap_or(false)
+    }
+    #[setter]
+    fn set_hidden(&self, py: Python<'_>, v: bool) -> PyResult<()> {
+        self.edit(py, |st| style_flag(st, "w:semiHidden", v))
+    }
+
+    /// Locked against editing (w:locked).
+    #[getter]
+    fn locked(&self, py: Python<'_>) -> bool {
+        self.read(py, |st| st.find("w:locked").is_some())
+            .unwrap_or(false)
+    }
+    #[setter]
+    fn set_locked(&self, py: Python<'_>, v: bool) -> PyResult<()> {
+        self.edit(py, |st| style_flag(st, "w:locked", v))
+    }
+
+    /// Shown in the quick style gallery (w:qFormat).
+    #[getter]
+    fn quick_style(&self, py: Python<'_>) -> bool {
+        self.read(py, |st| st.find("w:qFormat").is_some())
+            .unwrap_or(false)
+    }
+    #[setter]
+    fn set_quick_style(&self, py: Python<'_>, v: bool) -> PyResult<()> {
+        self.edit(py, |st| style_flag(st, "w:qFormat", v))
+    }
+
+    /// Re-hide when the style is no longer used (w:unhideWhenUsed).
+    #[getter]
+    fn unhide_when_used(&self, py: Python<'_>) -> bool {
+        self.read(py, |st| st.find("w:unhideWhenUsed").is_some())
+            .unwrap_or(false)
+    }
+    #[setter]
+    fn set_unhide_when_used(&self, py: Python<'_>, v: bool) -> PyResult<()> {
+        self.edit(py, |st| style_flag(st, "w:unhideWhenUsed", v))
+    }
+
+    /// UI priority (w:uiPriority w:val); None removes it.
+    #[getter]
+    fn priority(&self, py: Python<'_>) -> Option<i64> {
+        self.read(py, |st| {
+            st.find("w:uiPriority")
+                .and_then(|e| e.get_attr("w:val"))
+                .and_then(|s| s.parse::<i64>().ok())
+        })
+        .flatten()
+    }
+    #[setter]
+    fn set_priority(&self, py: Python<'_>, v: Option<i64>) -> PyResult<()> {
+        self.edit(py, |st| match v {
+            Some(n) => {
+                let e = crate::docmodel_fmt::ensure_child(st, "w:uiPriority");
+                e.set_attr("w:val", &n.to_string());
+            }
+            None => st
+                .children
+                .retain(|c| !matches!(c, Node::Elem(e) if e.name == "w:uiPriority")),
+        })
+    }
+
+    /// Builtin styles lack the w:customStyle attribute (read-only).
+    #[getter]
+    fn builtin(&self, py: Python<'_>) -> bool {
+        self.read(py, |st| {
+            !matches!(st.get_attr("w:customStyle"), Some("1") | Some("true") | Some("on"))
+        })
+        .unwrap_or(true)
+    }
+
+    /// Style applied to the next paragraph (w:next; paragraph styles).
+    #[getter]
+    fn next_paragraph_style(&self, py: Python<'_>) -> Option<String> {
+        self.read(py, |st| {
+            st.find("w:next")
+                .and_then(|e| e.get_attr("w:val").map(|s| s.to_string()))
+        })
+        .flatten()
+    }
+    #[setter]
+    fn set_next_paragraph_style(&self, py: Python<'_>, v: &Bound<'_, PyAny>) -> PyResult<()> {
+        if v.is_none() {
+            return self.edit(py, |st| {
+                st.children
+                    .retain(|c| !matches!(c, Node::Elem(e) if e.name == "w:next"));
+            });
+        }
+        let name: String = v.extract()?;
+        let sid = with_core(&self.tpl, py, |core| {
+            crate::subdocbuilder::resolve_style_id(core, &name)
+        });
+        self.edit(py, |st| {
+            let e = crate::docmodel_fmt::ensure_child(st, "w:next");
+            e.set_attr("w:val", &sid);
+        })
     }
 
     fn delete(&self, py: Python<'_>) -> PyResult<()> {
@@ -1850,6 +3396,17 @@ impl PyStyle {
             })
             .map_err(py_err)
         })
+    }
+}
+
+/// on/off child element of a style (missing == off).
+fn style_flag(st: &mut Element, tag: &str, on: bool) {
+    let exists = st.find(tag).is_some();
+    if on && !exists {
+        st.children.push(Node::Elem(Element::new(tag)));
+    } else if !on && exists {
+        st.children
+            .retain(|c| !matches!(c, Node::Elem(e) if e.name == tag));
     }
 }
 
@@ -2242,6 +3799,34 @@ impl PySettings {
                 } else if !v && exists {
                     root.children
                         .retain(|c| !matches!(c, Node::Elem(e) if e.name == "w:evenAndOddHeaders"));
+                }
+            })
+            .map_err(py_err)
+        })
+    }
+
+    /// Update fields (PAGE/NUMPAGES/TOC/...) when the document is opened in
+    /// Word (w:updateFields in settings.xml).
+    #[getter]
+    fn update_fields_on_open(&self, py: Python<'_>) -> bool {
+        with_core(&self.tpl, py, |core| {
+            core.part_dom("word/settings.xml")
+                .map(|dom| dom.root.find("w:updateFields").is_some())
+                .unwrap_or(false)
+        })
+    }
+
+    #[setter]
+    fn set_update_fields_on_open(&self, py: Python<'_>, v: bool) -> PyResult<()> {
+        with_core(&self.tpl, py, |core| {
+            with_settings(core, |root| {
+                let exists = root.find("w:updateFields").is_some();
+                if v && !exists {
+                    root.children
+                        .push(Node::Elem(Element::new("w:updateFields")));
+                } else if !v && exists {
+                    root.children
+                        .retain(|c| !matches!(c, Node::Elem(e) if e.name == "w:updateFields"));
                 }
             })
             .map_err(py_err)

@@ -468,11 +468,15 @@ impl PyDocxTemplate {
     }
 
     /// Create a new Subdoc from a docx file path (or empty if omitted).
-    #[pyo3(signature = (docpath=None))]
+    /// keep_sections=True preserves the subdoc's section properties (page
+    /// size/orientation/margins, header/footer references) by making the
+    /// subdoc content its own section; the default False matches docxtpl.
+    #[pyo3(signature = (docpath=None, keep_sections=false))]
     fn new_subdoc(
         slf: Py<Self>,
         py: Python<'_>,
         docpath: Option<&Bound<'_, PyAny>>,
+        keep_sections: bool,
     ) -> PyResult<Py<PySubdoc>> {
         slf.bind(py)
             .borrow()
@@ -484,7 +488,7 @@ impl PyDocxTemplate {
             Some(p) => Some(read_bytes_source(p)?),
             None => None,
         };
-        Py::new(py, PySubdoc { bytes, tpl: slf, blocks: std::cell::RefCell::new(Vec::new()) })
+        Py::new(py, PySubdoc { bytes, tpl: slf, blocks: std::cell::RefCell::new(Vec::new()), keep_sections })
     }
 
     /// Create an external hyperlink relationship, returns the rId.
@@ -960,6 +964,8 @@ pub struct PySubdoc {
     pub bytes: Option<Vec<u8>>,
     pub tpl: Py<PyDocxTemplate>,
     pub blocks: RefCell<Vec<crate::subdocbuilder::Block>>,
+    /// preserve the subdoc's section properties (page setup, headers/footers)
+    pub keep_sections: bool,
 }
 
 fn edit_block<R>(
@@ -979,8 +985,12 @@ fn edit_block<R>(
 #[pymethods]
 impl PySubdoc {
     #[new]
-    #[pyo3(signature = (tpl, docpath=None))]
-    fn new(tpl: Py<PyDocxTemplate>, docpath: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+    #[pyo3(signature = (tpl, docpath=None, keep_sections=false))]
+    fn new(
+        tpl: Py<PyDocxTemplate>,
+        docpath: Option<&Bound<'_, PyAny>>,
+        keep_sections: bool,
+    ) -> PyResult<Self> {
         let bytes = match docpath {
             Some(p) => Some(read_bytes_source(p)?),
             None => None,
@@ -989,6 +999,7 @@ impl PySubdoc {
             bytes,
             tpl,
             blocks: RefCell::new(Vec::new()),
+            keep_sections,
         })
     }
 
@@ -1350,6 +1361,76 @@ impl PySubTableCell {
             }
             _ => {}
         })?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------- Composer
+
+/// docxcompose-style document concatenation: append whole docx documents
+/// to the end of a master document.
+///
+/// ```python
+/// composer = Composer("master.docx")
+/// composer.append("chapter1.docx")
+/// composer.append("chapter2.docx")
+/// composer.save("out.docx")
+/// ```
+#[pyclass(name = "Composer", unsendable)]
+pub struct PyComposer {
+    inner: RefCell<crate::composer::Composer>,
+}
+
+#[pymethods]
+impl PyComposer {
+    /// master: path, bytes, or file-like object with the master docx.
+    #[new]
+    fn new(master: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let bytes = read_bytes_source(master)?;
+        let inner = crate::composer::Composer::new(bytes).map_err(to_pyerr)?;
+        Ok(PyComposer {
+            inner: RefCell::new(inner),
+        })
+    }
+
+    /// Append one whole docx (path, bytes, or file-like) to the master's
+    /// body, preceded by a page break. Styles/numbering/media/footnotes are
+    /// merged like docxcompose (style conflicts renamed `X_1`, the first
+    /// list restarts numbering); the appended document's section properties
+    /// (page setup, header/footer references) are dropped.
+    fn append(&self, py: Python<'_>, doc: &Bound<'_, PyAny>) -> PyResult<()> {
+        let bytes = read_bytes_source(doc)?;
+        let inner = AssertSend(&self.inner);
+        py.detach(move || {
+            let inner = inner; // capture AssertSend as a whole
+            inner.0.borrow_mut().append(&bytes)
+        })
+        .map_err(to_pyerr)
+    }
+
+    /// Save the composed docx to a path or file-like object.
+    fn save(&self, py: Python<'_>, filename: &Bound<'_, PyAny>) -> PyResult<()> {
+        let inner = AssertSend(&self.inner);
+        let bytes = py
+            .detach(move || {
+                let inner = inner; // capture AssertSend as a whole
+                inner.0.borrow_mut().save_bytes()
+            })
+            .map_err(to_pyerr)?;
+        if let Ok(path) = filename.extract::<String>() {
+            std::fs::write(&path, &bytes)
+                .map_err(|e| PyValueError::new_err(format!("cannot write {}: {}", path, e)))?;
+            return Ok(());
+        }
+        if let Ok(fspath) = filename.call_method0("__fspath__") {
+            if let Ok(path) = fspath.extract::<String>() {
+                std::fs::write(&path, &bytes)
+                    .map_err(|e| PyValueError::new_err(format!("cannot write {}: {}", path, e)))?;
+                return Ok(());
+            }
+        }
+        let b = PyBytes::new(py, &bytes);
+        filename.call_method1("write", (b,))?;
         Ok(())
     }
 }

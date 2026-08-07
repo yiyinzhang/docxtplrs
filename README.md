@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/docxtplrs.svg)](https://crates.io/crates/docxtplrs)
 [![docs.rs](https://docs.rs/docxtplrs/badge.svg)](https://docs.rs/docxtplrs)
 [![license](https://img.shields.io/badge/license-LGPL--2.1--or--later-blue.svg)](https://github.com/yiyinzhang/docxtplrs)
-[![tests](https://img.shields.io/badge/tests-384%20passed-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
+[![tests](https://img.shields.io/badge/tests-445%20passed-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
 [![coverage](https://img.shields.io/badge/coverage-86%25-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
 [![crosscheck](https://img.shields.io/badge/crosscheck-ALL%20MATCH-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
 
@@ -22,7 +22,7 @@ docx 的 zip/XML 处理、模板预处理、表格修复、关系管理、文档
 
 > ⚠️ Vibecoding project / AI 结对编写项目：written by an AI (Kimi Code) with the user,
 > without line-by-line human review / 未经人工逐行审查。Verified by the official docxtpl
-> test suite (32 real-world templates) + 384 in-house tests / 已通过官方套件与 384 个自建测试，
+> test suite (32 real-world templates) + 445 in-house tests / 已通过官方套件与 445 个自建测试，
 > but evaluate before production use / 生产使用前请自行评估。
 
 ## Quick start / 快速开始
@@ -83,11 +83,19 @@ tpl.save("out.docx")
   (`{{ var }}`, `{%tr %}`/`{%tc %}`/`{%p %}`, `RichText`, `InlineImage`,
   `Subdoc`, ...) mirror docxtpl; migrating is usually just changing the import.
   Verified against the official docxtpl test suite (32 real-world templates),
-  384 in-house tests, plus automated output cross-checking against docxtpl
+  445 in-house tests, plus automated output cross-checking against docxtpl
   itself (`tests/crosscheck.py`).
 - **One engine, two languages** — the same renderer is available as a native
   Rust crate, so Rust services/CLIs can render docx templates with no Python
   involved at all.
+- **Document composition** — `Composer` concatenates whole docx files
+  (docxcompose-style: page break between documents, style conflicts renamed,
+  list numbering restarted, media deduped), from both Python and pure Rust.
+  Going beyond docxcompose, appended documents keep their **section
+  properties** (page size/orientation/margins and header/footer references,
+  intermediate sections of multi-section documents included), **comments**
+  (with w15 threading state) are merged, and styles/numbering referenced
+  from inside headers/footers are merged consistently with the body.
 - **Engine extras beyond stock docxtpl** — `str` methods in templates
   (`upper/replace/split/...`), `'%s' % x` formatting, `{% break %}`/`{% continue %}`,
   the `{% do %}` statement, gettext i18n (`{% trans %}`/`{% pluralize %}`),
@@ -97,7 +105,11 @@ tpl.save("out.docx")
 - **Built-in read-write document model** — paragraphs/tables/sections/styles/
   comments/core properties plus `add_paragraph/add_heading/add_picture/
   add_table/add_page_break/add_section` cover the common python-docx paths,
-  without installing python-docx.
+  without installing python-docx. Full `Font` (29 properties with python-docx
+  tri-state semantics), `ParagraphFormat` (indents/spacing/line rules/keep
+  flags/tab stops), table columns/alignment/autofit, row heights, cell
+  vertical alignment, section start types and field codes (`add_field`,
+  `update_fields_on_open`) are all supported.
 - **Built-in CLI** — `python -m docxtplrs template.docx data.json out.docx`
   renders a template straight from the shell, no scripting needed.
 
@@ -215,7 +227,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-docxtplrs = { version = "0.2.0", default-features = false }  # pure Rust: no PyO3/libpython
+docxtplrs = { version = "0.2.1", default-features = false }  # pure Rust: no PyO3/libpython
 minijinja = "2"
 ```
 
@@ -235,6 +247,7 @@ Useful Rust API surface (all in `docxtplrs::`):
 | `template` | `TplCore`: `new/render/save_bytes/get_xml/undeclared_variables/build_url_id`, `Deferred`, replacement maps (`crc_to_new_media`, `pics_to_replace`, …) |
 | `package` | `Package` (docx zip entries, `.rels`, content types), `Rels`, CRC32/SHA1 helpers |
 | `patch` | `patch_xml`, `resolve_listing`, `decode_text_entities` (docxtpl's XML preprocessing) |
+| `composer` | `Composer`: docxcompose-style whole-document concatenation (`new`/`append`/`save_bytes`) |
 | `richtext` | `richtext_run`, `richtext_paragraph`, `listing_xml`, `TextProps` |
 | `image` | `ImageInfo` (PNG/JPEG/GIF/BMP/TIFF size & DPI), EMU conversions |
 | `gettext` | `Catalog` (.mo parsing, plural-rule evaluation) |
@@ -260,7 +273,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # in another uv project
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # or editable (local development)
 uv add --editable /path/to/docxtplrs
 ```
@@ -326,7 +339,8 @@ tpl.render({
     "items": [{"name": "A", "price": 12.5}],  # {%tr for x in items %} table row loop
     "rt": R("important", bold=True, color="#C00000"),  # write {{r rt }} in the template
     "img": InlineImage(tpl, "logo.png", width=Mm(15)), # {{ img }}
-    "sub": tpl.new_subdoc("chapter.docx"),             # {{p sub }}
+    "sub": tpl.new_subdoc("chapter.docx"),             # {{p sub }}; keep_sections=True
+                                                     # preserves the subdoc's page setup
 }, autoescape=True)
 
 tpl.save("out.docx")                         # or io.BytesIO()
@@ -345,7 +359,19 @@ tpl.save("out.docx")                         # or io.BytesIO()
 - Document object model (read-write): `get_docx()`, `paragraphs/tables/sections/
   styles/settings/comments/core_properties/inline_shapes`,
   `add_paragraph/add_heading/add_picture/add_table/add_page_break/add_section`,
-  run/cell formatting assignment, `__getattr__` delegation
+  full `Font` (29 tri-state properties) and `ParagraphFormat` (indents,
+  spacing, line rules, keep flags, tab stops) on runs/styles/paragraphs,
+  table `columns/add_column/alignment/autofit`, row `height/height_rule`,
+  cell `paragraphs/width/vertical_alignment`, section `start_type/distances`,
+  style flags (`hidden/locked/priority/quick_style/builtin/...`),
+  `insert_paragraph_before`/`clear`/`add_break`/`add_tab`/`add_text`,
+  `hyperlinks`, `iter_inner_content` (document/section/paragraph/run/cell),
+  `contains_page_break`/`rendered_page_breaks`, `part` facade,
+  field codes (`paragraph.fields`/`add_field`, `instr`/cached-result read-write,
+  `settings.update_fields_on_open`),
+  `run.add_picture`/`mark_comment_range`, `table_direction`,
+  `grid_span`/`grid_cols_before/after`, nested tables in cells,
+  `__getattr__` delegation
 - Raw-XML escape hatch: `settings/document/styles.element` return a live
   `XmlElement` proxy (`tag/text/attrib/get/set/remove_attr/find/findall/
   children/append/insert/remove/xml`), covering python-docx's `.element` use
@@ -355,7 +381,22 @@ tpl.save("out.docx")                         # or io.BytesIO()
 - docxtpl helpers: `HEADER_URI`/`FOOTER_URI`, `get_file_crc()` (path/bytes/
   file-like), `get_headers_footers(uri)` yielding live `(rid, XmlElement)` pairs
 - `RichText`/`R`, `RichTextParagraph`/`RP`, `Listing`, `InlineImage`, `Subdoc`
-  (file merging + programmatic `add_paragraph/add_picture/add_table`)
+  (file merging + programmatic `add_paragraph/add_picture/add_table`;
+  `new_subdoc(path, keep_sections=True)` additionally preserves the subdoc's
+  section properties — page setup and header/footer references — as its own
+  section; subdoc **comments are merged** in all cases)
+- `Composer`: docxcompose-style concatenation of whole documents —
+  `Composer(master).append(doc).save(out)`, with a page break between
+  documents and style/numbering/media merging:
+
+  ```python
+  from docxtplrs import Composer
+
+  c = Composer("master.docx")   # path / file-like / bytes
+  c.append("chapter1.docx")     # same input kinds
+  c.append("chapter2.docx")
+  c.save("out.docx")            # or io.BytesIO()
+  ```
 - Units: `Length/Emu/Inches/Cm/Mm/Pt/Twips`; jinja2.utils: `Cycler/Joiner/
   generate_lorem_ipsum`; exception: `TemplateError` (with `docx_context`)
 - CLI: `python -m docxtplrs template.docx data.json output.docx [-o] [-q]`
@@ -424,7 +465,7 @@ Engine-level extras beyond stock minijinja, so jinja2-style templates work as-is
 #### Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q          # 384 unit tests
+.venv/bin/python -m pytest tests/ -q          # 445 unit tests
 .venv/bin/python tests/crosscheck.py docxtplrs > /tmp/rs.json
 .venv/bin/python tests/crosscheck.py docxtpl > /tmp/ref.json   # needs crosscheck group
 .venv/bin/python tests/crosscheck.py compare /tmp/ref.json /tmp/rs.json
@@ -442,10 +483,11 @@ with `llvm-cov`.
 - The engine is minijinja, not jinja2: broadly compatible, but exotic jinja2 edge
   behavior is not guaranteed (common gaps already covered with custom tests/filters,
   loader, Unicode identifiers, kwargs support, etc.).
-- The document object model covers python-docx's common read/write paths but is
-  **not a full rewrite**: section writes, style editing, settings and comments are
-  supported; deeper APIs (precise paragraph-format objects, field-code editing,
-  OLE editing, ...) are not.
+- The document object model covers python-docx's common read/write paths
+  (including full `Font`/`ParagraphFormat` objects, table/row/cell geometry,
+  style flags, `rendered_page_breaks` markers, `iter_inner_content`, a
+  minimal `part` facade and field codes) but is **not a full rewrite**:
+  OLE editing is not supported.
 - `get_docx()` returns this library's facade object, **not** a python-docx
   `Document` — it cannot be passed to third-party code expecting python-docx types.
 
@@ -491,10 +533,15 @@ with `llvm-cov`.
   复现——引用数字前请用你自己的模板复测；引擎内部优化见[性能](#性能)。
 - **无缝替代**：Python API 与模板语法（`{{ var }}`、`{%tr %}`/`{%tc %}`/`{%p %}`、
   `RichText`、`InlineImage`、`Subdoc` 等）与 docxtpl 几乎完全一致，迁移通常只需改一行 import。
-  已通过 docxtpl 官方测试套件（32 个真实模板）、384 个自建测试，并有与 docxtpl 输出自动
+  已通过 docxtpl 官方测试套件（32 个真实模板）、445 个自建测试，并有与 docxtpl 输出自动
   交叉比对的工具（`tests/crosscheck.py`）。
 - **一个引擎，两种语言**：同一渲染器同时提供原生 Rust crate，Rust 服务/CLI 可以完全不
   经过 Python 渲染 docx 模板。
+- **文档拼接**：`Composer` 把多个完整 docx 首尾拼接为一个文档（docxcompose 风格：
+  文档间分页、样式冲突改名、列表编号重启、媒体去重），Python 与纯 Rust 两侧均可用。
+  比 docxcompose 更进一步：被拼接文档的**节属性**（页面尺寸/方向/页边距及页眉页脚
+  引用，多节文档的中间节同样保留）会被保留，**批注**（含 w15 线程状态）会被合并，
+  页眉页脚内部引用的样式与编号也会与正文一致地合并。
 - **超出原版 docxtpl 的引擎能力**：模板内 `str` 方法（`upper/replace/split/...`）、
   `'%s' % x` 格式化、`{% break %}`/`{% continue %}`、`{% do %}` 语句、gettext i18n
   （`{% trans %}`/`{% pluralize %}`）、`set_template_loader()` 支持的 `{% include %}`/
@@ -502,7 +549,10 @@ with `llvm-cov`.
   jinja2 `Environment` 的互操作。
 - **内置可读写文档对象模型**：paragraphs/tables/sections/styles/comments/core properties
   以及 `add_paragraph/add_heading/add_picture/add_table/add_page_break/add_section`，
-  覆盖 python-docx 常用读写路径，无需再安装 python-docx。
+  覆盖 python-docx 常用读写路径，无需再安装 python-docx。完整 `Font`（29 个属性，
+  python-docx 三态语义）、`ParagraphFormat`（缩进/间距/行距规则/keep 标志/制表位）、
+  表格列/对齐/自动适应、行高、单元格垂直对齐、节起始类型、域代码（`add_field`、
+  `update_fields_on_open`）均已支持。
 - **内置 CLI**：`python -m docxtplrs template.docx data.json out.docx`，无需写脚本即可
   在命令行直接渲染模板。
 
@@ -588,7 +638,7 @@ debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会�
 
 ```toml
 [dependencies]
-docxtplrs = { version = "0.2.0", default-features = false }  # 纯 Rust：不依赖 PyO3/libpython
+docxtplrs = { version = "0.2.1", default-features = false }  # 纯 Rust：不依赖 PyO3/libpython
 minijinja = "2"
 ```
 
@@ -609,6 +659,7 @@ Cargo features：
 | `template` | `TplCore`：`new/render/save_bytes/get_xml/undeclared_variables/build_url_id`、`Deferred`、替换映射（`crc_to_new_media`、`pics_to_replace` 等） |
 | `package` | `Package`（docx zip 条目、`.rels`、内容类型）、`Rels`、CRC32/SHA1 工具 |
 | `patch` | `patch_xml`、`resolve_listing`、`decode_text_entities`（docxtpl 的 XML 预处理） |
+| `composer` | `Composer`：docxcompose 风格的整文档拼接（`new`/`append`/`save_bytes`） |
 | `richtext` | `richtext_run`、`richtext_paragraph`、`listing_xml`、`TextProps` |
 | `image` | `ImageInfo`（PNG/JPEG/GIF/BMP/TIFF 尺寸与 DPI）、EMU 换算 |
 | `gettext` | `Catalog`（.mo 解析、复数规则求值） |
@@ -634,7 +685,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # 在其他 uv 项目中
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # 或本地开发模式（editable）
 uv add --editable /path/to/docxtplrs
 ```
@@ -700,7 +751,8 @@ tpl.render({
     "items": [{"name": "甲", "price": 12.5}],  # {%tr for x in items %} 表格行循环
     "rt": R("重点", bold=True, color="#C00000"),  # 模板里写 {{r rt }}
     "img": InlineImage(tpl, "logo.png", width=Mm(15)),  # {{ img }}
-    "sub": tpl.new_subdoc("chapter.docx"),                # {{p sub }}
+    "sub": tpl.new_subdoc("chapter.docx"),                # {{p sub }}；keep_sections=True
+                                                            # 可保留子文档页面设置
 }, autoescape=True)
 
 tpl.save("out.docx")                         # 或 io.BytesIO()
@@ -719,7 +771,18 @@ tpl.save("out.docx")                         # 或 io.BytesIO()
 - 文档对象模型（可读写）：`get_docx()`、`paragraphs/tables/sections/
   styles/settings/comments/core_properties/inline_shapes`、
   `add_paragraph/add_heading/add_picture/add_table/add_page_break/add_section`、
-  run/单元格格式赋值、`__getattr__` 委托
+  完整 `Font`（29 个三态属性）与 `ParagraphFormat`（缩进/间距/行距规则/
+  keep 标志/制表位，段落与样式均可）、表格 `columns/add_column/alignment/autofit`、
+  行 `height/height_rule`、单元格 `paragraphs/width/vertical_alignment`、
+  节 `start_type/页眉页脚距离`、样式标志位（`hidden/locked/priority/quick_style/builtin/...`）、
+  `insert_paragraph_before`/`clear`/`add_break`/`add_tab`/`add_text`、
+  `hyperlinks`、`iter_inner_content`（文档/节/段落/run/单元格）、
+  `contains_page_break`/`rendered_page_breaks`、`part` 门面、
+  域代码（`paragraph.fields`/`add_field`、`instr`/缓存结果读写、
+  `settings.update_fields_on_open`）、
+  `run.add_picture`/`mark_comment_range`、`table_direction`、
+  `grid_span`/`grid_cols_before/after`、单元格内嵌套表格、
+  `__getattr__` 委托
 - 原始 XML 逃生口：`settings/document/styles.element` 返回实时的 `XmlElement`
   代理（`tag/text/attrib/get/set/remove_attr/find/findall/children/append/
   insert/remove/xml`），覆盖 python-docx `.element` 的常见用法（如用
@@ -729,7 +792,20 @@ tpl.save("out.docx")                         # 或 io.BytesIO()
 - docxtpl 辅助 API：`HEADER_URI`/`FOOTER_URI`、`get_file_crc()`（路径/bytes/
   文件对象）、`get_headers_footers(uri)` 产出实时的 `(rid, XmlElement)` 对
 - `RichText`/`R`、`RichTextParagraph`/`RP`、`Listing`、`InlineImage`、`Subdoc`
-  （文件合并 + 编程式 `add_paragraph/add_picture/add_table`）
+  （文件合并 + 编程式 `add_paragraph/add_picture/add_table`；
+  `new_subdoc(path, keep_sections=True)` 还会把子文档的节属性——页面设置与
+  页眉页脚引用——保留为独立一节；子文档的**批注**在任何模式下都会被合并）
+- `Composer`：docxcompose 风格的整文档拼接——`Composer(master).append(doc).save(out)`，
+  文档间自动分页，样式/编号/媒体自动合并：
+
+  ```python
+  from docxtplrs import Composer
+
+  c = Composer("master.docx")   # 路径 / 文件对象 / bytes
+  c.append("chapter1.docx")     # 同样支持这三种输入
+  c.append("chapter2.docx")
+  c.save("out.docx")            # 或 io.BytesIO()
+  ```
 - 单位：`Length/Emu/Inches/Cm/Mm/Pt/Twips`；jinja2.utils：`Cycler/Joiner/
   generate_lorem_ipsum`；异常：`TemplateError`（含 `docx_context`）
 - CLI：`python -m docxtplrs template.docx data.json output.docx [-o] [-q]`
@@ -796,7 +872,7 @@ tpl.render(context, jinja_env=env)
 #### 测试
 
 ```bash
-.venv/bin/python -m pytest tests/ -q          # 384 个单元测试
+.venv/bin/python -m pytest tests/ -q          # 445 个单元测试
 .venv/bin/python tests/crosscheck.py docxtplrs > /tmp/rs.json
 .venv/bin/python tests/crosscheck.py docxtpl > /tmp/ref.json   # 需要 crosscheck 依赖组
 .venv/bin/python tests/crosscheck.py compare /tmp/ref.json /tmp/rs.json
@@ -812,9 +888,9 @@ tpl.render(context, jinja_env=env)
 
 - 引擎为 minijinja 而非 jinja2：总体兼容，但不保证极端 jinja2 边角行为一致
   （常见差异已通过自定义测试/过滤器、loader、Unicode 标识符、kwargs 支持等补齐）。
-- 文档对象模型覆盖 python-docx 常用读写路径，但**不是完整重写**：节写入、样式编辑、
-  settings、comments 已支持；更深的 API（精确的段落格式对象、域代码编辑、OLE 编辑等）
-  未覆盖。
+- 文档对象模型覆盖 python-docx 常用读写路径（含完整 `Font`/`ParagraphFormat` 对象、
+  表格/行/单元格几何属性、样式标志位、`rendered_page_breaks` 标记、`iter_inner_content`
+  与最小 `part` 门面、域代码读写），但**不是完整重写**：OLE 编辑未覆盖。
 - `get_docx()` 返回本库的外观对象，**不是** python-docx 的 `Document`——不能传给
   期望 python-docx 类型的第三方代码。
 
@@ -843,7 +919,7 @@ tpl.render(context, jinja_env=env)
 ```
 src/            Rust sources (17 modules, see AGENTS.md)   Rust 源码
 python/         Python package shell (__init__ + __main__ CLI)
-tests/          384 tests + crosscheck/compare/benchmark    测试、交叉验证与基准
+tests/          445 tests + crosscheck/compare/benchmark    测试、交叉验证与基准
 examples/       render.rs (Rust API), patch_dbg.rs (large-doc debugging), bench.rs (stage timings)
 AGENTS.md       Notes for AI coding assistants              给 AI 助手的项目说明
 ```
