@@ -70,6 +70,25 @@ def test_part_facade():
     assert tpl2.styles["N"].part.partname == "/word/styles.xml"
 
 
+def test_part_rels_and_content_type():
+    footnotes = '<w:footnote w:id="2"><w:p><w:r><w:t>fn</w:t></w:r></w:p></w:footnote>'
+    tpl = new_tpl(footnotes=footnotes)
+    part = tpl.get_docx().part
+    by_id = {r["rId"]: r for r in part.rels}
+    assert by_id["rId1"]["type"].endswith("/relationships/footnotes")
+    assert by_id["rId1"]["target"] == "footnotes.xml"
+    assert by_id["rId1"]["is_external"] is False
+    # Override-based content type
+    assert part.content_type.endswith("wordprocessingml.document.main+xml")
+
+    styles = '<w:style w:type="paragraph" w:styleId="N"><w:name w:val="N"/></w:style>'
+    tpl2 = new_tpl(styles=styles)
+    spart = tpl2.styles["N"].part
+    assert spart.content_type.endswith("wordprocessingml.styles+xml")
+    # no word/_rels/styles.xml.rels -> empty list
+    assert spart.rels == []
+
+
 # ---------------- Run.iter_inner_content with drawings ----------------
 
 def test_run_iter_inner_content_with_drawing_and_break():

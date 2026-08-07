@@ -2645,6 +2645,47 @@ impl Table {
     }
 
     /// Number of cells in row `i` (for row_cells).
+    /// Logical-grid cell access (python-docx table.cell): gridSpan/vMerge
+    /// covered coordinates resolve to the merged origin cell.
+    pub fn cell(self, core: &mut TplCore, i: usize, j: usize) -> Option<Cell> {
+        grid_map(core, self.index)
+            .get(i)
+            .and_then(|r| r.get(j))
+            .map(|&(row, col)| Cell {
+                index: self.index,
+                row,
+                col,
+            })
+    }
+
+    /// Cells of logical row `i` (python-docx row.cells: gridSpan repeats).
+    pub fn row_cells(self, core: &mut TplCore, i: usize) -> Vec<Cell> {
+        grid_map(core, self.index)
+            .get(i)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(row, col)| Cell {
+                index: self.index,
+                row,
+                col,
+            })
+            .collect()
+    }
+
+    /// Cells of logical column `j` (one per row).
+    pub fn column_cells(self, core: &mut TplCore, j: usize) -> Vec<Cell> {
+        grid_map(core, self.index)
+            .into_iter()
+            .filter_map(|r| r.get(j).copied())
+            .map(|(row, col)| Cell {
+                index: self.index,
+                row,
+                col,
+            })
+            .collect()
+    }
+
     pub fn row_cell_count(self, core: &mut TplCore, i: usize) -> usize {
         self.read(core, |t| {
             nth_direct_ref(t, "w:tr", i)
@@ -2720,6 +2761,11 @@ pub struct TableRow {
 }
 
 impl TableRow {
+    /// Cells of this row in logical-grid order (python-docx row.cells).
+    pub fn cells(self, core: &mut TplCore) -> Vec<Cell> {
+        Table { index: self.index }.row_cells(core, self.row)
+    }
+
     pub fn read<R>(self, core: &mut TplCore, f: impl FnOnce(&Element) -> R) -> Option<R> {
         row_read(core, self.index, self.row, f)
     }
@@ -3509,6 +3555,69 @@ pub fn paragraphs(core: &mut TplCore) -> Vec<Paragraph> {
     (0..count_in_body(core, "w:p"))
         .map(|index| Paragraph { index })
         .collect()
+}
+
+/// Logical grid map of a table (python-docx semantics): logical
+/// (row, col) -> physical (row, tc-index-in-row). gridSpan-covered columns
+/// repeat the origin cell; vMerge continuations map to the restart origin.
+pub fn grid_map(core: &mut TplCore, tbl: usize) -> Vec<Vec<(usize, usize)>> {
+    tbl_read(core, tbl, |t| {
+        let mut map: Vec<Vec<(usize, usize)>> = Vec::new();
+        // logical column -> vMerge origin (physical row, tc index)
+        let mut origins: std::collections::HashMap<usize, (usize, usize)> =
+            std::collections::HashMap::new();
+        let mut row_idx = 0usize;
+        for c in &t.children {
+            let Node::Elem(tr) = c else { continue };
+            if tr.name != "w:tr" {
+                continue;
+            }
+            let mut row_map: Vec<(usize, usize)> = Vec::new();
+            let mut col: usize = tr
+                .find("w:trPr")
+                .and_then(|p| p.find("w:gridBefore"))
+                .and_then(|e| e.get_attr("w:val"))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let mut tc_idx = 0usize;
+            for cc in &tr.children {
+                let Node::Elem(tc) = cc else { continue };
+                if tc.name != "w:tc" {
+                    continue;
+                }
+                let span: usize = tc
+                    .find("w:tcPr")
+                    .and_then(|p| p.find("w:gridSpan"))
+                    .and_then(|e| e.get_attr("w:val"))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1);
+                let vmerge = tc.find("w:tcPr").and_then(|p| p.find("w:vMerge"));
+                let target = match vmerge {
+                    Some(vm) => match vm.get_attr("w:val") {
+                        Some("restart") => {
+                            origins.insert(col, (row_idx, tc_idx));
+                            (row_idx, tc_idx)
+                        }
+                        // continue (no val or val="continue")
+                        _ => origins.get(&col).copied().unwrap_or((row_idx, tc_idx)),
+                    },
+                    None => {
+                        origins.remove(&col);
+                        (row_idx, tc_idx)
+                    }
+                };
+                for _ in 0..span.max(1) {
+                    row_map.push(target);
+                    col += 1;
+                }
+                tc_idx += 1;
+            }
+            map.push(row_map);
+            row_idx += 1;
+        }
+        map
+    })
+    .unwrap_or_default()
 }
 
 /// All body-level tables, in document order.
@@ -4478,4 +4587,52 @@ mod tests {
         let xml = pkg.get_string(DOCUMENT_PART).unwrap();
         assert!(xml.contains(">x<") && xml.contains(">added<"));
     }
+}
+
+// ---------------------------------------------------------------- part facade
+
+/// Relationships of a package part: (id, rel_type, target, is_external).
+pub fn part_rels(core: &mut TplCore, part: &str) -> Vec<(String, String, String, bool)> {
+    core.init_docx(false).ok();
+    core.package
+        .as_ref()
+        .map(|pkg| {
+            pkg.rels(part)
+                .rels
+                .iter()
+                .map(|r| {
+                    (
+                        r.id.clone(),
+                        r.rel_type.clone(),
+                        r.target.clone(),
+                        r.is_external,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Content type of a package part from [Content_Types].xml: the Override for
+/// "/"+part first, then the Default for its extension.
+pub fn part_content_type(core: &mut TplCore, part: &str) -> Option<String> {
+    core.init_docx(false).ok();
+    let pkg = core.package.as_ref()?;
+    let xml = pkg.get_string("[Content_Types].xml")?;
+    let dom = Document::parse(&xml).ok()?;
+    let want = format!("/{}", part);
+    for c in &dom.root.children {
+        let Node::Elem(e) = c else { continue };
+        if e.name == "Override" && e.get_attr("PartName") == Some(want.as_str()) {
+            return e.get_attr("ContentType").map(|s| s.to_string());
+        }
+    }
+    let ext = part.rsplit('.').next()?;
+    for c in &dom.root.children {
+        let Node::Elem(e) = c else { continue };
+        if e.name == "Default" && e.get_attr("Extension") == Some(ext) {
+            return e.get_attr("ContentType").map(|s| s.to_string());
+        }
+    }
+    None
 }

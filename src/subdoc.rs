@@ -15,6 +15,8 @@ const NUMBERING_CT: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml";
 const FOOTNOTES_CT: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml";
+const ENDNOTE_CT: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml";
 
 /// Produce the block-level xml for a subdocument to be inserted into the
 /// master. With `keep_sections` the subdoc's non-empty body-level `w:sectPr`
@@ -109,6 +111,7 @@ pub(crate) fn subdoc_xml_info(
             || rel.rel_type == rel_type::NUMBERING
             || rel.rel_type == rel_type::FOOTNOTES
             || rel.rel_type == rel_type::COMMENTS
+            || rel.rel_type == rel_type::ENDNOTE
         {
             // handled separately below
             continue;
@@ -161,12 +164,29 @@ pub(crate) fn subdoc_xml_info(
     // renumber bookmarks so ids don't collide with the master document
     body_xml = renumber_bookmarks(tpl, body_xml);
 
-    // styles + numbering merge. The copied header/footer parts may reference
-    // the subdoc's styles/numbering too: merge body and hf contents as ONE
-    // string so a style/numId referenced from several places maps to the
-    // same new id, then split back and write the hf parts out.
+    // prepare the footnotes/comments contents early: their image/external
+    // rids are remapped here; the style/numbering references inside them are
+    // merged jointly with the body below, so a style/numId referenced from
+    // the body and from a footnote/comment maps to the same new id
+    let mut fn_content = prepare_note_part_content(tpl, &sub_pkg, "word/footnotes.xml")?;
+    let mut en_content = prepare_note_part_content(tpl, &sub_pkg, "word/endnotes.xml")?;
+    let mut c_content = if body_xml.contains("w:commentReference") {
+        prepare_note_part_content(tpl, &sub_pkg, "word/comments.xml")?
+    } else {
+        None
+    };
+
+    // styles + numbering merge. The copied header/footer parts and the
+    // footnotes/comments contents may reference the subdoc's
+    // styles/numbering too: merge body and those contents as ONE string so a
+    // style/numId referenced from several places maps to the same new id,
+    // then split back and write the hf parts out.
     let style_renames;
-    if hf_parts.is_empty() {
+    let extras = hf_parts.len()
+        + fn_content.is_some() as usize
+        + en_content.is_some() as usize
+        + c_content.is_some() as usize;
+    if extras == 0 {
         style_renames = merge_styles(tpl, &sub_pkg, &mut body_xml)?;
         body_xml = merge_numbering(tpl, &sub_pkg, body_xml, &style_renames)?;
     } else {
@@ -182,19 +202,40 @@ pub(crate) fn subdoc_xml_info(
             joined.push_str(HF_PART_SEP);
             joined.push_str(c);
         }
+        if let Some(c) = &fn_content {
+            joined.push_str(HF_PART_SEP);
+            joined.push_str(c);
+        }
+        if let Some(c) = &en_content {
+            joined.push_str(HF_PART_SEP);
+            joined.push_str(c);
+        }
+        if let Some(c) = &c_content {
+            joined.push_str(HF_PART_SEP);
+            joined.push_str(c);
+        }
         style_renames = merge_styles(tpl, &sub_pkg, &mut joined)?;
         joined = merge_numbering(tpl, &sub_pkg, joined, &style_renames)?;
         let mut segs = joined.split(HF_PART_SEP);
         body_xml = segs.next().unwrap_or_default().to_string();
         {
             let pkg = tpl.package.as_mut().ok_or("package not loaded")?;
-            for (part, seg) in hf_parts.iter().zip(segs) {
+            for (part, seg) in hf_parts.iter().zip(segs.by_ref()) {
                 let enc = pkg.encoding_of(part);
                 pkg.set(
                     part,
                     crate::package::encode_part_owned(seg.to_string(), &enc),
                 );
             }
+        }
+        if fn_content.is_some() {
+            fn_content = Some(segs.next().unwrap_or_default().to_string());
+        }
+        if en_content.is_some() {
+            en_content = Some(segs.next().unwrap_or_default().to_string());
+        }
+        if c_content.is_some() {
+            c_content = Some(segs.next().unwrap_or_default().to_string());
         }
         for part in &hf_parts {
             tpl.invalidate_part(part);
@@ -205,10 +246,13 @@ pub(crate) fn subdoc_xml_info(
     body_xml = restart_first_numbering(tpl, body_xml)?;
 
     // footnotes merge
-    body_xml = merge_footnotes(tpl, &sub_pkg, body_xml)?;
+    body_xml = merge_footnotes(tpl, body_xml, fn_content)?;
+
+    // endnotes merge
+    body_xml = merge_endnotes(tpl, body_xml, en_content)?;
 
     // comments merge (+ w15 commentsExtended / w16cid commentsIds)
-    let (body_xml, comments_merged) = merge_comments(tpl, &sub_pkg, body_xml)?;
+    let (body_xml, comments_merged) = merge_comments(tpl, body_xml, c_content)?;
     if comments_merged {
         merge_comments_extended(tpl, &sub_pkg);
     }
@@ -216,8 +260,9 @@ pub(crate) fn subdoc_xml_info(
     Ok((body_xml, sectpr_xml.is_some()))
 }
 
-/// Separator between the body and copied header/footer contents during the
-/// joint styles/numbering merge (never present in real xml).
+/// Separator between the body, the copied header/footer contents and the
+/// footnotes/comments contents during the joint styles/numbering merge
+/// (never present in real xml).
 const HF_PART_SEP: &str = "\u{1}DTPLHF\u{1}";
 
 /// Serialize the master document's body-level sectPr for the resume-section
@@ -1060,39 +1105,54 @@ fn find_max_numbering(el: &Element, max_abstract: &mut i64, max_num: &mut i64) {
 
 // ---------------- footnotes ----------------
 
-/// Merge footnote definitions from the subdoc; returns body xml with
-/// remapped w:footnoteReference ids.
-fn merge_footnotes(
+/// Produce a subdoc note part's content (footnotes/comments) with its image
+/// and external relationships remapped into the master package. Style and
+/// numbering references inside the content are remapped later, jointly with
+/// the body (see subdoc_xml_info).
+fn prepare_note_part_content(
     tpl: &mut TplCore,
     sub: &Package,
+    part: &str,
+) -> Result<Option<String>, String> {
+    let Some(mut xml) = sub.get_string(part) else {
+        return Ok(None);
+    };
+    // remap image relationships inside the part (rare but supported by
+    // docxcompose's add_referenced_parts)
+    let sub_rels = sub.rels(part);
+    let mut rid_map: HashMap<String, String> = HashMap::new();
+    for rel in &sub_rels.rels {
+        let new_rid = if rel.rel_type == rel_type::IMAGE {
+            let target = resolve_target(part, &rel.target);
+            let Some(blob) = sub.get(&target) else { continue };
+            let pkg = tpl.package.as_mut().ok_or("package not loaded")?;
+            let (partname, _) = add_image_part(pkg, blob, &target);
+            let rel_target = crate::package::relative_target(part, &partname);
+            pkg.add_rel(part, rel_type::IMAGE, &rel_target, false)
+        } else if rel.is_external {
+            let pkg = tpl.package.as_mut().ok_or("package not loaded")?;
+            pkg.add_rel(part, &rel.rel_type, &rel.target, true)
+        } else {
+            continue;
+        };
+        rid_map.insert(rel.id.clone(), new_rid);
+    }
+    xml = remap_rids(&xml, &rid_map);
+    Ok(Some(xml))
+}
+
+/// Merge footnote definitions from the subdoc; returns body xml with
+/// remapped w:footnoteReference ids. `fn_content` is the subdoc's
+/// footnotes.xml with image rids and style/numbering references already
+/// remapped (None when the subdoc has no footnotes part).
+fn merge_footnotes(
+    tpl: &mut TplCore,
     mut body_xml: String,
+    fn_content: Option<String>,
 ) -> Result<String, String> {
-    let Some(mut sub_fn_xml) = sub.get_string("word/footnotes.xml") else {
+    let Some(sub_fn_xml) = fn_content else {
         return Ok(body_xml);
     };
-    // remap image relationships inside footnotes (rare but supported by
-    // docxcompose's add_referenced_parts)
-    {
-        let sub_fn_rels = sub.rels("word/footnotes.xml");
-        let mut rid_map: HashMap<String, String> = HashMap::new();
-        for rel in &sub_fn_rels.rels {
-            let new_rid = if rel.rel_type == rel_type::IMAGE {
-                let target = resolve_target("word/footnotes.xml", &rel.target);
-                let Some(blob) = sub.get(&target) else { continue };
-                let pkg = tpl.package.as_mut().ok_or("package not loaded")?;
-                let (partname, _) = add_image_part(pkg, blob, &target);
-                let rel_target = crate::package::relative_target("word/footnotes.xml", &partname);
-                pkg.add_rel("word/footnotes.xml", rel_type::IMAGE, &rel_target, false)
-            } else if rel.is_external {
-                let pkg = tpl.package.as_mut().ok_or("package not loaded")?;
-                pkg.add_rel("word/footnotes.xml", &rel.rel_type, &rel.target, true)
-            } else {
-                continue;
-            };
-            rid_map.insert(rel.id.clone(), new_rid);
-        }
-        sub_fn_xml = remap_rids(&sub_fn_xml, &rid_map);
-    }
     // quick check: are there real footnotes (id > 1)?
     let sub_dom = match Document::parse(&sub_fn_xml) {
         Ok(d) => d,
@@ -1183,6 +1243,108 @@ fn collect_footnotes<'a>(el: &'a Element, out: &mut Vec<&'a Element>) {
     }
 }
 
+// ---------------- endnotes ----------------
+
+/// Merge endnote definitions from the subdoc; returns body xml with
+/// remapped w:endnoteReference ids (same algorithm as merge_footnotes).
+fn merge_endnotes(
+    tpl: &mut TplCore,
+    mut body_xml: String,
+    en_content: Option<String>,
+) -> Result<String, String> {
+    let Some(sub_en_xml) = en_content else {
+        return Ok(body_xml);
+    };
+    // quick check: are there real endnotes (id > 1)?
+    let sub_dom = match Document::parse(&sub_en_xml) {
+        Ok(d) => d,
+        Err(_) => return Ok(body_xml),
+    };
+    let mut sub_notes: Vec<&Element> = Vec::new();
+    collect_endnotes(&sub_dom.root, &mut sub_notes);
+    let has_real = sub_notes.iter().any(|e| {
+        e.get_attr("w:id")
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|id| id > 1)
+            .unwrap_or(false)
+    });
+    if !has_real {
+        return Ok(body_xml);
+    }
+
+    let pkg = tpl.package.as_mut().ok_or("package not loaded")?;
+    if !pkg.contains("word/endnotes.xml") {
+        pkg.set("word/endnotes.xml", sub_en_xml.clone().into_bytes());
+        pkg.ensure_content_type_override("word/endnotes.xml", ENDNOTE_CT);
+        if pkg.rels(DOCUMENT_PART).by_type(rel_type::ENDNOTE).next().is_none() {
+            pkg.add_rel(DOCUMENT_PART, rel_type::ENDNOTE, "endnotes.xml", false);
+        }
+        return Ok(body_xml);
+    }
+
+    let master_xml = pkg.get_string("word/endnotes.xml").unwrap_or_default();
+    let mut master_dom = match Document::parse(&master_xml) {
+        Ok(d) => d,
+        Err(_) => return Ok(body_xml),
+    };
+    let mut master_notes: Vec<&Element> = Vec::new();
+    collect_endnotes(&master_dom.root, &mut master_notes);
+    let max_id = master_notes
+        .iter()
+        .filter_map(|e| e.get_attr("w:id").and_then(|v| v.parse::<i64>().ok()))
+        .max()
+        .unwrap_or(1);
+    let offset = max_id + 1;
+
+    // id remap for real notes
+    let mut id_map: HashMap<i64, i64> = HashMap::new();
+    for note in &sub_notes {
+        if let Some(id) = note.get_attr("w:id").and_then(|v| v.parse::<i64>().ok()) {
+            if id > 1 {
+                let mut n = (*note).clone();
+                let new_id = id + offset;
+                n.set_attr("w:id", &new_id.to_string());
+                id_map.insert(id, new_id);
+                master_dom.root.children.push(Node::Elem(n));
+            }
+        }
+    }
+    let xml = master_dom.serialize();
+    pkg.set("word/endnotes.xml", xml.into_bytes());
+
+    if !id_map.is_empty() {
+        body_xml = psub(
+            r#"(<w:endnoteReference w:id=")(\d+)(")"#,
+            |m| {
+                let old: i64 = m.get(2).unwrap().as_str().parse().unwrap_or(-1);
+                match id_map.get(&old) {
+                    Some(new) => format!(
+                        "{}{}{}",
+                        m.get(1).unwrap().as_str(),
+                        new,
+                        m.get(3).unwrap().as_str()
+                    ),
+                    None => m.get(0).unwrap().as_str().to_string(),
+                }
+            },
+            &body_xml,
+        );
+    }
+    Ok(body_xml)
+}
+
+fn collect_endnotes<'a>(el: &'a Element, out: &mut Vec<&'a Element>) {
+    if el.name == "w:endnote" {
+        out.push(el);
+        return;
+    }
+    for c in &el.children {
+        if let Node::Elem(e) = c {
+            collect_endnotes(e, out);
+        }
+    }
+}
+
 // ---------------- comments ----------------
 
 const COMMENTS_CT: &str =
@@ -1191,42 +1353,22 @@ const COMMENTS_CT: &str =
 /// Merge comment definitions from the subdoc; returns body xml with remapped
 /// w:commentRangeStart / w:commentRangeEnd / w:commentReference ids, plus a
 /// flag telling whether subdoc comments were merged (gates the
-/// commentsExtended/commentsIds merge).
+/// commentsExtended/commentsIds merge). `c_content` is the subdoc's
+/// comments.xml with image rids and style/numbering references already
+/// remapped (None when the subdoc has no comments part or the body has no
+/// comment references).
 /// (docxcompose does not merge comments at all; this goes beyond parity.)
 fn merge_comments(
     tpl: &mut TplCore,
-    sub: &Package,
     mut body_xml: String,
+    c_content: Option<String>,
 ) -> Result<(String, bool), String> {
     if !body_xml.contains("w:commentReference") {
         return Ok((body_xml, false));
     }
-    let Some(mut sub_c_xml) = sub.get_string("word/comments.xml") else {
+    let Some(sub_c_xml) = c_content else {
         return Ok((body_xml, false));
     };
-    // remap image/external relationships inside comments (same pattern as
-    // footnotes)
-    {
-        let sub_c_rels = sub.rels("word/comments.xml");
-        let mut rid_map: HashMap<String, String> = HashMap::new();
-        for rel in &sub_c_rels.rels {
-            let new_rid = if rel.rel_type == rel_type::IMAGE {
-                let target = resolve_target("word/comments.xml", &rel.target);
-                let Some(blob) = sub.get(&target) else { continue };
-                let pkg = tpl.package.as_mut().ok_or("package not loaded")?;
-                let (partname, _) = add_image_part(pkg, blob, &target);
-                let rel_target = crate::package::relative_target("word/comments.xml", &partname);
-                pkg.add_rel("word/comments.xml", rel_type::IMAGE, &rel_target, false)
-            } else if rel.is_external {
-                let pkg = tpl.package.as_mut().ok_or("package not loaded")?;
-                pkg.add_rel("word/comments.xml", &rel.rel_type, &rel.target, true)
-            } else {
-                continue;
-            };
-            rid_map.insert(rel.id.clone(), new_rid);
-        }
-        sub_c_xml = remap_rids(&sub_c_xml, &rid_map);
-    }
     let sub_dom = match Document::parse(&sub_c_xml) {
         Ok(d) => d,
         Err(_) => return Ok((body_xml, false)),
@@ -1431,7 +1573,8 @@ mod tests {
         let body = "<w:p><w:commentRangeStart w:id=\"0\"/><w:r><w:t>x</w:t></w:r>\
                     <w:commentRangeEnd w:id=\"0\"/><w:r><w:commentReference w:id=\"0\"/></w:r></w:p>"
             .to_string();
-        let (out, merged) = merge_comments(&mut core, &sub, body).unwrap();
+        let (out, merged) =
+            merge_comments(&mut core, body, sub.get_string("word/comments.xml")).unwrap();
         assert!(merged);
 
         assert!(out.contains("<w:commentRangeStart w:id=\"1\"/>"));

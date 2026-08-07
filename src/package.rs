@@ -25,6 +25,8 @@ pub mod rel_type {
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings";
     pub const COMMENTS: &str =
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
+    pub const ENDNOTE: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes";
 }
 
 pub fn crc32(data: &[u8]) -> u32 {

@@ -818,6 +818,31 @@ impl PyPart {
                 .and_then(|pkg| pkg.get(&self.part_name).map(|b| b.to_vec()))
         })
     }
+
+    /// Relationships of the part, as a list of dicts with keys "rId",
+    /// "type", "target", "is_external".
+    #[getter]
+    fn rels(&self, py: Python<'_>) -> Vec<Py<pyo3::types::PyDict>> {
+        with_core(&self.tpl, py, |core| crate::doc::part_rels(core, &self.part_name))
+            .into_iter()
+            .map(|(id, rel_type, target, is_external)| {
+                let d = pyo3::types::PyDict::new(py);
+                let _ = d.set_item("rId", id);
+                let _ = d.set_item("type", rel_type);
+                let _ = d.set_item("target", target);
+                let _ = d.set_item("is_external", is_external);
+                d.unbind()
+            })
+            .collect()
+    }
+
+    /// Content type of the part (Override first, then Default by extension).
+    #[getter]
+    fn content_type(&self, py: Python<'_>) -> Option<String> {
+        with_core(&self.tpl, py, |core| {
+            crate::doc::part_content_type(core, &self.part_name)
+        })
+    }
 }
 
 // ---------------------------------------------------------------- fields

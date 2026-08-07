@@ -541,13 +541,18 @@ impl PyTable {
         })
     }
 
-    fn cell(&self, py: Python<'_>, i: usize, j: usize) -> PyCell {
-        PyCell {
+    /// Logical-grid cell access (python-docx table.cell semantics).
+    fn cell(&self, py: Python<'_>, i: usize, j: usize) -> PyResult<PyCell> {
+        let c = with_core(&self.tpl, py, |core| self.handle().cell(core, i, j))
+            .ok_or_else(|| {
+                pyo3::exceptions::PyIndexError::new_err("cell index out of range")
+            })?;
+        Ok(PyCell {
             tpl: self.tpl.clone_ref(py),
-            index: self.index,
-            row: i,
-            col: j,
-        }
+            index: c.index,
+            row: c.row,
+            col: c.col,
+        })
     }
 
     /// The table style id (python-docx table.style; accepts a style name or
@@ -635,28 +640,28 @@ impl PyTable {
             .map_err(val_err)
     }
 
-    /// Cells of column `i` (one per row).
+    /// Cells of column `i` (one per row, logical grid).
     fn column_cells(&self, py: Python<'_>, i: usize) -> Vec<PyCell> {
-        let rows = with_core(&self.tpl, py, |core| self.handle().row_count(core));
-        (0..rows)
-            .map(|row| PyCell {
+        with_core(&self.tpl, py, |core| self.handle().column_cells(core, i))
+            .into_iter()
+            .map(|c| PyCell {
                 tpl: self.tpl.clone_ref(py),
-                index: self.index,
-                row,
-                col: i,
+                index: c.index,
+                row: c.row,
+                col: c.col,
             })
             .collect()
     }
 
-    /// Cells of row `i`.
+    /// Cells of row `i` (logical grid).
     fn row_cells(&self, py: Python<'_>, i: usize) -> Vec<PyCell> {
-        let cols = with_core(&self.tpl, py, |core| self.handle().row_cell_count(core, i));
-        (0..cols)
-            .map(|col| PyCell {
+        with_core(&self.tpl, py, |core| self.handle().row_cells(core, i))
+            .into_iter()
+            .map(|c| PyCell {
                 tpl: self.tpl.clone_ref(py),
-                index: self.index,
-                row: i,
-                col,
+                index: c.index,
+                row: c.row,
+                col: c.col,
             })
             .collect()
     }
@@ -740,15 +745,17 @@ impl PyTableRow {
         with_core(&self.tpl, py, |core| self.handle().grid_cols_after(core))
     }
 
+    /// Cells of this row in logical-grid order (python-docx row.cells:
+    /// gridSpan/vMerge covered coordinates resolve to the merged origin).
     #[getter]
     fn cells(&self, py: Python<'_>) -> Vec<PyCell> {
-        let n = with_core(&self.tpl, py, |core| self.handle().cell_count(core));
-        (0..n)
-            .map(|col| PyCell {
+        with_core(&self.tpl, py, |core| self.handle().cells(core))
+            .into_iter()
+            .map(|c| PyCell {
                 tpl: self.tpl.clone_ref(py),
-                index: self.index,
-                row: self.row,
-                col,
+                index: c.index,
+                row: c.row,
+                col: c.col,
             })
             .collect()
     }

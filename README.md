@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/docxtplrs.svg)](https://crates.io/crates/docxtplrs)
 [![docs.rs](https://docs.rs/docxtplrs/badge.svg)](https://docs.rs/docxtplrs)
 [![license](https://img.shields.io/badge/license-LGPL--2.1--or--later-blue.svg)](https://github.com/yiyinzhang/docxtplrs)
-[![tests](https://img.shields.io/badge/tests-445%20passed-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
+[![tests](https://img.shields.io/badge/tests-458%20passed-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
 [![coverage](https://img.shields.io/badge/coverage-86%25-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
 [![crosscheck](https://img.shields.io/badge/crosscheck-ALL%20MATCH-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
 
@@ -22,7 +22,7 @@ docx 的 zip/XML 处理、模板预处理、表格修复、关系管理、文档
 
 > ⚠️ Vibecoding project / AI 结对编写项目：written by an AI (Kimi Code) with the user,
 > without line-by-line human review / 未经人工逐行审查。Verified by the official docxtpl
-> test suite (32 real-world templates) + 445 in-house tests / 已通过官方套件与 445 个自建测试，
+> test suite (32 real-world templates) + 458 in-house tests / 已通过官方套件与 458 个自建测试，
 > but evaluate before production use / 生产使用前请自行评估。
 
 ## Quick start / 快速开始
@@ -83,7 +83,7 @@ tpl.save("out.docx")
   (`{{ var }}`, `{%tr %}`/`{%tc %}`/`{%p %}`, `RichText`, `InlineImage`,
   `Subdoc`, ...) mirror docxtpl; migrating is usually just changing the import.
   Verified against the official docxtpl test suite (32 real-world templates),
-  445 in-house tests, plus automated output cross-checking against docxtpl
+  458 in-house tests, plus automated output cross-checking against docxtpl
   itself (`tests/crosscheck.py`).
 - **One engine, two languages** — the same renderer is available as a native
   Rust crate, so Rust services/CLIs can render docx templates with no Python
@@ -94,8 +94,9 @@ tpl.save("out.docx")
   Going beyond docxcompose, appended documents keep their **section
   properties** (page size/orientation/margins and header/footer references,
   intermediate sections of multi-section documents included), **comments**
-  (with w15 threading state) are merged, and styles/numbering referenced
-  from inside headers/footers are merged consistently with the body.
+  (with w15 threading state) and **endnotes** are merged, and styles/
+  numbering referenced from headers/footers/footnotes/comments are merged
+  consistently with the body.
 - **Engine extras beyond stock docxtpl** — `str` methods in templates
   (`upper/replace/split/...`), `'%s' % x` formatting, `{% break %}`/`{% continue %}`,
   the `{% do %}` statement, gettext i18n (`{% trans %}`/`{% pluralize %}`),
@@ -229,7 +230,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-docxtplrs = { version = "0.2.2", default-features = false }  # pure Rust: no PyO3/libpython
+docxtplrs = { version = "0.2.3", default-features = false }  # pure Rust: no PyO3/libpython
 minijinja = "2"
 ```
 
@@ -270,6 +271,34 @@ Useful Rust API surface (all in `docxtplrs::`):
 | `gettext` | `Catalog` (.mo parsing, plural-rule evaluation) |
 | `xmldom` | Minimal XML DOM used for structured edits |
 
+#### Rust API summary
+
+Mirrors the Python API; everything is pure Rust (no `pyo3` with
+`default-features = false`):
+
+- Template rendering: `TplCore::new(bytes)`, `render(autoescape, &ctx_fn)`
+  (context built from `minijinja::Value`), `save_bytes()`, `get_xml()`,
+  `undeclared_variables()`, `build_url_id()`, replacement maps
+  (`crc_to_new_media`/`pics_to_replace`/`zipname_to_replace` pub fields)
+- Document model (`doc` module): `paragraphs()/tables()/sections()` entry
+  points returning Copy index handles (`Paragraph`/`Run`/`Table`/`TableRow`/
+  `Cell`/`Section`/`Style`); `text`/`style`/`alignment` read-write,
+  `add_run`/`add_row`/`add_column`, `cell.merge()`,
+  `insert_paragraph_before`/`clear`, `hyperlinks`/`fields`/`add_field`,
+  `contains_page_break`/`rendered_page_breaks`,
+  `iter_inner_content()` (via `BlockItem`/`ParaItem`/`RunItem` enums),
+  logical-grid cell access (`table.cell(i,j)`, gridSpan/vMerge aware)
+- Formatting handles: `Font` (full 29 properties, tri-state
+  `Option<bool>` setters like python-docx) and `ParagraphFormat` (indents,
+  spacing, line rules, keep flags, `TabStops`) on runs/styles/paragraphs
+- Write ops (free fns): `doc::add_paragraph/add_heading/add_picture/
+  add_table/add_page_break/add_section(core, ...)`
+- Document composition: `composer::Composer::new(master).append(doc)` →
+  `save_bytes()` (section properties/comments/endnotes merged)
+- Conventions: methods take `&mut TplCore`; errors are `Result<T, String>`;
+  lengths are `doc::Length { emu }` (i64 EMU); enums are `i64` matching the
+  python-docx `WD_*` values
+
 A runnable example is included:
 
 ```bash
@@ -290,7 +319,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # in another uv project
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.2-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.3-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # or editable (local development)
 uv add --editable /path/to/docxtplrs
 ```
@@ -387,8 +416,9 @@ tpl.save("out.docx")                         # or io.BytesIO()
   field codes (`paragraph.fields`/`add_field`, `instr`/cached-result read-write,
   `settings.update_fields_on_open`),
   `run.add_picture`/`mark_comment_range`, `table_direction`,
-  `grid_span`/`grid_cols_before/after`, nested tables in cells,
-  `__getattr__` delegation
+  `grid_span`/`grid_cols_before/after`, logical-grid cell access
+  (`table.cell(i,j)`/`row.cells` resolve gridSpan/vMerge like python-docx),
+  nested tables in cells, `__getattr__` delegation
 - Raw-XML escape hatch: `settings/document/styles.element` return a live
   `XmlElement` proxy (`tag/text/attrib/get/set/remove_attr/find/findall/
   children/append/insert/remove/xml`), covering python-docx's `.element` use
@@ -482,7 +512,7 @@ Engine-level extras beyond stock minijinja, so jinja2-style templates work as-is
 #### Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q          # 445 unit tests
+.venv/bin/python -m pytest tests/ -q          # 458 unit tests
 .venv/bin/python tests/crosscheck.py docxtplrs > /tmp/rs.json
 .venv/bin/python tests/crosscheck.py docxtpl > /tmp/ref.json   # needs crosscheck group
 .venv/bin/python tests/crosscheck.py compare /tmp/ref.json /tmp/rs.json
@@ -507,6 +537,13 @@ with `llvm-cov`.
   OLE editing is not supported.
 - `get_docx()` returns this library's facade object, **not** a python-docx
   `Document` — it cannot be passed to third-party code expecting python-docx types.
+  Interop goes through the bytes: save (or `get_docx_bytes()`), then open with
+  python-docx —
+
+  ```python
+  import docx, io
+  real_doc = docx.Document(io.BytesIO(tpl.get_docx_bytes()))
+  ```
 
 **Behavioral differences (equal or better outcomes)**
 
@@ -550,15 +587,15 @@ with `llvm-cov`.
   复现——引用数字前请用你自己的模板复测；引擎内部优化见[性能](#性能)。
 - **无缝替代**：Python API 与模板语法（`{{ var }}`、`{%tr %}`/`{%tc %}`/`{%p %}`、
   `RichText`、`InlineImage`、`Subdoc` 等）与 docxtpl 几乎完全一致，迁移通常只需改一行 import。
-  已通过 docxtpl 官方测试套件（32 个真实模板）、445 个自建测试，并有与 docxtpl 输出自动
+  已通过 docxtpl 官方测试套件（32 个真实模板）、458 个自建测试，并有与 docxtpl 输出自动
   交叉比对的工具（`tests/crosscheck.py`）。
 - **一个引擎，两种语言**：同一渲染器同时提供原生 Rust crate，Rust 服务/CLI 可以完全不
   经过 Python 渲染 docx 模板。
 - **文档拼接**：`Composer` 把多个完整 docx 首尾拼接为一个文档（docxcompose 风格：
   文档间分页、样式冲突改名、列表编号重启、媒体去重），Python 与纯 Rust 两侧均可用。
   比 docxcompose 更进一步：被拼接文档的**节属性**（页面尺寸/方向/页边距及页眉页脚
-  引用，多节文档的中间节同样保留）会被保留，**批注**（含 w15 线程状态）会被合并，
-  页眉页脚内部引用的样式与编号也会与正文一致地合并。
+  引用，多节文档的中间节同样保留）会被保留，**批注**（含 w15 线程状态）与**尾注**
+  会被合并，页眉/页脚/脚注/批注内部引用的样式与编号也会与正文一致地合并。
 - **超出原版 docxtpl 的引擎能力**：模板内 `str` 方法（`upper/replace/split/...`）、
   `'%s' % x` 格式化、`{% break %}`/`{% continue %}`、`{% do %}` 语句、gettext i18n
   （`{% trans %}`/`{% pluralize %}`）、`set_template_loader()` 支持的 `{% include %}`/
@@ -656,7 +693,7 @@ debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会�
 
 ```toml
 [dependencies]
-docxtplrs = { version = "0.2.2", default-features = false }  # 纯 Rust：不依赖 PyO3/libpython
+docxtplrs = { version = "0.2.3", default-features = false }  # 纯 Rust：不依赖 PyO3/libpython
 minijinja = "2"
 ```
 
@@ -698,6 +735,31 @@ std::fs::write("out.docx", tpl.save_bytes()?)?;
 | `gettext` | `Catalog`（.mo 解析、复数规则求值） |
 | `xmldom` | 用于结构化修改的极简 XML DOM |
 
+#### Rust API 概览
+
+与 Python API 对应；全部为纯 Rust（`default-features = false` 时无 `pyo3`）：
+
+- 模板渲染：`TplCore::new(bytes)`、`render(autoescape, &ctx_fn)`（上下文用
+  `minijinja::Value` 构造）、`save_bytes()`、`get_xml()`、
+  `undeclared_variables()`、`build_url_id()`、替换映射
+  （`crc_to_new_media`/`pics_to_replace`/`zipname_to_replace` 公开字段）
+- 文档模型（`doc` 模块）：`paragraphs()/tables()/sections()` 入口返回 Copy
+  索引句柄（`Paragraph`/`Run`/`Table`/`TableRow`/`Cell`/`Section`/`Style`）；
+  `text`/`style`/`alignment` 读写、`add_run`/`add_row`/`add_column`、
+  `cell.merge()`、`insert_paragraph_before`/`clear`、
+  `hyperlinks`/`fields`/`add_field`、`contains_page_break`/`rendered_page_breaks`、
+  `iter_inner_content()`（`BlockItem`/`ParaItem`/`RunItem` 枚举）、
+  逻辑网格单元格访问（`table.cell(i,j)`，支持 gridSpan/vMerge）
+- 格式化句柄：`Font`（完整 29 属性，与 python-docx 同款三态 `Option<bool>`）
+  与 `ParagraphFormat`（缩进/间距/行距规则/keep 标志/`TabStops`），
+  run/样式/段落均可用
+- 写操作（自由函数）：`doc::add_paragraph/add_heading/add_picture/
+  add_table/add_page_break/add_section(core, ...)`
+- 文档拼接：`composer::Composer::new(master).append(doc)` → `save_bytes()`
+  （节属性/批注/尾注自动合并）
+- 约定：方法接受 `&mut TplCore`；错误为 `Result<T, String>`；长度为
+  `doc::Length { emu }`（i64 EMU）；枚举为与 python-docx `WD_*` 对应的 `i64`
+
 内置可运行示例：
 
 ```bash
@@ -718,7 +780,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # 在其他 uv 项目中
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.2-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.3-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # 或本地开发模式（editable）
 uv add --editable /path/to/docxtplrs
 ```
@@ -814,8 +876,9 @@ tpl.save("out.docx")                         # 或 io.BytesIO()
   域代码（`paragraph.fields`/`add_field`、`instr`/缓存结果读写、
   `settings.update_fields_on_open`）、
   `run.add_picture`/`mark_comment_range`、`table_direction`、
-  `grid_span`/`grid_cols_before/after`、单元格内嵌套表格、
-  `__getattr__` 委托
+  `grid_span`/`grid_cols_before/after`、逻辑网格单元格访问
+  （`table.cell(i,j)`/`row.cells` 按 gridSpan/vMerge 解析，与 python-docx 一致）、
+  单元格内嵌套表格、`__getattr__` 委托
 - 原始 XML 逃生口：`settings/document/styles.element` 返回实时的 `XmlElement`
   代理（`tag/text/attrib/get/set/remove_attr/find/findall/children/append/
   insert/remove/xml`），覆盖 python-docx `.element` 的常见用法（如用
@@ -905,7 +968,7 @@ tpl.render(context, jinja_env=env)
 #### 测试
 
 ```bash
-.venv/bin/python -m pytest tests/ -q          # 445 个单元测试
+.venv/bin/python -m pytest tests/ -q          # 458 个单元测试
 .venv/bin/python tests/crosscheck.py docxtplrs > /tmp/rs.json
 .venv/bin/python tests/crosscheck.py docxtpl > /tmp/ref.json   # 需要 crosscheck 依赖组
 .venv/bin/python tests/crosscheck.py compare /tmp/ref.json /tmp/rs.json
@@ -925,7 +988,13 @@ tpl.render(context, jinja_env=env)
   表格/行/单元格几何属性、样式标志位、`rendered_page_breaks` 标记、`iter_inner_content`
   与最小 `part` 门面、域代码读写），但**不是完整重写**：OLE 编辑未覆盖。
 - `get_docx()` 返回本库的外观对象，**不是** python-docx 的 `Document`——不能传给
-  期望 python-docx 类型的第三方代码。
+  期望 python-docx 类型的第三方代码。互操作走字节流：先 save（或 `get_docx_bytes()`），
+  再用 python-docx 打开——
+
+  ```python
+  import docx, io
+  real_doc = docx.Document(io.BytesIO(tpl.get_docx_bytes()))
+  ```
 
 **行为差异（结果相当或更好）**
 
@@ -952,7 +1021,7 @@ tpl.render(context, jinja_env=env)
 ```
 src/            Rust sources (17 modules, see AGENTS.md)   Rust 源码
 python/         Python package shell (__init__ + __main__ CLI)
-tests/          445 tests + crosscheck/compare/benchmark    测试、交叉验证与基准
+tests/          458 tests + crosscheck/compare/benchmark    测试、交叉验证与基准
 examples/       render.rs (Rust API), patch_dbg.rs (large-doc debugging), bench.rs (stage timings)
 AGENTS.md       Notes for AI coding assistants              给 AI 助手的项目说明
 ```

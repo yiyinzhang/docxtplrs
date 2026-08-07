@@ -466,3 +466,118 @@ def test_comments_extended_appended():
     data = out.getvalue()
     ex = read_docx_part(data, "word/commentsExtended.xml")
     assert "BBBB0002" in ex and "AAAA0001" in ex
+
+
+# ---------------- footnotes/comments style & numbering consistency ----------------
+
+FOOTNOTES_CT = '<Override PartName="/word/footnotes.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"/>'
+FOOTNOTES_RT = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes"
+
+SUB_STYLES_SUBONLY = (
+    XML_DECL
+    + f'<w:styles {NSDECL}>'
+    + '<w:style w:type="paragraph" w:styleId="SubOnly"><w:name w:val="sub only"/>'
+    + '<w:rPr><w:color w:val="0000FF"/></w:rPr></w:style>'
+    + "</w:styles>"
+)
+# master's conflicting definition of the same style id (different color)
+MASTER_STYLES_SUBONLY = (
+    '<w:style w:type="paragraph" w:styleId="SubOnly"><w:name w:val="sub only"/>'
+    '<w:rPr><w:color w:val="FF0000"/></w:rPr></w:style>'
+)
+
+
+def footnotes_xml(*notes):
+    inner = (
+        '<w:footnote w:type="separator" w:id="0"/>'
+        '<w:footnote w:type="continuationSeparator" w:id="1"/>' + "".join(notes)
+    )
+    return XML_DECL + f"<w:footnotes {NSDECL}>{inner}</w:footnotes>"
+
+
+def test_footnote_style_merged_consistently():
+    """A pStyle referenced from both the body and a footnote maps to ONE new
+    id (the footnotes content joins the body's styles merge)."""
+    styled = '<w:pStyle w:val="SubOnly"/>'
+    sub = build_doc(
+        f"<w:p><w:pPr>{styled}</w:pPr><w:r><w:t>styled body</w:t></w:r>"
+        '<w:r><w:footnoteReference w:id="2"/></w:r></w:p>',
+        files={
+            "word/styles.xml": SUB_STYLES_SUBONLY,
+            "word/footnotes.xml": footnotes_xml(
+                f'<w:footnote w:id="2"><w:p><w:pPr>{styled}</w:pPr>'
+                "<w:r><w:t>sub footnote text</w:t></w:r></w:p></w:footnote>"
+            ),
+        },
+        doc_rels=[("rId10", STYLES_RT, "styles.xml"), ("rId11", FOOTNOTES_RT, "footnotes.xml")],
+        content_types_extra=STYLES_CT + FOOTNOTES_CT,
+    )
+    master = build_doc(
+        tp("{{p sub }}"),
+        files={
+            "word/styles.xml": XML_DECL + f"<w:styles {NSDECL}>" + MASTER_STYLES_SUBONLY + "</w:styles>",
+        },
+        doc_rels=[("rId3", STYLES_RT, "styles.xml")],
+        content_types_extra=STYLES_CT,
+    )
+    tpl = DocxTemplate(io.BytesIO(master))
+    tpl.render({"sub": tpl.new_subdoc(io.BytesIO(sub))})
+    out = io.BytesIO()
+    tpl.save(out)
+    data = out.getvalue()
+
+    styles = read_docx_part(data, "word/styles.xml")
+    # exactly one renamed copy of the conflicting style
+    assert styles.count('w:styleId="SubOnly_1"') == 1
+    doc = read_docx_part(data, "word/document.xml")
+    assert 'w:pStyle w:val="SubOnly_1"' in doc
+    footnotes = read_docx_part(data, "word/footnotes.xml")
+    # the footnote references the SAME renamed style as the body
+    assert 'w:pStyle w:val="SubOnly_1"' in footnotes
+    assert "sub footnote text" in footnotes
+
+
+def test_comment_numbering_merged_consistently():
+    """A numId referenced from both the body and a comment maps to ONE new
+    id. The body paragraph carries no pStyle, so the docxcompose numbering
+    restart does not trigger and both references stay identical."""
+    commented = comment_body(0, "annotated item")
+    sub_comments = (
+        XML_DECL + f"<w:comments {NSDECL}>"
+        '<w:comment w:id="0" w:author="Bob"><w:p><w:pPr>'
+        '<w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr>'
+        "</w:pPr><w:r><w:t>sub note</w:t></w:r></w:p></w:comment></w:comments>"
+    )
+    sub = build_doc(
+        f'<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="7"/></w:numPr></w:pPr>'
+        "<w:r><w:t>item</w:t></w:r></w:p>" + commented,
+        files={
+            "word/numbering.xml": SUB_NUMBERING,
+            "word/comments.xml": sub_comments,
+        },
+        doc_rels=[("rId12", NUMBERING_RT, "numbering.xml"), ("rId9", COMMENTS_RT, "comments.xml")],
+        content_types_extra=NUMBERING_CT + COMMENTS_CT,
+    )
+    master = build_doc(
+        tp("{{p sub }}"),
+        files={"word/numbering.xml": MASTER_NUMBERING},
+        doc_rels=[("rId3", NUMBERING_RT, "numbering.xml")],
+        content_types_extra=NUMBERING_CT,
+    )
+    tpl = DocxTemplate(io.BytesIO(master))
+    tpl.render({"sub": tpl.new_subdoc(io.BytesIO(sub))})
+    out = io.BytesIO()
+    tpl.save(out)
+    data = out.getvalue()
+
+    doc = read_docx_part(data, "word/document.xml")
+    comments = read_docx_part(data, "word/comments.xml")
+    numbering = read_docx_part(data, "word/numbering.xml")
+    body_id = re.search(r'<w:numId w:val="(\d+)"/>', doc).group(1)
+    comment_id = re.search(r'<w:numId w:val="(\d+)"/>', comments).group(1)
+    # both remapped away from the subdoc's 7, to the SAME merged id
+    assert body_id != "7"
+    assert body_id == comment_id
+    assert f'<w:num w:numId="{body_id}">' in numbering
+    # master num 7 + one merged sub num (no restart: no pStyle on the body para)
+    assert numbering.count("<w:num ") == 2
