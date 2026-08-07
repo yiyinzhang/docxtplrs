@@ -113,7 +113,6 @@ pub fn table_xml(rows: &[Vec<String>], usable_twips: i64) -> String {
 
 /// Usable page width in twips of the *master* document's last section
 /// (python-docx add_table on a Document uses its own section width).
-#[cfg(feature = "python")]
 pub fn master_usable_width_twips(tpl: &mut TplCore) -> i64 {
     let _ = tpl.flush_doc();
     let Some(pkg) = tpl.package.as_ref() else {

@@ -105,7 +105,9 @@ tpl.save("out.docx")
 - **Built-in read-write document model** — paragraphs/tables/sections/styles/
   comments/core properties plus `add_paragraph/add_heading/add_picture/
   add_table/add_page_break/add_section` cover the common python-docx paths,
-  without installing python-docx. Full `Font` (29 properties with python-docx
+  without installing python-docx — and the same model is available to pure
+  Rust consumers via the `doc` module (the Python bindings are thin wrappers
+  over it). Full `Font` (29 properties with python-docx
   tri-state semantics), `ParagraphFormat` (indents/spacing/line rules/keep
   flags/tab stops), table columns/alignment/autofit, row heights, cell
   vertical alignment, section start types and field codes (`add_field`,
@@ -227,7 +229,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-docxtplrs = { version = "0.2.1", default-features = false }  # pure Rust: no PyO3/libpython
+docxtplrs = { version = "0.2.2", default-features = false }  # pure Rust: no PyO3/libpython
 minijinja = "2"
 ```
 
@@ -240,6 +242,20 @@ Cargo features:
 
 Render a template (see [Quick start](#quick-start--快速开始) for the code).
 
+Edit a document with the pure-Rust object model (no Python involved):
+
+```rust
+use docxtplrs::{doc, template::TplCore};
+
+let mut tpl = TplCore::new(std::fs::read("in.docx")?);
+let p = doc::paragraphs(&mut tpl)[0];
+p.set_alignment(&mut tpl, Some(1))?;            // center
+let run = p.add_run(&mut tpl, "important")?;
+run.font().set_bold(&mut tpl, Some(true))?;      // tri-state like python-docx
+doc::add_table(&mut tpl, 2, 2)?;
+std::fs::write("out.docx", tpl.save_bytes()?)?;
+```
+
 Useful Rust API surface (all in `docxtplrs::`):
 
 | Module | Highlights |
@@ -248,6 +264,7 @@ Useful Rust API surface (all in `docxtplrs::`):
 | `package` | `Package` (docx zip entries, `.rels`, content types), `Rels`, CRC32/SHA1 helpers |
 | `patch` | `patch_xml`, `resolve_listing`, `decode_text_entities` (docxtpl's XML preprocessing) |
 | `composer` | `Composer`: docxcompose-style whole-document concatenation (`new`/`append`/`save_bytes`) |
+| `doc` | Pure-Rust document object model: `Paragraph/Run/Table/TableRow/Cell/Section/Style` index handles over `TplCore` (`text`/`style`/`alignment` read-write, `Font`/`ParagraphFormat` handles, `add_paragraph/add_table/...` free fns) — the same model the Python bindings wrap |
 | `richtext` | `richtext_run`, `richtext_paragraph`, `listing_xml`, `TextProps` |
 | `image` | `ImageInfo` (PNG/JPEG/GIF/BMP/TIFF size & DPI), EMU conversions |
 | `gettext` | `Catalog` (.mo parsing, plural-rule evaluation) |
@@ -273,7 +290,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # in another uv project
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.2-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # or editable (local development)
 uv add --editable /path/to/docxtplrs
 ```
@@ -549,7 +566,8 @@ with `llvm-cov`.
   jinja2 `Environment` 的互操作。
 - **内置可读写文档对象模型**：paragraphs/tables/sections/styles/comments/core properties
   以及 `add_paragraph/add_heading/add_picture/add_table/add_page_break/add_section`，
-  覆盖 python-docx 常用读写路径，无需再安装 python-docx。完整 `Font`（29 个属性，
+  覆盖 python-docx 常用读写路径，无需再安装 python-docx——同一模型也通过 `doc`
+  模块面向纯 Rust 用户（Python 绑定只是它的薄包装）。完整 `Font`（29 个属性，
   python-docx 三态语义）、`ParagraphFormat`（缩进/间距/行距规则/keep 标志/制表位）、
   表格列/对齐/自动适应、行高、单元格垂直对齐、节起始类型、域代码（`add_field`、
   `update_fields_on_open`）均已支持。
@@ -638,7 +656,7 @@ debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会�
 
 ```toml
 [dependencies]
-docxtplrs = { version = "0.2.1", default-features = false }  # 纯 Rust：不依赖 PyO3/libpython
+docxtplrs = { version = "0.2.2", default-features = false }  # 纯 Rust：不依赖 PyO3/libpython
 minijinja = "2"
 ```
 
@@ -652,6 +670,20 @@ Cargo features：
 渲染模板的代码见[快速开始](#quick-start--快速开始)（中文上下文把 `title`/`items`
 换成中文即可）。
 
+用纯 Rust 文档对象模型编辑文档（无需 Python）：
+
+```rust
+use docxtplrs::{doc, template::TplCore};
+
+let mut tpl = TplCore::new(std::fs::read("in.docx")?);
+let p = doc::paragraphs(&mut tpl)[0];
+p.set_alignment(&mut tpl, Some(1))?;            // 居中
+let run = p.add_run(&mut tpl, "重点")?;
+run.font().set_bold(&mut tpl, Some(true))?;      // 与 python-docx 同三态语义
+doc::add_table(&mut tpl, 2, 2)?;
+std::fs::write("out.docx", tpl.save_bytes()?)?;
+```
+
 主要 Rust API（均在 `docxtplrs::` 下）：
 
 | 模块 | 要点 |
@@ -660,6 +692,7 @@ Cargo features：
 | `package` | `Package`（docx zip 条目、`.rels`、内容类型）、`Rels`、CRC32/SHA1 工具 |
 | `patch` | `patch_xml`、`resolve_listing`、`decode_text_entities`（docxtpl 的 XML 预处理） |
 | `composer` | `Composer`：docxcompose 风格的整文档拼接（`new`/`append`/`save_bytes`） |
+| `doc` | 纯 Rust 文档对象模型：`Paragraph/Run/Table/TableRow/Cell/Section/Style` 索引句柄（`text`/`style`/`alignment` 读写、`Font`/`ParagraphFormat` 句柄、`add_paragraph/add_table` 等自由函数）——Python 绑定即此模型的薄包装 |
 | `richtext` | `richtext_run`、`richtext_paragraph`、`listing_xml`、`TextProps` |
 | `image` | `ImageInfo`（PNG/JPEG/GIF/BMP/TIFF 尺寸与 DPI）、EMU 换算 |
 | `gettext` | `Catalog`（.mo 解析、复数规则求值） |
@@ -685,7 +718,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # 在其他 uv 项目中
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.2-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # 或本地开发模式（editable）
 uv add --editable /path/to/docxtplrs
 ```
