@@ -9,6 +9,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PySet};
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 fn to_pyerr(e: String) -> PyErr {
     PyRuntimeError::new_err(e)
@@ -50,6 +51,123 @@ fn py_truthy(obj: &Bound<'_, PyAny>) -> bool {
     obj.is_truthy().unwrap_or(false)
 }
 
+/// Duck-type a jinja2 Environment's options and customizations onto the core
+/// (shared by render() and the exposed pipeline methods below).
+/// Returns the env's autoescape flag.
+fn import_jinja_env(core: &mut TplCore, env: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let mut autoescape = false;
+    if let Ok(ae) = env.getattr("autoescape") {
+        if ae.is_truthy().unwrap_or(false) {
+            autoescape = true;
+        }
+    }
+    // jinja2 environment options
+    for (attr, slot) in [
+        ("trim_blocks", 0u8),
+        ("lstrip_blocks", 1u8),
+        ("keep_trailing_newline", 2u8),
+    ] {
+        if let Ok(v) = env.getattr(attr) {
+            let b = v.is_truthy().unwrap_or(false);
+            match slot {
+                0 => core.env_options.trim_blocks = Some(b),
+                1 => core.env_options.lstrip_blocks = Some(b),
+                _ => core.env_options.keep_trailing_newline = Some(b),
+            }
+        }
+    }
+    if let Ok(undefined_cls) = env.getattr("undefined") {
+        if let Ok(name) = undefined_cls.getattr("__name__") {
+            let behavior = match name.str()?.to_string_lossy().as_ref() {
+                "ChainableUndefined" => "chainable",
+                "StrictUndefined" => "strict",
+                _ => "lenient",
+            };
+            core.env_options.undefined_behavior = Some(behavior.to_string());
+        }
+    }
+    // jinja2 ships default globals (namespace, range, dict, ...) that
+    // would shadow minijinja's native builtins. minijinja's own
+    // `namespace` object is required for `{% set ns.attr = ... %}`,
+    // so never let an env-provided global override these names.
+    const SKIP_GLOBALS: &[&str] =
+        &["namespace", "range", "dict", "cycler", "joiner", "lipsum"];
+    // jinja2's own builtin filters/tests/globals are best handled by
+    // minijinja's native implementations: importing them as plain
+    // python callables would both shadow the faster native versions
+    // and break undefined-value semantics (jinja2's builtins check
+    // `isinstance(v, jinja2.Undefined)`, which never matches values
+    // converted from minijinja). Detect builtins by object identity
+    // against jinja2.defaults; only entries the user actually added
+    // or overrode get imported. When jinja2 is not importable (e.g.
+    // duck-typed fake environments) fall back to importing everything.
+    let py = env.py();
+    let jinja_defaults = PyModule::import(py, "jinja2.defaults").ok();
+    let default_dict = |attr: &str| -> Option<Bound<'_, PyDict>> {
+        jinja_defaults
+            .as_ref()
+            .and_then(|m| m.getattr(attr).ok())
+            .and_then(|d| d.cast_into::<PyDict>().ok())
+    };
+    let default_filters = default_dict("DEFAULT_FILTERS");
+    let default_globals = default_dict("DEFAULT_NAMESPACE");
+    let default_tests = default_dict("DEFAULT_TESTS");
+    for (attr, kind) in [("filters", 0u8), ("globals", 1u8), ("tests", 2u8)] {
+        if let Ok(d) = env.getattr(attr) {
+            if let Ok(d) = d.cast::<PyDict>() {
+                for (k, v) in d.iter() {
+                    let name = k.str()?.to_string_lossy().to_string();
+                    if kind == 1 && SKIP_GLOBALS.contains(&name.as_str()) {
+                        continue;
+                    }
+                    let defaults_dict = match kind {
+                        0 => &default_filters,
+                        1 => &default_globals,
+                        _ => &default_tests,
+                    };
+                    if let Some(dd) = defaults_dict {
+                        if let Ok(Some(dv)) = dd.get_item(&name) {
+                            if dv.as_ptr() == v.as_ptr() {
+                                // untouched jinja2 builtin -> native
+                                continue;
+                            }
+                        }
+                    }
+                    if kind != 1 {
+                        // jinja2's own builtin filters/tests are either
+                        // @async_variant wrappers or @pass_environment /
+                        // @pass_eval_context / @pass_context bound; both
+                        // forms expect the jinja2 runtime as first arg
+                        // and break when invoked as plain callables.
+                        // minijinja provides native equivalents, so skip
+                        // them and only import user-registered plain
+                        // callables.
+                        let async_variant = v
+                            .getattr("jinja_async_variant")
+                            .map(|x| x.is_truthy().unwrap_or(false))
+                            .unwrap_or(false);
+                        let pass_arg = v
+                            .getattr("jinja_pass_arg")
+                            .map(|x| !x.is_none())
+                            .unwrap_or(false);
+                        if async_variant || pass_arg {
+                            continue;
+                        }
+                    }
+                    let list = match kind {
+                        0 => &mut core.custom_filters,
+                        1 => &mut core.custom_globals,
+                        _ => &mut core.custom_tests,
+                    };
+                    list.retain(|(n, _)| n != &name);
+                    list.push((name, v.unbind()));
+                }
+            }
+        }
+    }
+    Ok(autoescape)
+}
+
 // ---------------------------------------------------------------- DocxTemplate
 
 /// Send/Ungil wrapper for values that are logically confined to one thread
@@ -66,6 +184,9 @@ pub struct PyDocxTemplate {
     pub core: RefCell<TplCore>,
     /// cached document facade for __getattr__ delegation
     doc: RefCell<Option<Py<crate::docmodel::PyDocument>>>,
+    /// template source path when constructed from a path (docxtpl
+    /// template_file); None for bytes / file-like sources
+    template_file: Option<String>,
 }
 
 #[pymethods]
@@ -82,9 +203,16 @@ impl PyDocxTemplate {
     #[new]
     fn new(template_file: &Bound<'_, PyAny>) -> PyResult<Self> {
         let bytes = read_bytes_source(template_file)?;
+        let path = template_file.extract::<String>().ok().or_else(|| {
+            template_file
+                .call_method0("__fspath__")
+                .ok()
+                .and_then(|f| f.extract::<String>().ok())
+        });
         Ok(PyDocxTemplate {
             core: RefCell::new(TplCore::new(bytes)),
             doc: RefCell::new(None),
+            template_file: path,
         })
     }
 
@@ -125,114 +253,8 @@ impl PyDocxTemplate {
         let mut autoescape = autoescape;
         let mut core = self.core.borrow_mut();
         if let Some(env) = jinja_env {
-            if let Ok(ae) = env.getattr("autoescape") {
-                if ae.is_truthy().unwrap_or(false) {
-                    autoescape = true;
-                }
-            }
-            // jinja2 environment options
-            for (attr, slot) in [
-                ("trim_blocks", 0u8),
-                ("lstrip_blocks", 1u8),
-                ("keep_trailing_newline", 2u8),
-            ] {
-                if let Ok(v) = env.getattr(attr) {
-                    let b = v.is_truthy().unwrap_or(false);
-                    match slot {
-                        0 => core.env_options.trim_blocks = Some(b),
-                        1 => core.env_options.lstrip_blocks = Some(b),
-                        _ => core.env_options.keep_trailing_newline = Some(b),
-                    }
-                }
-            }
-            if let Ok(undefined_cls) = env.getattr("undefined") {
-                if let Ok(name) = undefined_cls.getattr("__name__") {
-                    let behavior = match name.str()?.to_string_lossy().as_ref() {
-                        "ChainableUndefined" => "chainable",
-                        "StrictUndefined" => "strict",
-                        _ => "lenient",
-                    };
-                    core.env_options.undefined_behavior = Some(behavior.to_string());
-                }
-            }
-            // jinja2 ships default globals (namespace, range, dict, ...) that
-            // would shadow minijinja's native builtins. minijinja's own
-            // `namespace` object is required for `{% set ns.attr = ... %}`,
-            // so never let an env-provided global override these names.
-            const SKIP_GLOBALS: &[&str] =
-                &["namespace", "range", "dict", "cycler", "joiner", "lipsum"];
-            // jinja2's own builtin filters/tests/globals are best handled by
-            // minijinja's native implementations: importing them as plain
-            // python callables would both shadow the faster native versions
-            // and break undefined-value semantics (jinja2's builtins check
-            // `isinstance(v, jinja2.Undefined)`, which never matches values
-            // converted from minijinja). Detect builtins by object identity
-            // against jinja2.defaults; only entries the user actually added
-            // or overrode get imported. When jinja2 is not importable (e.g.
-            // duck-typed fake environments) fall back to importing everything.
-            let py = env.py();
-            let jinja_defaults = PyModule::import(py, "jinja2.defaults").ok();
-            let default_dict = |attr: &str| -> Option<Bound<'_, PyDict>> {
-                jinja_defaults
-                    .as_ref()
-                    .and_then(|m| m.getattr(attr).ok())
-                    .and_then(|d| d.cast_into::<PyDict>().ok())
-            };
-            let default_filters = default_dict("DEFAULT_FILTERS");
-            let default_globals = default_dict("DEFAULT_NAMESPACE");
-            let default_tests = default_dict("DEFAULT_TESTS");
-            for (attr, kind) in [("filters", 0u8), ("globals", 1u8), ("tests", 2u8)] {
-                if let Ok(d) = env.getattr(attr) {
-                    if let Ok(d) = d.cast::<PyDict>() {
-                        for (k, v) in d.iter() {
-                            let name = k.str()?.to_string_lossy().to_string();
-                            if kind == 1 && SKIP_GLOBALS.contains(&name.as_str()) {
-                                continue;
-                            }
-                            let defaults_dict = match kind {
-                                0 => &default_filters,
-                                1 => &default_globals,
-                                _ => &default_tests,
-                            };
-                            if let Some(dd) = defaults_dict {
-                                if let Ok(Some(dv)) = dd.get_item(&name) {
-                                    if dv.as_ptr() == v.as_ptr() {
-                                        // untouched jinja2 builtin -> native
-                                        continue;
-                                    }
-                                }
-                            }
-                            if kind != 1 {
-                                // jinja2's own builtin filters/tests are either
-                                // @async_variant wrappers or @pass_environment /
-                                // @pass_eval_context / @pass_context bound; both
-                                // forms expect the jinja2 runtime as first arg
-                                // and break when invoked as plain callables.
-                                // minijinja provides native equivalents, so skip
-                                // them and only import user-registered plain
-                                // callables.
-                                let async_variant = v
-                                    .getattr("jinja_async_variant")
-                                    .map(|x| x.is_truthy().unwrap_or(false))
-                                    .unwrap_or(false);
-                                let pass_arg = v
-                                    .getattr("jinja_pass_arg")
-                                    .map(|x| !x.is_none())
-                                    .unwrap_or(false);
-                                if async_variant || pass_arg {
-                                    continue;
-                                }
-                            }
-                            let list = match kind {
-                                0 => &mut core.custom_filters,
-                                1 => &mut core.custom_globals,
-                                _ => &mut core.custom_tests,
-                            };
-                            list.retain(|(n, _)| n != &name);
-                            list.push((name, v.unbind()));
-                        }
-                    }
-                }
+            if import_jinja_env(&mut core, env)? {
+                autoescape = true;
             }
         }
         // Render runs detached from the GIL: the engine re-acquires it on
@@ -398,7 +420,6 @@ impl PyDocxTemplate {
         jinja_env: Option<&Bound<'_, PyAny>>,
         context: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PySet>> {
-        let _ = jinja_env;
         let keys = match context {
             Some(c) => {
                 let dict = c.cast::<PyDict>().map_err(|_| {
@@ -412,11 +433,18 @@ impl PyDocxTemplate {
             }
             None => None,
         };
-        let vars = self
-            .core
-            .borrow_mut()
-            .undeclared_variables(keys)
-            .map_err(to_pyerr)?;
+        let mut core = self.core.borrow_mut();
+        // when a jinja_env is given, honor its parse-relevant options
+        // (trim_blocks/lstrip_blocks/keep_trailing_newline) and the same
+        // preprocessing as the render pipeline ({% trans %} etc.)
+        let use_env = match jinja_env {
+            Some(env) => {
+                import_jinja_env(&mut core, env)?;
+                true
+            }
+            None => false,
+        };
+        let vars = core.undeclared_variables(keys, use_env).map_err(to_pyerr)?;
         let out = PySet::new(py, vars.iter())?;
         Ok(out.unbind())
     }
@@ -591,6 +619,441 @@ impl PyDocxTemplate {
             ));
         }
         Ok(out)
+    }
+
+    // ---------------- docxtpl pipeline methods (string-based) ----------------
+    //
+    // Unlike docxtpl (which passes lxml trees / Part objects around), these
+    // take and return plain XML strings (and part names as zip paths),
+    // matching the existing get_xml/write_xml style of this library.
+
+    /// Template source path given at construction time (docxtpl
+    /// template_file); None when constructed from bytes or a file-like.
+    #[getter]
+    fn template_file(&self) -> Option<String> {
+        self.template_file.clone()
+    }
+
+    /// The document facade; equivalent to get_docx() (docxtpl `docx`,
+    /// except that docxtpl's is None before the first init_docx()).
+    #[getter(docx)]
+    fn docx_prop(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<crate::docmodel::PyDocument>> {
+        Py::new(py, crate::docmodel::PyDocument { tpl: slf })
+    }
+
+    /// Map of pictures found while replacing: filename -> (target_ref,
+    /// partname). Equivalent to get_pic_map() (docxtpl `pic_map`).
+    #[getter(pic_map)]
+    fn pic_map_prop(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        self.get_pic_map(py)
+    }
+
+    /// Name of the part currently being rendered (docxtpl
+    /// current_rendering_part); None outside a render.
+    #[getter]
+    fn current_rendering_part(&self) -> Option<String> {
+        crate::pybridge::current_rendering_part()
+    }
+
+    #[setter]
+    fn set_is_rendered(&self, v: bool) {
+        self.core.borrow_mut().is_rendered = v;
+    }
+
+    #[setter]
+    fn set_is_saved(&self, v: bool) {
+        self.core.borrow_mut().is_saved = v;
+    }
+
+    /// Media replacement map {crc32: new_bytes} (docxtpl crc_to_new_media).
+    /// The getter returns a snapshot copy: mutating it in place has no
+    /// effect, reassign the attribute instead (unlike docxtpl's live dict).
+    #[getter]
+    fn crc_to_new_media(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let dict = PyDict::new(py);
+        for (k, v) in &self.core.borrow().crc_to_new_media {
+            dict.set_item(k, PyBytes::new(py, v))?;
+        }
+        Ok(dict.unbind())
+    }
+
+    #[setter]
+    fn set_crc_to_new_media(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let dict = value.cast::<PyDict>()?;
+        let mut map = HashMap::new();
+        for (k, v) in dict.iter() {
+            map.insert(k.extract::<u32>()?, v.extract::<Vec<u8>>()?);
+        }
+        self.core.borrow_mut().crc_to_new_media = map;
+        Ok(())
+    }
+
+    /// Embedded-object replacement map {crc32: new_bytes} (docxtpl
+    /// crc_to_new_embedded). Snapshot semantics: see crc_to_new_media.
+    #[getter]
+    fn crc_to_new_embedded(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let dict = PyDict::new(py);
+        for (k, v) in &self.core.borrow().crc_to_new_embedded {
+            dict.set_item(k, PyBytes::new(py, v))?;
+        }
+        Ok(dict.unbind())
+    }
+
+    #[setter]
+    fn set_crc_to_new_embedded(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let dict = value.cast::<PyDict>()?;
+        let mut map = HashMap::new();
+        for (k, v) in dict.iter() {
+            map.insert(k.extract::<u32>()?, v.extract::<Vec<u8>>()?);
+        }
+        self.core.borrow_mut().crc_to_new_embedded = map;
+        Ok(())
+    }
+
+    /// Zip-entry replacement map {zipname: new_bytes} (docxtpl
+    /// zipname_to_replace). Snapshot semantics: see crc_to_new_media.
+    #[getter]
+    fn zipname_to_replace(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let dict = PyDict::new(py);
+        for (k, v) in &self.core.borrow().zipname_to_replace {
+            dict.set_item(k, PyBytes::new(py, v))?;
+        }
+        Ok(dict.unbind())
+    }
+
+    #[setter]
+    fn set_zipname_to_replace(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let dict = value.cast::<PyDict>()?;
+        let mut map = HashMap::new();
+        for (k, v) in dict.iter() {
+            map.insert(k.extract::<String>()?, v.extract::<Vec<u8>>()?);
+        }
+        self.core.borrow_mut().zipname_to_replace = map;
+        Ok(())
+    }
+
+    /// Picture replacement map {name/title/descr: new_bytes} (docxtpl
+    /// pics_to_replace). Snapshot semantics: see crc_to_new_media.
+    #[getter]
+    fn pics_to_replace(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let dict = PyDict::new(py);
+        for (k, v) in &self.core.borrow().pics_to_replace {
+            dict.set_item(k, PyBytes::new(py, v))?;
+        }
+        Ok(dict.unbind())
+    }
+
+    #[setter]
+    fn set_pics_to_replace(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let dict = value.cast::<PyDict>()?;
+        let mut map = HashMap::new();
+        for (k, v) in dict.iter() {
+            map.insert(k.extract::<String>()?, v.extract::<Vec<u8>>()?);
+        }
+        self.core.borrow_mut().pics_to_replace = map;
+        Ok(())
+    }
+
+    /// Run the internal patch pipeline on a raw xml string (docxtpl
+    /// patch_xml): text-node entity decoding + tag merging/cleaning,
+    /// returning the patched xml string.
+    fn patch_xml(&self, src_xml: &str) -> String {
+        crate::patch::patch_xml(&crate::patch::decode_text_entities(src_xml)).into_owned()
+    }
+
+    /// Expand newlines/tabs/page breaks inside w:t into w:br/w:tab/paragraph
+    /// splits (docxtpl resolve_listing), returning the xml string.
+    fn resolve_listing(&self, xml: &str) -> String {
+        crate::patch::resolve_listing(xml).into_owned()
+    }
+
+    /// Fix table grids whose rows have more/fewer cells than w:gridCol
+    /// declarations (docxtpl fix_tables), with the same three-level fallback
+    /// (strict DOM parse -> recovery parse -> regex). Takes and returns an
+    /// xml string instead of an lxml tree.
+    fn fix_tables(&self, xml: &str) -> PyResult<String> {
+        crate::template::fix_tables_only(xml).map_err(to_pyerr)
+    }
+
+    /// Renumber wp:docPr ids (from the internal docx_ids_index) and
+    /// pic:cNvPr ids so they are unique (docxtpl fix_docpr_ids); no table
+    /// fixing is done. Takes and returns an xml string instead of mutating
+    /// an lxml tree.
+    fn fix_docpr_ids(&self, xml: &str) -> String {
+        let mut core = self.core.borrow_mut();
+        let mut cnvpr_next = 1u32;
+        crate::template::fix_docpr_cnvpr_ids(xml, &mut core.docx_ids_index, Some(&mut cnvpr_next))
+    }
+
+    /// docxtpl xml_to_string (etree.tostring). Here: a str is returned
+    /// unchanged (no lxml normalization exists), bytes are decoded using
+    /// `encoding` (any Python codec) and returned as str.
+    #[pyo3(signature = (xml, encoding="utf-8"))]
+    fn xml_to_string(&self, xml: &Bound<'_, PyAny>, encoding: &str) -> PyResult<String> {
+        if let Ok(s) = xml.extract::<String>() {
+            return Ok(s);
+        }
+        if let Ok(b) = xml.cast::<PyBytes>() {
+            return Ok(b.call_method1("decode", (encoding,))?.extract::<String>()?);
+        }
+        Err(PyValueError::new_err("expected str or bytes"))
+    }
+
+    /// Render one already-patched xml string with the given context
+    /// (docxtpl render_xml_part). `part` is the part's zip path (docxtpl
+    /// passes a Part object) and is used for deferred InlineImage/Subdoc
+    /// materialization and current_rendering_part. jinja_env is honored the
+    /// same way as in render(). Returns the rendered xml string.
+    #[pyo3(signature = (src_xml, part, context, jinja_env=None))]
+    fn render_xml_part(
+        &self,
+        src_xml: &str,
+        part: &str,
+        context: &Bound<'_, PyAny>,
+        jinja_env: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<String> {
+        let mut autoescape = false;
+        let mut core = self.core.borrow_mut();
+        if let Some(env) = jinja_env {
+            if import_jinja_env(&mut core, env)? {
+                autoescape = true;
+            }
+        }
+        core.init_docx(false).map_err(to_pyerr)?;
+        let prev = crate::pybridge::set_current_render(&mut *core, part);
+        let run = |core: &mut TplCore| -> Result<String, String> {
+            let ctx = py_to_value(context, core, part, 0).map_err(|e| e.to_string())?;
+            let rendered = crate::template::render_xml_str(src_xml, ctx, autoescape, core)?;
+            let rendered = crate::patch::resolve_listing(&rendered).into_owned();
+            core.materialize_deferred(part, rendered)
+        };
+        let result = run(&mut core);
+        crate::pybridge::restore_current_render(prev);
+        result.map_err(to_pyerr)
+    }
+
+    /// Render the jinja placeholders in docProps/core.xml with the given
+    /// context, updating the part in the package (docxtpl
+    /// render_properties). jinja_env is honored the same way as in
+    /// render() (autoescape is always off here, like docxtpl).
+    #[pyo3(signature = (context, jinja_env=None))]
+    fn render_properties(
+        &self,
+        context: &Bound<'_, PyAny>,
+        jinja_env: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let mut core = self.core.borrow_mut();
+        if let Some(env) = jinja_env {
+            import_jinja_env(&mut core, env)?;
+        }
+        core.init_docx(false).map_err(to_pyerr)?;
+        core.render_properties(&|core, part| {
+            py_to_value(context, core, part, 0).map_err(|e| e.to_string())
+        })
+        .map_err(to_pyerr)
+    }
+
+    /// Render the footnotes part(s) with the given context, updating them in
+    /// the package (docxtpl render_footnotes). No-op when the document has
+    /// no footnotes part.
+    #[pyo3(signature = (context, jinja_env=None))]
+    fn render_footnotes(
+        &self,
+        context: &Bound<'_, PyAny>,
+        jinja_env: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let mut autoescape = false;
+        let mut core = self.core.borrow_mut();
+        if let Some(env) = jinja_env {
+            if import_jinja_env(&mut core, env)? {
+                autoescape = true;
+            }
+        }
+        core.init_docx(false).map_err(to_pyerr)?;
+        core.render_footnotes(autoescape, &|core, part| {
+            py_to_value(context, core, part, 0).map_err(|e| e.to_string())
+        })
+        .map_err(to_pyerr)
+    }
+
+    /// Render the document body with the given context and return the
+    /// rendered xml string (docxtpl build_xml). The package is not
+    /// modified; table/docPr fixing is not applied (see map_tree()).
+    #[pyo3(signature = (context, jinja_env=None))]
+    fn build_xml(
+        &self,
+        context: &Bound<'_, PyAny>,
+        jinja_env: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<String> {
+        let mut autoescape = false;
+        let mut core = self.core.borrow_mut();
+        if let Some(env) = jinja_env {
+            if import_jinja_env(&mut core, env)? {
+                autoescape = true;
+            }
+        }
+        let src = core.get_xml().map_err(to_pyerr)?;
+        core.render_part(crate::template::DOCUMENT_PART, &src, autoescape, &|core, part| {
+            py_to_value(context, core, part, 0).map_err(|e| e.to_string())
+        })
+        .map_err(to_pyerr)
+    }
+
+    /// Apply fix_tables + fix_docpr_ids to a rendered body xml string
+    /// (docxtpl map_tree replaces the body with the fixed tree). Here the
+    /// fixed xml string is returned instead; the package is not modified.
+    fn map_tree(&self, xml: &str) -> PyResult<String> {
+        let mut core = self.core.borrow_mut();
+        crate::template::fix_tables_and_docpr(xml, &mut core.docx_ids_index).map_err(to_pyerr)
+    }
+
+    /// Current xml of a package part given by its zip path, e.g.
+    /// "word/document.xml" (docxtpl get_part_xml, which takes a Part
+    /// object and returns the lxml-serialized string; here the stored xml
+    /// string is returned as-is).
+    fn get_part_xml(&self, part: &str) -> PyResult<String> {
+        self.core.borrow_mut().get_part_xml(part).map_err(to_pyerr)
+    }
+
+    /// Encoding declared in an xml declaration, "utf-8" when absent
+    /// (docxtpl get_headers_footers_encoding). Accepts str or bytes.
+    fn get_headers_footers_encoding(&self, xml: &Bound<'_, PyAny>) -> PyResult<String> {
+        if let Ok(s) = xml.extract::<String>() {
+            return Ok(crate::template::headers_footers_encoding(&s));
+        }
+        if let Ok(b) = xml.cast::<PyBytes>() {
+            return Ok(crate::template::headers_footers_encoding(
+                &String::from_utf8_lossy(b.as_bytes()),
+            ));
+        }
+        Err(PyValueError::new_err("expected str or bytes"))
+    }
+
+    /// Render the header/footer parts matching `uri` (HEADER_URI /
+    /// FOOTER_URI) with the given context (docxtpl build_headers_footers_xml).
+    /// Returns a dict {relKey: rendered_xml} — docxtpl yields
+    /// (relKey, bytes) pairs encoded with the part's declared encoding.
+    #[pyo3(signature = (context, uri, jinja_env=None))]
+    fn build_headers_footers_xml(
+        &self,
+        py: Python<'_>,
+        context: &Bound<'_, PyAny>,
+        uri: &str,
+        jinja_env: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyDict>> {
+        let mut autoescape = false;
+        let mut core = self.core.borrow_mut();
+        if let Some(env) = jinja_env {
+            if import_jinja_env(&mut core, env)? {
+                autoescape = true;
+            }
+        }
+        core.init_docx(false).map_err(to_pyerr)?;
+        core.flush_parts().map_err(to_pyerr)?;
+        let pairs: Vec<(String, String)> = match core.package.as_ref() {
+            Some(pkg) => pkg
+                .rels(crate::template::DOCUMENT_PART)
+                .by_type(uri)
+                .filter(|r| !r.is_external)
+                .map(|r| {
+                    (
+                        r.id.clone(),
+                        crate::package::resolve_target(crate::template::DOCUMENT_PART, &r.target),
+                    )
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let srcs: Vec<(String, String, String)> = pairs
+            .into_iter()
+            .filter_map(|(rid, part)| {
+                core.package
+                    .as_ref()
+                    .and_then(|p| p.get_string(&part))
+                    .map(|s| (rid, part, s))
+            })
+            .collect();
+        let out = PyDict::new(py);
+        for (rid, part, src) in srcs {
+            let rendered = core
+                .render_part(&part, &src, autoescape, &|core, part| {
+                    py_to_value(context, core, part, 0).map_err(|e| e.to_string())
+                })
+                .map_err(to_pyerr)?;
+            out.set_item(rid, rendered)?;
+        }
+        Ok(out.unbind())
+    }
+
+    /// Apply the header/footer fixups to a rendered header/footer xml
+    /// string: fix_tables, plus docPr id renumbering when relKey points to
+    /// a header (docxtpl map_headers_footers_xml). Here the fixed xml
+    /// string is returned instead of replacing the part in the package.
+    fn map_headers_footers_xml(&self, rel_key: &str, xml: &str) -> PyResult<String> {
+        let mut core = self.core.borrow_mut();
+        core.init_docx(false).map_err(to_pyerr)?;
+        let is_header = core
+            .package
+            .as_ref()
+            .and_then(|p| {
+                p.rels(crate::template::DOCUMENT_PART)
+                    .get(rel_key)
+                    .map(|r| r.rel_type == crate::package::rel_type::HEADER)
+            })
+            .unwrap_or(false);
+        let fixed = crate::template::fix_tables_only(xml).map_err(to_pyerr)?;
+        if is_header {
+            Ok(crate::template::fix_docpr_cnvpr_ids(
+                &fixed,
+                &mut core.docx_ids_index,
+                None,
+            ))
+        } else {
+            Ok(fixed)
+        }
+    }
+
+    /// (Re)initialize the internal package from the template bytes
+    /// (docxtpl init_docx). With reload=False the package is only loaded if
+    /// it has not been loaded yet (or was reloaded since the last render).
+    #[pyo3(signature = (reload=true))]
+    fn init_docx(&self, reload: bool) -> PyResult<()> {
+        self.core.borrow_mut().init_docx(reload).map_err(to_pyerr)
+    }
+
+    /// Reset the per-render state: reloads the package, clears pic_map and
+    /// deferred values, resets docx_ids_index and is_saved (docxtpl
+    /// render_init).
+    fn render_init(&self) -> PyResult<()> {
+        self.core.borrow_mut().render_init().map_err(to_pyerr)
+    }
+
+    /// Apply the pending pics_to_replace replacements to the package and
+    /// populate pic_map (docxtpl pre_processing). Raises for pictures not
+    /// found in the template unless allow_missing_pics is set.
+    fn pre_processing(&self) -> PyResult<()> {
+        let mut core = self.core.borrow_mut();
+        core.init_docx(false).map_err(to_pyerr)?;
+        core.pre_processing().map_err(to_pyerr)
+    }
+
+    /// Apply the pending zip-level replacements (crc_to_new_media /
+    /// crc_to_new_embedded / zipname_to_replace) to a docx file on disk,
+    /// rewriting it in place (docxtpl post_processing). The live package is
+    /// not touched. No-op when all replacement dicts are empty.
+    fn post_processing(&self, docx_file: &str) -> PyResult<()> {
+        let core = self.core.borrow();
+        if core.crc_to_new_media.is_empty()
+            && core.crc_to_new_embedded.is_empty()
+            && core.zipname_to_replace.is_empty()
+        {
+            return Ok(());
+        }
+        let data = std::fs::read(docx_file)
+            .map_err(|e| PyValueError::new_err(format!("cannot read {}: {}", docx_file, e)))?;
+        let out = core.post_processing_bytes(&data).map_err(to_pyerr)?;
+        std::fs::write(docx_file, &out)
+            .map_err(|e| PyValueError::new_err(format!("cannot write {}: {}", docx_file, e)))
     }
 }
 
@@ -982,8 +1445,72 @@ fn edit_block<R>(
     Ok(f(block))
 }
 
+/// Build a read-only PyDocument facade over the subdoc's current content
+/// (the delegation target of docxtpl's Subdoc.__getattr__ and its `docx`
+/// attribute). A subdoc created from a file/bytes is wrapped directly; a
+/// bound (builder) subdoc serializes its accumulated blocks into a minimal
+/// document (pictures are embedded into that document's package).
+fn subdoc_docx(slf: &Py<PySubdoc>, py: Python<'_>) -> PyResult<Py<crate::docmodel::PyDocument>> {
+    let (bytes, blocks) = {
+        let sd = slf.bind(py).borrow();
+        let blocks = sd.blocks.borrow().clone();
+        (sd.bytes.clone(), blocks)
+    };
+    let core = match bytes {
+        // file-based subdoc: facade over the source document
+        Some(b) => TplCore::new(b),
+        None => {
+            let mut core = TplCore::new(crate::package::minimal_docx(""));
+            if !blocks.is_empty() {
+                core.init_docx(false).map_err(to_pyerr)?;
+                let body = crate::subdocbuilder::serialize_blocks(
+                    &mut core,
+                    crate::template::DOCUMENT_PART,
+                    &blocks,
+                )
+                .map_err(to_pyerr)?;
+                let xml = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>{}<w:sectPr/></w:body></w:document>",
+                    body
+                );
+                core.package
+                    .as_mut()
+                    .unwrap()
+                    .set(crate::template::DOCUMENT_PART, xml.into_bytes());
+                core.invalidate_doc();
+            }
+            core
+        }
+    };
+    let tpl = Py::new(
+        py,
+        PyDocxTemplate {
+            core: RefCell::new(core),
+            doc: RefCell::new(None),
+            template_file: None,
+        },
+    )?;
+    Py::new(py, crate::docmodel::PyDocument { tpl })
+}
+
 #[pymethods]
 impl PySubdoc {
+    /// A read-only document facade over the subdoc's current content
+    /// (docxtpl Subdoc.docx). Rebuilt on each access, so programmatically
+    /// added content is reflected.
+    #[getter]
+    fn docx(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<crate::docmodel::PyDocument>> {
+        subdoc_docx(&slf, py)
+    }
+
+    /// Unknown attributes are delegated to a document facade over the
+    /// subdoc's current content (docxtpl Subdoc.__getattr__ delegating to
+    /// the inner python-docx Document).
+    fn __getattr__(slf: Py<Self>, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
+        let doc = subdoc_docx(&slf, py)?;
+        doc.bind(py).getattr(name).map(|o| o.unbind())
+    }
+
     #[new]
     #[pyo3(signature = (tpl, docpath=None, keep_sections=false))]
     fn new(

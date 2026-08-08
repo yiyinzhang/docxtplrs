@@ -446,6 +446,43 @@ pub fn encode_part_owned(content: String, encoding: &str) -> Vec<u8> {
     encode_part(&content, encoding)
 }
 
+/// Build a minimal valid docx (content types + root rels + document.xml)
+/// wrapping the given body xml. Used to back the Subdoc query facade for
+/// programmatically built (bound) subdocs.
+pub fn minimal_docx(body_xml: &str) -> Vec<u8> {
+    let ct = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"#;
+    let rels = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#;
+    let doc = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>{}<w:sectPr/></w:body></w:document>",
+        body_xml
+    );
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut cursor);
+        let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, data) in [
+            ("[Content_Types].xml", &ct[..]),
+            ("_rels/.rels", &rels[..]),
+            ("word/document.xml", doc.as_bytes()),
+        ] {
+            // infallible for an in-memory cursor
+            let _ = writer.start_file(name, options);
+            let _ = writer.write_all(data);
+        }
+        let _ = writer.finish();
+    }
+    cursor.into_inner()
+}
+
 impl Package {
     pub fn from_bytes(data: &[u8]) -> Result<Package, String> {
         Self::from_archive(data, None)

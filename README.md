@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/docxtplrs.svg)](https://crates.io/crates/docxtplrs)
 [![docs.rs](https://docs.rs/docxtplrs/badge.svg)](https://docs.rs/docxtplrs)
 [![license](https://img.shields.io/badge/license-LGPL--2.1--or--later-blue.svg)](https://github.com/yiyinzhang/docxtplrs)
-[![tests](https://img.shields.io/badge/tests-458%20passed-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
+[![tests](https://img.shields.io/badge/tests-502%20passed-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
 [![coverage](https://img.shields.io/badge/coverage-86%25-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
 [![crosscheck](https://img.shields.io/badge/crosscheck-ALL%20MATCH-brightgreen.svg)](https://github.com/yiyinzhang/docxtplrs)
 
@@ -22,7 +22,7 @@ docx 的 zip/XML 处理、模板预处理、表格修复、关系管理、文档
 
 > ⚠️ Vibecoding project / AI 结对编写项目：written by an AI (Kimi Code) with the user,
 > without line-by-line human review / 未经人工逐行审查。Verified by the official docxtpl
-> test suite (32 real-world templates) + 458 in-house tests / 已通过官方套件与 458 个自建测试，
+> test suite (32 real-world templates) + 502 in-house tests / 已通过官方套件与 502 个自建测试，
 > but evaluate before production use / 生产使用前请自行评估。
 
 ## Quick start / 快速开始
@@ -83,7 +83,7 @@ tpl.save("out.docx")
   (`{{ var }}`, `{%tr %}`/`{%tc %}`/`{%p %}`, `RichText`, `InlineImage`,
   `Subdoc`, ...) mirror docxtpl; migrating is usually just changing the import.
   Verified against the official docxtpl test suite (32 real-world templates),
-  458 in-house tests, plus automated output cross-checking against docxtpl
+  502 in-house tests, plus automated output cross-checking against docxtpl
   itself (`tests/crosscheck.py`).
 - **One engine, two languages** — the same renderer is available as a native
   Rust crate, so Rust services/CLIs can render docx templates with no Python
@@ -230,7 +230,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-docxtplrs = { version = "0.2.3", default-features = false }  # pure Rust: no PyO3/libpython
+docxtplrs = { version = "0.2.4", default-features = false }  # pure Rust: no PyO3/libpython
 minijinja = "2"
 ```
 
@@ -319,7 +319,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # in another uv project
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.3-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.4-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # or editable (local development)
 uv add --editable /path/to/docxtplrs
 ```
@@ -399,7 +399,8 @@ tpl.save("out.docx")                         # or io.BytesIO()
   `replace_media()` / `replace_embedded()` / `replace_pic()` / `replace_zipname()`,
   `reset_replacements()`, `allow_missing_pics`, `get_pic_map()`
 - Customization: `register_filter/test/function/global()`, `set_template_loader()`,
-  `install_gettext()`; `render(ctx, jinja_env=...)` accepts a real jinja2
+  `install_gettext()`; `render(ctx, jinja_env=...)` and
+  `get_undeclared_template_variables(jinja_env=...)` accept a real jinja2
   `Environment` (reads `autoescape/filters/globals/tests/trim_blocks/lstrip_blocks/
   keep_trailing_newline/undefined`)
 - Document object model (read-write): `get_docx()`, `paragraphs/tables/sections/
@@ -427,11 +428,26 @@ tpl.save("out.docx")                         # or io.BytesIO()
   `Section.even_page_header/footer`, `Section.first_page_header/footer`
 - docxtpl helpers: `HEADER_URI`/`FOOTER_URI`, `get_file_crc()` (path/bytes/
   file-like), `get_headers_footers(uri)` yielding live `(rid, XmlElement)` pairs
+- Semi-public pipeline methods (docxtpl parity, but taking/returning XML
+  strings and part zip-paths instead of lxml trees/Part objects):
+  `patch_xml()`, `resolve_listing()`, `fix_tables()`, `fix_docpr_ids()`,
+  `xml_to_string()`, `render_xml_part()`, `render_properties()`,
+  `render_footnotes()`, `build_xml()`, `map_tree()`, `get_part_xml()`,
+  `get_headers_footers_encoding()`, `build_headers_footers_xml()`,
+  `map_headers_footers_xml()`, `init_docx()`, `render_init()`,
+  `pre_processing()`, `post_processing()`
+- Public attributes: `template_file` (None for bytes/file-like sources),
+  `docx`, `pic_map`, `current_rendering_part`, settable `is_saved` /
+  `is_rendered`, and the four replacement dicts `crc_to_new_media` /
+  `crc_to_new_embedded` / `zipname_to_replace` / `pics_to_replace`
+  (getter returns a snapshot; reassign to apply — unlike docxtpl's live dicts)
 - `RichText`/`R`, `RichTextParagraph`/`RP`, `Listing`, `InlineImage`, `Subdoc`
   (file merging + programmatic `add_paragraph/add_picture/add_table`;
   `new_subdoc(path, keep_sections=True)` additionally preserves the subdoc's
   section properties — page setup and header/footer references — as its own
-  section; subdoc **comments are merged** in all cases)
+  section; subdoc **comments are merged** in all cases; unknown attributes
+  and `subdoc.docx` delegate to a read-only document facade over the subdoc's
+  current content, like docxtpl's `Subdoc.__getattr__`)
 - `Composer`: docxcompose-style concatenation of whole documents —
   `Composer(master).append(doc).save(out)`, with a page break between
   documents and style/numbering/media merging:
@@ -512,7 +528,7 @@ Engine-level extras beyond stock minijinja, so jinja2-style templates work as-is
 #### Tests
 
 ```bash
-.venv/bin/python -m pytest tests/ -q          # 458 unit tests
+.venv/bin/python -m pytest tests/ -q          # 502 unit tests
 .venv/bin/python tests/crosscheck.py docxtplrs > /tmp/rs.json
 .venv/bin/python tests/crosscheck.py docxtpl > /tmp/ref.json   # needs crosscheck group
 .venv/bin/python tests/crosscheck.py compare /tmp/ref.json /tmp/rs.json
@@ -560,6 +576,10 @@ with `llvm-cov`.
   official test suite, but extremely malformed templates may differ.
 - Zip output preserves compression methods and timestamps, but is not guaranteed
   byte-identical to python-docx output.
+- The semi-public pipeline methods (`patch_xml`/`render_xml_part`/`build_xml`/
+  `map_tree`/...) take and return XML strings (and part zip-paths) instead of
+  lxml trees/Part objects, and the four replacement dicts are snapshot
+  getter/setter pairs rather than live mutable dicts.
 
 **Not supported**
 
@@ -587,7 +607,7 @@ with `llvm-cov`.
   复现——引用数字前请用你自己的模板复测；引擎内部优化见[性能](#性能)。
 - **无缝替代**：Python API 与模板语法（`{{ var }}`、`{%tr %}`/`{%tc %}`/`{%p %}`、
   `RichText`、`InlineImage`、`Subdoc` 等）与 docxtpl 几乎完全一致，迁移通常只需改一行 import。
-  已通过 docxtpl 官方测试套件（32 个真实模板）、458 个自建测试，并有与 docxtpl 输出自动
+  已通过 docxtpl 官方测试套件（32 个真实模板）、502 个自建测试，并有与 docxtpl 输出自动
   交叉比对的工具（`tests/crosscheck.py`）。
 - **一个引擎，两种语言**：同一渲染器同时提供原生 Rust crate，Rust 服务/CLI 可以完全不
   经过 Python 渲染 docx 模板。
@@ -693,7 +713,7 @@ debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会�
 
 ```toml
 [dependencies]
-docxtplrs = { version = "0.2.3", default-features = false }  # 纯 Rust：不依赖 PyO3/libpython
+docxtplrs = { version = "0.2.4", default-features = false }  # 纯 Rust：不依赖 PyO3/libpython
 minijinja = "2"
 ```
 
@@ -780,7 +800,7 @@ cargo run --example render --release -- template.docx out.docx
 uv sync
 
 # 在其他 uv 项目中
-uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.3-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+uv add /path/to/docxtplrs/target/wheels/docxtplrs-0.2.4-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
 # 或本地开发模式（editable）
 uv add --editable /path/to/docxtplrs
 ```
@@ -860,7 +880,8 @@ tpl.save("out.docx")                         # 或 io.BytesIO()
   `replace_media()` / `replace_embedded()` / `replace_pic()` / `replace_zipname()`、
   `reset_replacements()`、`allow_missing_pics`、`get_pic_map()`
 - 自定义：`register_filter/test/function/global()`、`set_template_loader()`、
-  `install_gettext()`；`render(ctx, jinja_env=...)` 接受真实 jinja2
+  `install_gettext()`；`render(ctx, jinja_env=...)` 与
+  `get_undeclared_template_variables(jinja_env=...)` 接受真实 jinja2
   `Environment`（读取 `autoescape/filters/globals/tests/trim_blocks/lstrip_blocks/
   keep_trailing_newline/undefined`）
 - 文档对象模型（可读写）：`get_docx()`、`paragraphs/tables/sections/
@@ -887,10 +908,24 @@ tpl.save("out.docx")                         # 或 io.BytesIO()
   `Section.even_page_header/footer`、`Section.first_page_header/footer`
 - docxtpl 辅助 API：`HEADER_URI`/`FOOTER_URI`、`get_file_crc()`（路径/bytes/
   文件对象）、`get_headers_footers(uri)` 产出实时的 `(rid, XmlElement)` 对
+- 半公开管线方法（与 docxtpl 对齐，但出入参为 XML 字符串与 part 的 zip
+  路径，而非 lxml 树/Part 对象）：`patch_xml()`、`resolve_listing()`、
+  `fix_tables()`、`fix_docpr_ids()`、`xml_to_string()`、`render_xml_part()`、
+  `render_properties()`、`render_footnotes()`、`build_xml()`、`map_tree()`、
+  `get_part_xml()`、`get_headers_footers_encoding()`、
+  `build_headers_footers_xml()`、`map_headers_footers_xml()`、`init_docx()`、
+  `render_init()`、`pre_processing()`、`post_processing()`
+- 公开属性：`template_file`（bytes/文件对象构造时为 None）、`docx`、
+  `pic_map`、`current_rendering_part`、可赋值的 `is_saved`/`is_rendered`，
+  以及四个替换字典 `crc_to_new_media`/`crc_to_new_embedded`/
+  `zipname_to_replace`/`pics_to_replace`（getter 返回快照，需重新赋值生效——
+  与 docxtpl 的可变 dict 不同）
 - `RichText`/`R`、`RichTextParagraph`/`RP`、`Listing`、`InlineImage`、`Subdoc`
   （文件合并 + 编程式 `add_paragraph/add_picture/add_table`；
   `new_subdoc(path, keep_sections=True)` 还会把子文档的节属性——页面设置与
-  页眉页脚引用——保留为独立一节；子文档的**批注**在任何模式下都会被合并）
+  页眉页脚引用——保留为独立一节；子文档的**批注**在任何模式下都会被合并；
+  未知属性与 `subdoc.docx` 会委托到基于子文档当前内容构建的只读文档门面，
+  与 docxtpl 的 `Subdoc.__getattr__` 一致）
 - `Composer`：docxcompose 风格的整文档拼接——`Composer(master).append(doc).save(out)`，
   文档间自动分页，样式/编号/媒体自动合并：
 
@@ -968,7 +1003,7 @@ tpl.render(context, jinja_env=env)
 #### 测试
 
 ```bash
-.venv/bin/python -m pytest tests/ -q          # 458 个单元测试
+.venv/bin/python -m pytest tests/ -q          # 502 个单元测试
 .venv/bin/python tests/crosscheck.py docxtplrs > /tmp/rs.json
 .venv/bin/python tests/crosscheck.py docxtpl > /tmp/ref.json   # 需要 crosscheck 依赖组
 .venv/bin/python tests/crosscheck.py compare /tmp/ref.json /tmp/rs.json
@@ -1007,6 +1042,9 @@ tpl.render(context, jinja_env=env)
 - MB 级大文档上，docxtpl 的 8 处正则被替换为线性扫描器以避免回溯栈溢出；输出已与官方
   测试套件逐字节比对，但极端畸形的模板可能有差异。
 - zip 输出保留压缩方式与时间戳，但不保证与 python-docx 输出逐字节一致。
+- 半公开管线方法（`patch_xml`/`render_xml_part`/`build_xml`/`map_tree` 等）
+  的出入参为 XML 字符串（及 part 的 zip 路径），而非 lxml 树/Part 对象；
+  四个替换字典为快照式 getter/setter，而非 docxtpl 的可变 dict。
 
 **不支持**
 
@@ -1021,7 +1059,7 @@ tpl.render(context, jinja_env=env)
 ```
 src/            Rust sources (17 modules, see AGENTS.md)   Rust 源码
 python/         Python package shell (__init__ + __main__ CLI)
-tests/          458 tests + crosscheck/compare/benchmark    测试、交叉验证与基准
+tests/          502 tests + crosscheck/compare/benchmark    测试、交叉验证与基准
 examples/       render.rs (Rust API), patch_dbg.rs (large-doc debugging), bench.rs (stage timings)
 AGENTS.md       Notes for AI coding assistants              给 AI 助手的项目说明
 ```

@@ -305,6 +305,15 @@ impl TplCore {
             .ok_or_else(|| "word/document.xml not found".to_string())
     }
 
+    /// Current xml string of an arbitrary package part (docxtpl get_part_xml).
+    pub fn get_part_xml(&mut self, part: &str) -> Result<String, String> {
+        self.init_docx(false)?;
+        self.flush_parts()?;
+        self.pkg()?
+            .get_string(part)
+            .ok_or_else(|| format!("part {} not found", part))
+    }
+
     // ---------------- render pipeline ----------------
 
     pub fn render(&mut self, autoescape: bool, make_ctx: &CtxFn) -> Result<(), String> {
@@ -380,7 +389,7 @@ impl TplCore {
         Ok(())
     }
 
-    fn render_init(&mut self) -> Result<(), String> {
+    pub fn render_init(&mut self) -> Result<(), String> {
         self.init_docx(true)?;
         self.pic_map.clear();
         self.docx_ids_index = 1000;
@@ -620,7 +629,7 @@ impl TplCore {
         }
     }
 
-    fn render_properties(&mut self, make_ctx: &CtxFn) -> Result<(), String> {
+    pub fn render_properties(&mut self, make_ctx: &CtxFn) -> Result<(), String> {
         let name = "docProps/core.xml";
         // python-docx always provides a core properties part
         if self.package.as_ref().map(|p| !p.contains(name)).unwrap_or(false) {
@@ -681,7 +690,7 @@ impl TplCore {
         result
     }
 
-    fn render_footnotes(&mut self, autoescape: bool, make_ctx: &CtxFn) -> Result<(), String> {
+    pub fn render_footnotes(&mut self, autoescape: bool, make_ctx: &CtxFn) -> Result<(), String> {
         let rels = match &self.package {
             Some(p) => p.rels(DOCUMENT_PART),
             None => return Ok(()),
@@ -719,7 +728,12 @@ impl TplCore {
 
     // ---------------- variables ----------------
 
-    pub fn undeclared_variables(&mut self, context_keys: Option<HashSet<String>>) -> Result<Vec<String>, String> {
+    /// Undeclared variables of the template (body + headers/footers).
+    /// With `use_env` the parse honors the configured jinja environment
+    /// (trim_blocks/lstrip_blocks/keep_trailing_newline and the {% trans %}
+    /// /bool-compare/engine-feature rewrites, like the render pipeline);
+    /// without it a plain default-syntax environment is used.
+    pub fn undeclared_variables(&mut self, context_keys: Option<HashSet<String>>, use_env: bool) -> Result<Vec<String>, String> {
         // Build on a temporary package so current state is untouched
         let pkg = Package::from_bytes_arc(self.original_bytes.clone())?;
         let mut xml = String::new();
@@ -735,11 +749,25 @@ impl TplCore {
                 }
             }
         }
-        let env = Environment::new();
-        let tmpl = env
-            .template_from_str(&xml)
-            .map_err(|e| e.to_string())?;
-        let mut vars = tmpl.undeclared_variables(false);
+        let mut vars = if use_env {
+            // strip trans tags but keep their bodies (and the pluralize
+            // count) visible: the render-time gettext rewrite would fold
+            // {{ var }} into a msgid string, hiding it from the analyzer
+            let src = trans_bodies_for_analysis(&xml);
+            let src = preprocess_bool_compare(&src);
+            let src = preprocess_engine_features(&src);
+            let env = make_env(false, self);
+            let tmpl = env
+                .template_from_str(&src)
+                .map_err(|e| e.to_string())?;
+            tmpl.undeclared_variables(false)
+        } else {
+            let env = Environment::new();
+            let tmpl = env
+                .template_from_str(&xml)
+                .map_err(|e| e.to_string())?;
+            tmpl.undeclared_variables(false)
+        };
         if let Some(keys) = context_keys {
             vars = vars.into_iter().filter(|v| !keys.contains(v)).collect();
         }
@@ -760,7 +788,7 @@ impl TplCore {
         Ok(self.pkg()?.add_rel(DOCUMENT_PART, rel_type::HYPERLINK, url, true))
     }
 
-    fn pre_processing(&mut self) -> Result<(), String> {
+    pub fn pre_processing(&mut self) -> Result<(), String> {
         if !self.pics_to_replace.is_empty() {
             self.replace_pics()?;
         }
@@ -914,6 +942,38 @@ impl TplCore {
 
         self.is_saved = true;
         Ok(out)
+    }
+
+    /// Apply the pending zip-level replacements (crc_to_new_media /
+    /// crc_to_new_embedded / zipname_to_replace) to a standalone docx byte
+    /// stream, without touching the live package (docxtpl post_processing).
+    pub fn post_processing_bytes(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+        if self.crc_to_new_media.is_empty()
+            && self.crc_to_new_embedded.is_empty()
+            && self.zipname_to_replace.is_empty()
+        {
+            return Ok(data.to_vec());
+        }
+        let mut pkg = Package::from_bytes(data)?;
+        let mut updates: Vec<(usize, Vec<u8>)> = Vec::new();
+        for (idx, entry) in pkg.entries.iter().enumerate() {
+            let new = if let Some(new) = self.zipname_to_replace.get(&entry.name) {
+                Some(new.clone())
+            } else if entry.name.starts_with("word/media/") {
+                self.crc_to_new_media.get(&crc32(entry.bytes())).cloned()
+            } else if entry.name.starts_with("word/embeddings/") {
+                self.crc_to_new_embedded.get(&crc32(entry.bytes())).cloned()
+            } else {
+                None
+            };
+            if let Some(new) = new {
+                updates.push((idx, new));
+            }
+        }
+        for (idx, new) in updates {
+            pkg.entries[idx].swap_bytes(new);
+        }
+        pkg.to_bytes()
     }
 }
 
@@ -2005,11 +2065,43 @@ fn py_like_method(
     Ok(out)
 }
 
+/// Analysis variant of the trans rewrite for undeclared_variables: strips
+/// the trans/pluralize/endtrans tags but keeps the bodies (and assignment
+/// RHS / pluralize count expressions) visible, so variables inside trans
+/// blocks are still reported. The render-time gettext rewrite would fold
+/// `{{ var }}` into a msgid string, hiding it from static analysis.
+fn trans_bodies_for_analysis(src: &str) -> Cow<'_, str> {
+    if !src.contains("{% trans") {
+        return Cow::Borrowed(src);
+    }
+    Cow::Owned(crate::patch::sub(
+        r"(?s)\{%\s*trans\s*(.*?)\%\}(.*?)(?:\{%\s*pluralize\s*(.*?)\s*%\}(.*?))?\{%\s*endtrans\s*%\}",
+        |m| {
+            let mut s = String::new();
+            let kv_re = crate::patch::re(r#"(\w+)\s*=\s*("(?:[^"]*)"|'(?:[^']*)'|[^,\s]+)"#);
+            for cap in kv_re.captures_iter(m.get(1).unwrap().as_str()).flatten() {
+                if &cap[1] == "context" {
+                    continue;
+                }
+                s.push_str(&format!("{{% set {} = {} %}}", &cap[1], &cap[2]));
+            }
+            s.push_str(m.get(2).unwrap().as_str());
+            if let Some(e) = m.get(3).map(|g| g.as_str().trim()).filter(|e| !e.is_empty()) {
+                s.push_str(&format!("{{{{ {} }}}}", e));
+            }
+            if let Some(p) = m.get(4) {
+                s.push_str(p.as_str());
+            }
+            s
+        },
+        src,
+    ))
+}
+
 /// Rewrite `{% trans %}` blocks into gettext function calls (jinja2 i18n
 /// extension semantics). Without an installed catalog the functions fall
 /// back to the untranslated, formatted msgid.
-pub fn preprocess_trans(src: &str) -> Cow<'_, str> {
-    if !src.contains("{% trans") {
+pub fn preprocess_trans(src: &str) -> Cow<'_, str> {    if !src.contains("{% trans") {
         return Cow::Borrowed(src);
     }
     Cow::Owned(crate::patch::sub(
@@ -2725,8 +2817,28 @@ fn restore_escaped_delims(s: String) -> String {
 
 // ---------------- fix tables & docPr ids ----------------
 
+/// docxtpl get_headers_footers_encoding: the encoding declared in the xml
+/// declaration (`<?xml ... encoding="X"`), defaulting to "utf-8". Only the
+/// declaration's double-quoted form is recognized, matching docxtpl's regex.
+pub fn headers_footers_encoding(xml: &str) -> String {
+    let head: String = xml.chars().take(200).collect();
+    if !head.starts_with("<?xml") {
+        return "utf-8".to_string();
+    }
+    // ascii-lowercasing preserves byte positions, so `pos` indexes `head`
+    let lower = head.to_ascii_lowercase();
+    if let Some(pos) = lower.find("encoding=\"") {
+        let rest = &head[pos + "encoding=\"".len()..];
+        let enc: String = rest.chars().take_while(|c| *c != '"').collect();
+        if !enc.is_empty() {
+            return enc;
+        }
+    }
+    "utf-8".to_string()
+}
+
 pub fn fix_tables_and_docpr(xml: &str, docx_ids_index: &mut u32) -> Result<String, String> {
-    fix_tables_docpr_cnvpr(xml, docx_ids_index, None)
+    fix_impl(xml, true, Some(docx_ids_index), None)
 }
 
 /// fix_tables + docPr renumber + (optionally) pic:cNvPr renumber in a single
@@ -2738,29 +2850,65 @@ pub(crate) fn fix_tables_docpr_cnvpr(
     docx_ids_index: &mut u32,
     cnvpr_next: Option<&mut u32>,
 ) -> Result<String, String> {
+    fix_impl(xml, true, Some(docx_ids_index), cnvpr_next)
+}
+
+/// docxtpl fix_tables as a standalone string->string pass: table grid fixing
+/// only (no docPr/cNvPr renumbering), same three-level fallback
+/// (strict DOM -> recover_xml -> regex).
+pub fn fix_tables_only(xml: &str) -> Result<String, String> {
+    fix_impl(xml, true, None, None)
+}
+
+/// docxtpl fix_docpr_ids as a standalone string->string pass: renumber
+/// wp:docPr ids from docx_ids_index (and, when cnvpr_next is given,
+/// pic:cNvPr ids) without any table fixing.
+pub fn fix_docpr_cnvpr_ids(
+    xml: &str,
+    docx_ids_index: &mut u32,
+    mut cnvpr_next: Option<&mut u32>,
+) -> String {
+    let mut s = if xml.contains("wp:docPr") {
+        regex_fix_docpr(xml, docx_ids_index)
+    } else {
+        xml.to_string()
+    };
+    if let Some(next) = cnvpr_next.as_deref_mut() {
+        if let Some(fixed) = renumber_cnvpr(&s, next) {
+            s = fixed;
+        }
+    }
+    s
+}
+
+/// Shared implementation behind fix_tables_and_docpr / fix_tables_docpr_cnvpr
+/// / fix_tables_only. `do_tables` gates the w:tbl grid pass (the standalone
+/// id-renumber entry points never reach the DOM walk), `docx_ids_index` /
+/// `cnvpr_next` gate the wp:docPr / pic:cNvPr renumbering passes.
+fn fix_impl(
+    xml: &str,
+    do_tables: bool,
+    docx_ids_index: Option<&mut u32>,
+    cnvpr_next: Option<&mut u32>,
+) -> Result<String, String> {
     // nothing to fix without any table, drawing or (when requested) picture:
     // skip the full DOM parse+serialize round-trip
-    let need_cnvpr = cnvpr_next.is_some();
-    let has_tbl = xml.contains("<w:tbl");
-    let has_docpr = xml.contains("wp:docPr");
-    let has_cnvpr = need_cnvpr && xml.contains("pic:cNvPr");
+    let has_tbl = do_tables && xml.contains("<w:tbl");
+    let has_docpr = docx_ids_index.is_some() && xml.contains("wp:docPr");
+    let has_cnvpr = cnvpr_next.is_some() && xml.contains("pic:cNvPr");
     if !has_tbl && !has_docpr && !has_cnvpr {
         return Ok(xml.to_string());
     }
     if !has_tbl {
         // no tables: docPr/cNvPr renumbering are pure id rewrites — linear
         // string scans avoid the full DOM parse+serialize round-trip
-        let mut s = if has_docpr {
-            regex_fix_docpr(xml, docx_ids_index)
-        } else {
-            xml.to_string()
-        };
-        if let Some(next) = cnvpr_next {
-            if let Some(fixed) = renumber_cnvpr(&s, next) {
-                s = fixed;
-            }
-        }
-        return Ok(s);
+        return Ok(match docx_ids_index {
+            Some(idx) => fix_docpr_cnvpr_ids(xml, idx, cnvpr_next),
+            None => match cnvpr_next {
+                Some(next) => renumber_cnvpr(xml, next).unwrap_or_else(|| xml.to_string()),
+                None => xml.to_string(),
+            },
+        });
     }
     // pure-table case (no docPr/cNvPr work): a read-only string scan decides
     // whether any table grid actually needs fixing — the common case after
@@ -2784,7 +2932,7 @@ pub(crate) fn fix_tables_docpr_cnvpr(
             // single fused tree walk for tables + docPr + cNvPr; the docPr and
             // cNvPr passes are skipped entirely when the raw xml contains no
             // such elements (pure-table documents avoid the extra traversal)
-            let docpr_idx = if has_docpr { Some(docx_ids_index) } else { None };
+            let docpr_idx = if has_docpr { docx_ids_index } else { None };
             let cnvpr_idx = if has_cnvpr { cnvpr_next } else { None };
             let changed = fix_elem_fused(&mut doc.root, docpr_idx, cnvpr_idx);
             if !changed {
@@ -2797,7 +2945,10 @@ pub(crate) fn fix_tables_docpr_cnvpr(
         }
         None => {
             let s = regex_fix_tables(xml);
-            let mut s = regex_fix_docpr(&s, docx_ids_index);
+            let mut s = match docx_ids_index {
+                Some(idx) => regex_fix_docpr(&s, idx),
+                None => s,
+            };
             // cNvPr renumbering is DOM-based; attempt it on the regex-fixed
             // xml, exactly like the old fix-then-renumber sequence
             if let Some(next) = cnvpr_next {

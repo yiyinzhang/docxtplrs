@@ -1,6 +1,6 @@
 [package]
 name = "docxtplrs"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "Rust implementation of python-docx-template (docxtpl): render docx templates with Jinja2 syntax (minijinja), native zip/XML handling, plus optional Python bindings via PyO3"
 license = "LGPL-2.1-or-later"

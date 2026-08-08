@@ -29,6 +29,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("saved {} ({} bytes)", output, bytes.len());
 
     // template introspection
-    println!("variables: {:?}", tpl.undeclared_variables(None)?);
+    println!("variables: {:?}", tpl.undeclared_variables(None, false)?);
     Ok(())
 }

@@ -19,6 +19,12 @@ pub fn restore_current_render(prev: Option<(*mut TplCore, String)>) {
     CURRENT_RENDER.with(|c| *c.borrow_mut() = prev);
 }
 
+/// Name of the part currently being rendered on this thread
+/// (docxtpl current_rendering_part), None outside a render.
+pub fn current_rendering_part() -> Option<String> {
+    CURRENT_RENDER.with(|c| c.borrow().as_ref().map(|(_, part)| part.clone()))
+}
+
 /// Access the current render core if set.
 fn with_current_core<R>(f: impl FnOnce(&mut TplCore, &str) -> R) -> Option<R> {
     CURRENT_RENDER.with(|c| {
