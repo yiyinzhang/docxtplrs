@@ -965,6 +965,39 @@ fn element_tag_scan_hits(xml: &str, y: &str, comment: bool, positions: &[usize])
             if open < i {
                 break; // already consumed/skipped by the element-first walk
             }
+            // a self-closing `<w:y .../>` cannot enclose the marker: skip it
+            // and keep walking left (docxtpl's regex never anchors on it,
+            // so an empty spacer paragraph before a tag paragraph survives)
+            {
+                let bytes = xml.as_bytes();
+                let mut k = open;
+                let mut quote: Option<u8> = None;
+                let mut gt: Option<usize> = None;
+                while k < xml.len() {
+                    let c = bytes[k];
+                    match quote {
+                        Some(q) if c == q => quote = None,
+                        Some(_) => {}
+                        None if c == b'"' || c == b'\'' => quote = Some(c),
+                        None if c == b'>' => {
+                            gt = Some(k);
+                            break;
+                        }
+                        None => {}
+                    }
+                    k += 1;
+                }
+                if let Some(g) = gt {
+                    let mut m = g;
+                    while m > open && bytes[m - 1].is_ascii_whitespace() {
+                        m -= 1;
+                    }
+                    if m > open && bytes[m - 1] == b'/' {
+                        cursor = open;
+                        continue;
+                    }
+                }
+            }
             let after_open = open + open_prefix.len();
             let region_end = xml[after_open..]
                 .find(&close_tag)
@@ -1819,6 +1852,16 @@ mod tests {
         assert_eq!(
             element_tag_scan("<w:p>{%p x %}</w:p>", "p", true),
             "<w:p>{%p x %}</w:p>"
+        );
+        // 自闭合的空段落不是容器：标签段落单独被替换，空壳原样保留
+        // （docxtpl 正则以含标签的段落为锚点，不会跨过另一个 <w:p）
+        assert_eq!(
+            element_tag_scan(
+                "<w:p w14:paraId=\"X\"/><w:p><w:r><w:t>{%p endif %}</w:t></w:r></w:p>",
+                "p",
+                false
+            ),
+            "<w:p w14:paraId=\"X\"/>{% endif %}"
         );
     }
 

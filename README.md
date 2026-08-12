@@ -230,7 +230,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-docxtplrs = { version = "0.2.4", default-features = false }  # pure Rust: no PyO3/libpython
+docxtplrs = { version = "0.2.5", default-features = false }  # pure Rust: no PyO3/libpython
 minijinja = "2"
 ```
 
@@ -713,7 +713,7 @@ debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会�
 
 ```toml
 [dependencies]
-docxtplrs = { version = "0.2.4", default-features = false }  # 纯 Rust：不依赖 PyO3/libpython
+docxtplrs = { version = "0.2.5", default-features = false }  # 纯 Rust：不依赖 PyO3/libpython
 minijinja = "2"
 ```
 
