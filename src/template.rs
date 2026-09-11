@@ -490,6 +490,7 @@ impl TplCore {
                 let s = preprocess_trans(&s);
                 let s = preprocess_bool_compare(&s);
                 let s = preprocess_engine_features(&s);
+                let s = preprocess_mutlist(&s);
                 let rc: std::rc::Rc<str> = s.into_owned().into();
                 let ph = fxhash64(rc.as_bytes());
                 self.preproc_cache
@@ -756,6 +757,7 @@ impl TplCore {
             let src = trans_bodies_for_analysis(&xml);
             let src = preprocess_bool_compare(&src);
             let src = preprocess_engine_features(&src);
+            let src = preprocess_mutlist(&src);
             let env = make_env(false, self);
             let tmpl = env
                 .template_from_str(&src)
@@ -1008,6 +1010,10 @@ pub fn make_env(autoescape: bool, core: &TplCore) -> Environment<'static> {
     env.set_unknown_method_callback(|_state, value, method, args| {
         py_like_method(value, method, args)
     });
+
+    // backs `{% set x = [] %}` assignments rewritten by preprocess_mutlist
+    // when the template mutates the list in place (x.append(...))
+    env.add_function("__dtpl_mutlist", || Value::from_object(MutList::new()));
 
     // jinja2's Undefined supports len() == 0
     env.add_filter("length", |value: Value| -> usize {
@@ -1773,6 +1779,142 @@ fn format_g(v: f64, precision: usize) -> String {
     }
 }
 
+/// A template-local mutable list backing `{% set x = [] %}` assignments
+/// rewritten by [`preprocess_mutlist`] when the template mutates the list in
+/// place (`x.append(...)`), emulating jinja2's list semantics (native
+/// minijinja sequences are immutable).
+#[derive(Debug, Default)]
+pub struct MutList {
+    items: std::sync::Mutex<Vec<Value>>,
+}
+
+/// python None for MutList method return values (renders as "None").
+#[cfg(feature = "python")]
+fn py_none() -> Value {
+    Value::from_object(crate::pybridge::PyNoneObj)
+}
+
+#[cfg(not(feature = "python"))]
+fn py_none() -> Value {
+    Value::from(())
+}
+
+impl MutList {
+    pub fn new() -> MutList {
+        MutList::default()
+    }
+}
+
+impl minijinja::value::Object for MutList {
+    fn repr(self: &std::sync::Arc<Self>) -> minijinja::value::ObjectRepr {
+        minijinja::value::ObjectRepr::Seq
+    }
+
+    fn get_value(self: &std::sync::Arc<Self>, key: &Value) -> Option<Value> {
+        let idx = key.as_i64().and_then(|i| usize::try_from(i).ok())?;
+        self.items.lock().unwrap().get(idx).cloned()
+    }
+
+    fn enumerate(self: &std::sync::Arc<Self>) -> minijinja::value::Enumerator {
+        let items = self.items.lock().unwrap().clone();
+        minijinja::value::Enumerator::Iter(Box::new(items.into_iter()))
+    }
+
+    fn enumerator_len(self: &std::sync::Arc<Self>) -> Option<usize> {
+        Some(self.items.lock().unwrap().len())
+    }
+
+    fn call_method(
+        self: &std::sync::Arc<Self>,
+        _state: &minijinja::State<'_, '_>,
+        method: &str,
+        args: &[Value],
+    ) -> Result<Value, minijinja::Error> {
+        use minijinja::{Error, ErrorKind};
+        match method {
+            "append" => {
+                let item = args.first().cloned().ok_or_else(|| {
+                    Error::new(ErrorKind::MissingArgument, "append() takes exactly one argument")
+                })?;
+                self.items.lock().unwrap().push(item);
+                Ok(py_none())
+            }
+            "extend" => {
+                let arg = args.first().cloned().ok_or_else(|| {
+                    Error::new(ErrorKind::MissingArgument, "extend() takes exactly one argument")
+                })?;
+                let iter = arg.try_iter().map_err(|_| {
+                    Error::new(ErrorKind::InvalidOperation, "extend() argument is not iterable")
+                })?;
+                let mut items = self.items.lock().unwrap();
+                items.extend(iter);
+                Ok(py_none())
+            }
+            "insert" => {
+                let idx = args.first().and_then(|v| v.as_i64()).ok_or_else(|| {
+                    Error::new(ErrorKind::MissingArgument, "insert() needs an integer index")
+                })?;
+                let item = args.get(1).cloned().ok_or_else(|| {
+                    Error::new(ErrorKind::MissingArgument, "insert() takes exactly two arguments")
+                })?;
+                let mut items = self.items.lock().unwrap();
+                let len = items.len() as i64;
+                let pos = if idx < 0 { (len + idx).max(0) } else { idx.min(len) } as usize;
+                items.insert(pos, item);
+                Ok(py_none())
+            }
+            "pop" => {
+                let mut items = self.items.lock().unwrap();
+                let len = items.len() as i64;
+                let idx = args.first().and_then(|v| v.as_i64()).unwrap_or(-1);
+                let pos = if idx < 0 { len + idx } else { idx };
+                if pos < 0 || pos >= len {
+                    return Err(Error::new(ErrorKind::InvalidOperation, "pop index out of range"));
+                }
+                Ok(items.remove(pos as usize))
+            }
+            "remove" => {
+                let needle = args.first().cloned().ok_or_else(|| {
+                    Error::new(ErrorKind::MissingArgument, "remove() takes exactly one argument")
+                })?;
+                let mut items = self.items.lock().unwrap();
+                match items.iter().position(|v| *v == needle) {
+                    Some(pos) => {
+                        items.remove(pos);
+                        Ok(py_none())
+                    }
+                    None => Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        "list.remove(x): x not in list",
+                    )),
+                }
+            }
+            "clear" => {
+                self.items.lock().unwrap().clear();
+                Ok(py_none())
+            }
+            _ => Err(Error::from(ErrorKind::UnknownMethod)),
+        }
+    }
+
+    fn render(self: &std::sync::Arc<Self>, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // python list repr: ['a', 'b']
+        let items = self.items.lock().unwrap();
+        f.write_str("[")?;
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            if let Some(s) = item.as_str() {
+                write!(f, "'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))?;
+            } else {
+                write!(f, "{}", item)?;
+            }
+        }
+        f.write_str("]")
+    }
+}
+
 /// Python-like str methods for jinja compatibility (called for unknown methods).
 fn py_like_method(
     value: &Value,
@@ -2400,6 +2542,41 @@ pub fn preprocess_engine_features(src: &str) -> Cow<'_, str> {
     })
 }
 
+/// jinja2 allows in-place mutation of template-created lists:
+/// `{% set x = [] %}` followed by `x.append(...)` (or extend/insert/pop/
+/// remove/clear). Native minijinja sequences are immutable, so rewrite those
+/// assignments to construct a [`MutList`] (transparent to the template).
+/// Only variables that are actually mutated somewhere in the source are
+/// rewritten.
+pub fn preprocess_mutlist(src: &str) -> Cow<'_, str> {
+    const METHODS: &[&str] = &["append", "extend", "insert", "pop", "remove", "clear"];
+    if !METHODS.iter().any(|m| src.contains(&format!(".{}", m))) {
+        return Cow::Borrowed(src);
+    }
+    let rex = crate::patch::re(r"([A-Za-z_]\w*)\.(append|extend|insert|pop|remove|clear)\(");
+    let mut names: HashSet<String> = HashSet::new();
+    for cap in rex.captures_iter(src).flatten() {
+        names.insert(cap[1].to_string());
+    }
+    if names.is_empty() {
+        return Cow::Borrowed(src);
+    }
+    let set_rex = crate::patch::re(
+        r"^\{%([-+]?)\s*set\s+([A-Za-z_]\w*)\s*=\s*\[\s*\]\s*([-+]?)%\}$",
+    );
+    rewrite_jinja_tags(src, |tag| {
+        if let Some(Some(cap)) = set_rex.captures(tag).ok() {
+            if names.contains(&cap[2]) {
+                return Some(format!(
+                    "{{%{0} set {1} = __dtpl_mutlist() {2}%}}",
+                    &cap[1], &cap[2], &cap[3]
+                ));
+            }
+        }
+        None
+    })
+}
+
 /// Rewrite `STR % RHS` inside a tag to `(STR)|pyformat(RHS)` (char-safe).
 fn rewrite_printf_tags(tag: &str) -> String {
     let mut out = String::with_capacity(tag.len());
@@ -2641,6 +2818,7 @@ pub fn render_xml_str_with(src_xml: &str, ctx: Value, env: &Environment, core: &
     let src = preprocess_trans(&src);
     let src = preprocess_bool_compare(&src);
     let src = preprocess_engine_features(&src);
+    let src = preprocess_mutlist(&src);
 
     let rendered = match env.template_from_str(&src).and_then(|t| t.render(&ctx)) {
         Ok(s) => s,

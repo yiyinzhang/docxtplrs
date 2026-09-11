@@ -98,11 +98,14 @@ tpl.save("out.docx")
   numbering referenced from headers/footers/footnotes/comments are merged
   consistently with the body.
 - **Engine extras beyond stock docxtpl** — `str` methods in templates
-  (`upper/replace/split/...`), `'%s' % x` formatting, `{% break %}`/`{% continue %}`,
-  the `{% do %}` statement, gettext i18n (`{% trans %}`/`{% pluralize %}`),
-  `{% include %}`/`{% import %}` via `set_template_loader()`, custom
-  filters/tests/functions/globals with keyword arguments, and interop with a
-  real jinja2 `Environment`.
+  (`upper/replace/split/...`), `'%s' % x` formatting, in-place mutation of
+  template-created lists (`{% set x = [] %}` followed by `x.append(...)` —
+  `extend`/`insert`/`pop`/`remove`/`clear` work too, reproducing jinja2's
+  mutable-list semantics on top of minijinja's immutable sequences),
+  `{% break %}`/`{% continue %}`, the `{% do %}` statement, gettext i18n
+  (`{% trans %}`/`{% pluralize %}`), `{% include %}`/`{% import %}` via
+  `set_template_loader()`, custom filters/tests/functions/globals with
+  keyword arguments, and interop with a real jinja2 `Environment`.
 - **Built-in read-write document model** — paragraphs/tables/sections/styles/
   comments/core properties plus `add_paragraph/add_heading/add_picture/
   add_table/add_page_break/add_section` cover the common python-docx paths,
@@ -230,7 +233,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-docxtplrs = { version = "0.2.5", default-features = false }  # pure Rust: no PyO3/libpython
+docxtplrs = { version = "0.3.0", default-features = false }  # pure Rust: no PyO3/libpython
 minijinja = "2"
 ```
 
@@ -361,7 +364,7 @@ uv pip install target/wheels/*.whl                     # local install
 | Syntax | Purpose |
 |---|---|
 | `{{ var }}` | variables (filters, attr/item access, method calls, str methods, `'%s' % x`, Unicode identifiers) |
-| `{% if %}` `{% for %}` `{% set %}` `{% macro %}` | statements (break/continue/do supported) |
+| `{% if %}` `{% for %}` `{% set %}` `{% macro %}` | statements (break/continue/do supported; `{% set x = [] %}` lists can be mutated in place: `x.append(...)`/`extend`/`insert`/`pop`/`remove`/`clear`) |
 | `{%tr for x in items %}` | table-row loop |
 | `{%tc for x in items %}` | cell loop (auto-fixes `tblGrid` columns/widths) |
 | `{%p if x %}` / `{{p var }}` | paragraph-level statement / replacement |
@@ -617,7 +620,10 @@ with `llvm-cov`.
   引用，多节文档的中间节同样保留）会被保留，**批注**（含 w15 线程状态）与**尾注**
   会被合并，页眉/页脚/脚注/批注内部引用的样式与编号也会与正文一致地合并。
 - **超出原版 docxtpl 的引擎能力**：模板内 `str` 方法（`upper/replace/split/...`）、
-  `'%s' % x` 格式化、`{% break %}`/`{% continue %}`、`{% do %}` 语句、gettext i18n
+  `'%s' % x` 格式化、模板内建列表的原地修改（`{% set x = [] %}` 之后可
+  `x.append(...)`——同时支持 `extend`/`insert`/`pop`/`remove`/`clear`，在
+  minijinja 不可变序列之上复刻 jinja2 的可变列表语义）、
+  `{% break %}`/`{% continue %}`、`{% do %}` 语句、gettext i18n
   （`{% trans %}`/`{% pluralize %}`）、`set_template_loader()` 支持的 `{% include %}`/
   `{% import %}`、带关键字参数的自定义 filters/tests/functions/globals，以及与真实
   jinja2 `Environment` 的互操作。
@@ -713,7 +719,7 @@ debug 构建 + CPython 3.13 实测（除特别注明外），release 构建会�
 
 ```toml
 [dependencies]
-docxtplrs = { version = "0.2.5", default-features = false }  # 纯 Rust：不依赖 PyO3/libpython
+docxtplrs = { version = "0.3.0", default-features = false }  # 纯 Rust：不依赖 PyO3/libpython
 minijinja = "2"
 ```
 
@@ -842,7 +848,7 @@ uv pip install target/wheels/*.whl                     # 本地安装
 | 语法 | 用途 |
 |---|---|
 | `{{ var }}` | 变量（过滤器、属性/下标访问、方法调用、str 方法、`'%s' % x`、Unicode 标识符） |
-| `{% if %}` `{% for %}` `{% set %}` `{% macro %}` | 语句（支持 break/continue/do） |
+| `{% if %}` `{% for %}` `{% set %}` `{% macro %}` | 语句（支持 break/continue/do；`{% set x = [] %}` 创建的列表可原地修改：`x.append(...)`/`extend`/`insert`/`pop`/`remove`/`clear`） |
 | `{%tr for x in items %}` | 表格行循环 |
 | `{%tc for x in items %}` | 单元格循环（自动修复 `tblGrid` 列数/宽度） |
 | `{%p if x %}` / `{{p var }}` | 段落级语句 / 替换 |
