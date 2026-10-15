@@ -92,46 +92,9 @@ impl PyJoiner {
     }
 }
 
-const LOREM_WORDS: &[&str] = &[
-    "lorem", "ipsum", "dolor", "sit", "amet", "consectetur", "adipiscing", "elit",
-    "sed", "do", "eiusmod", "tempor", "incididunt", "ut", "labore", "et", "dolore",
-    "magna", "aliqua", "enim", "ad", "minim", "veniam", "quis", "nostrud",
-    "exercitation", "ullamco", "laboris", "nisi", "aliquip", "ex", "ea", "commodo",
-    "consequat", "duis", "aute", "irure", "in", "reprehenderit", "voluptate",
-    "velit", "esse", "cillum", "fugiat", "nulla", "pariatur", "excepteur", "sint",
-    "occaecat", "cupidatat", "non", "proident", "sunt", "culpa", "qui", "officia",
-    "deserunt", "mollit", "anim", "id", "est", "laborum",
-];
-
 /// jinja2.utils.generate_lorem_ipsum(n=5, html=True, min=20, max=100)
 #[pyfunction]
 #[pyo3(signature = (n=5, html=true, min=20, max=100))]
 pub fn generate_lorem_ipsum(n: usize, html: bool, min: usize, max: usize) -> String {
-    let mut seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
-        .unwrap_or(0x9E3779B9);
-    let mut rand = move || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (seed >> 33) as usize
-    };
-    let mut out = String::new();
-    for _ in 0..n.max(1) {
-        let count = min + rand() % (max.saturating_sub(min).max(1) + 1);
-        let words: Vec<&str> = (0..count)
-            .map(|_| LOREM_WORDS[rand() % LOREM_WORDS.len()])
-            .collect();
-        let mut sentence = words.join(" ");
-        if let Some(c) = sentence.chars().next() {
-            sentence = c.to_uppercase().collect::<String>() + &sentence[1..];
-        }
-        sentence.push('.');
-        if html {
-            out.push_str(&format!("<p>{}</p>\n", sentence));
-        } else {
-            out.push_str(&sentence);
-            out.push_str("\n\n");
-        }
-    }
-    out.trim_end().to_string()
+    crate::template::lorem_ipsum(n, html, min, max)
 }

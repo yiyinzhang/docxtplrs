@@ -25,6 +25,12 @@ pub fn current_rendering_part() -> Option<String> {
     CURRENT_RENDER.with(|c| c.borrow().as_ref().map(|(_, part)| part.clone()))
 }
 
+/// Set the current rendering part name from Python (docxtpl exposes
+/// current_rendering_part as a plain writable attribute).
+pub fn set_current_rendering_part(core: *mut TplCore, part: Option<String>) {
+    CURRENT_RENDER.with(|c| *c.borrow_mut() = part.map(|p| (core, p)));
+}
+
 /// Access the current render core if set.
 fn with_current_core<R>(f: impl FnOnce(&mut TplCore, &str) -> R) -> Option<R> {
     CURRENT_RENDER.with(|c| {

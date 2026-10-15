@@ -10,7 +10,7 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from helpers import make_docx, read_docx_part, docx_names, text_of, tp, cell, tr, tbl
+from helpers import make_docx, read_docx_part, docx_names, text_of, tp, p, run, cell, tr, tbl, make_png
 
 from docxtplrs import DocxTemplate
 
@@ -299,3 +299,121 @@ def test_section_variants_unlink():
     assert sec.first_page_header.is_linked_to_previous
     xml = tpl.get_xml()
     assert '<w:headerReference w:type="first"' not in xml
+
+
+# ---------------- RichText.xml setter ----------------
+
+def test_richtext_xml_setter():
+    from docxtplrs import RichText
+
+    rt = RichText("hello", bold=True)
+    assert "hello" in rt.xml and "hello" in str(rt)
+    # the setter replaces the generated xml wholesale
+    donor = RichText("world", italic=True)
+    rt.xml = donor.xml
+    assert rt.xml == donor.xml
+    assert str(rt) == donor.xml
+    # and it is what gets rendered through {{r rt }}
+    tpl = DocxTemplate(io.BytesIO(make_docx(p(run("{{r rt }}")))))
+    tpl.render({"rt": rt})
+    assert "world" in text_of(saved_part(tpl, "word/document.xml"))
+    assert "hello" not in text_of(saved_part(tpl, "word/document.xml"))
+
+
+# ---------------- InlineImage getters ----------------
+
+def test_inline_image_getters():
+    from docxtplrs import InlineImage, Mm, Length
+
+    tpl = DocxTemplate(io.BytesIO(make_docx(tp("x"))))
+    source = io.BytesIO(make_png(8, 6))
+    im = InlineImage(
+        tpl,
+        source,
+        width=Mm(15),
+        height=Length(12345),
+        anchor="https://example.com",
+        title="the title",
+        descr="the descr",
+    )
+    assert im.tpl is tpl
+    assert im.image_descriptor is source
+    assert isinstance(im.width, Length)
+    assert im.width.emu == Mm(15).emu
+    assert im.height.emu == 12345
+    assert im.anchor == "https://example.com"
+    assert im.title == "the title"
+    assert im.descr == "the descr"
+    # the image still renders through the template
+    tpl2 = DocxTemplate(io.BytesIO(make_docx(tp("{{ im }}"))))
+    im2 = InlineImage(tpl2, io.BytesIO(make_png(8, 6)))
+    assert im2.width is None and im2.height is None
+    assert im2.anchor is None and im2.title is None and im2.descr is None
+    tpl2.render({"im": im2})
+    out = io.BytesIO()
+    tpl2.save(out)
+    assert "word/media/image1.png" in docx_names(out.getvalue())
+
+
+# ---------------- post_processing with a file-like object ----------------
+
+class _RwFile:
+    """Minimal read/write file-like double over a bytes buffer."""
+
+    def __init__(self, data):
+        self.data = data
+
+    def read(self):
+        return self.data
+
+    def write(self, b):
+        self.data = bytes(b)
+
+
+def test_post_processing_filelike():
+    blob = make_docx(tp("x"), extra_files={"word/embeddings/obj.bin": b"OLD"})
+    tpl = DocxTemplate(io.BytesIO(blob))
+    out = io.BytesIO()
+    tpl.save(out)
+    fobj = _RwFile(out.getvalue())
+    tpl.zipname_to_replace = {"word/embeddings/obj.bin": b"NEW"}
+    tpl.post_processing(fobj)
+    import zipfile
+
+    with zipfile.ZipFile(io.BytesIO(fobj.data)) as z:
+        assert z.read("word/embeddings/obj.bin") == b"NEW"
+
+
+def test_post_processing_bytesio():
+    blob = make_docx(tp("x"), extra_files={"word/embeddings/obj.bin": b"OLD"})
+    tpl = DocxTemplate(io.BytesIO(blob))
+    out = io.BytesIO()
+    tpl.save(out)
+    buf = io.BytesIO(out.getvalue())
+    buf.seek(0)
+    tpl.zipname_to_replace = {"word/embeddings/obj.bin": b"NEW"}
+    tpl.post_processing(buf)
+    # the rewritten document is appended after the consumed source bytes
+    rewritten = buf.getvalue()[len(out.getvalue()):]
+    import zipfile
+
+    with zipfile.ZipFile(io.BytesIO(rewritten)) as z:
+        assert z.read("word/embeddings/obj.bin") == b"NEW"
+
+
+# ---------------- current_rendering_part / docx_ids_index ----------------
+
+def test_current_rendering_part_read_write():
+    tpl = DocxTemplate(io.BytesIO(make_docx(tp("x"))))
+    assert tpl.current_rendering_part is None
+    tpl.current_rendering_part = "word/header1.xml"
+    assert tpl.current_rendering_part == "word/header1.xml"
+    tpl.current_rendering_part = None
+    assert tpl.current_rendering_part is None
+
+
+def test_docx_ids_index_after_render():
+    tpl = DocxTemplate(io.BytesIO(make_docx(tp("{{ x }}"))))
+    tpl.render({"x": "v"})
+    assert isinstance(tpl.docx_ids_index, int)
+    assert tpl.docx_ids_index >= 1000

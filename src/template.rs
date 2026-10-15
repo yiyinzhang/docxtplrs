@@ -1015,6 +1015,49 @@ pub fn make_env(autoescape: bool, core: &TplCore) -> Environment<'static> {
     // when the template mutates the list in place (x.append(...))
     env.add_function("__dtpl_mutlist", || Value::from_object(MutList::new()));
 
+    // jinja2's default template globals missing from minijinja's builtins
+    // (range/dict/namespace/debug are provided by minijinja itself)
+    env.add_function("cycler", |args: minijinja::value::Rest<Value>| {
+        Value::from_object(Cycler::new(args.0))
+    });
+    env.add_function("joiner", |sep: Option<String>| {
+        Value::from_object(Joiner::new(sep.unwrap_or_else(|| ", ".to_string())))
+    });
+    env.add_function(
+        "lipsum",
+        |args: minijinja::value::Rest<Value>,
+         kwargs: minijinja::value::Kwargs|
+         -> Result<Value, minijinja::Error> {
+            let pick = |idx: usize, name: &str| -> Option<Value> {
+                args.0
+                    .get(idx)
+                    .cloned()
+                    .filter(|v| !v.is_undefined())
+                    .or_else(|| kwargs.get::<Value>(name).ok())
+            };
+            let to_usize = |v: Option<Value>, default: usize| -> Result<usize, minijinja::Error> {
+                match v {
+                    None => Ok(default),
+                    Some(v) => v
+                        .as_i64()
+                        .and_then(|i| usize::try_from(i).ok())
+                        .ok_or_else(|| {
+                            minijinja::Error::new(
+                                minijinja::ErrorKind::InvalidOperation,
+                                "lipsum: expected integer arguments",
+                            )
+                        }),
+                }
+            };
+            let n = to_usize(pick(0, "n"), 5)?;
+            let html = pick(1, "html").map(|v| v.is_true()).unwrap_or(true);
+            let min = to_usize(pick(2, "min"), 20)?;
+            let max = to_usize(pick(3, "max"), 100)?;
+            // jinja2 returns Markup (already-safe html)
+            Ok(Value::from_safe_string(lorem_ipsum(n, html, min, max)))
+        },
+    );
+
     // jinja2's Undefined supports len() == 0
     env.add_filter("length", |value: Value| -> usize {
         use minijinja::value::ValueKind;
@@ -1130,20 +1173,30 @@ pub fn make_env(autoescape: bool, core: &TplCore) -> Environment<'static> {
         let mut items: Vec<String> = Vec::new();
         if let Ok(iter) = value.try_iter() {
             for k in iter {
+                let key = k.to_string();
+                // jinja2 skips keys that could break out of attribute syntax
+                if key.contains(['/', '>', '=']) {
+                    continue;
+                }
                 if let Ok(v) = value.get_item(&k) {
+                    // jinja2 skips none/undefined values
+                    if v.is_none() || v.is_undefined() {
+                        continue;
+                    }
                     let vs = v
                         .to_string()
                         .replace('&', "&amp;")
                         .replace('<', "&lt;")
                         .replace('>', "&gt;")
                         .replace('"', "&#34;");
-                    items.push(format!("{}=\"{}\"", k, vs));
+                    items.push(format!("{}=\"{}\"", key, vs));
                 }
             }
         }
         let joined = items.join(" ");
+        // jinja2 autospace: a single LEADING space
         if autospace && !joined.is_empty() {
-            format!("{} ", joined)
+            format!(" {}", joined)
         } else {
             joined
         }
@@ -1170,11 +1223,7 @@ pub fn make_env(autoescape: bool, core: &TplCore) -> Environment<'static> {
                 "random from empty sequence",
             ));
         }
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() as usize)
-            .unwrap_or(0);
-        Ok(items[nanos % items.len()].clone())
+        Ok(items[(random_u64() as usize) % items.len()].clone())
     });
 
     // bool/None tests must match our jinja2-faithful wrappers
@@ -1913,6 +1962,169 @@ impl minijinja::value::Object for MutList {
         }
         f.write_str("]")
     }
+}
+
+/// jinja2.utils.Cycler as a template global: `cycler(*items)` cycles through
+/// the items (`next()`/`reset()` methods, `current` attribute).
+#[derive(Debug)]
+pub struct Cycler {
+    items: Vec<Value>,
+    pos: std::sync::Mutex<usize>,
+}
+
+impl Cycler {
+    pub fn new(items: Vec<Value>) -> Cycler {
+        Cycler {
+            items,
+            pos: std::sync::Mutex::new(0),
+        }
+    }
+}
+
+impl minijinja::value::Object for Cycler {
+    fn get_value(self: &std::sync::Arc<Self>, key: &Value) -> Option<Value> {
+        if key.as_str() != Some("current") || self.items.is_empty() {
+            return None;
+        }
+        // like jinja2: before the first next() the last item is "current"
+        let pos = *self.pos.lock().unwrap();
+        let idx = if pos == 0 {
+            self.items.len() - 1
+        } else {
+            (pos - 1) % self.items.len()
+        };
+        Some(self.items[idx].clone())
+    }
+
+    fn call_method(
+        self: &std::sync::Arc<Self>,
+        _state: &minijinja::State<'_, '_>,
+        method: &str,
+        _args: &[Value],
+    ) -> Result<Value, minijinja::Error> {
+        use minijinja::{Error, ErrorKind};
+        match method {
+            "next" => {
+                if self.items.is_empty() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        "no items to cycle through",
+                    ));
+                }
+                let mut pos = self.pos.lock().unwrap();
+                let item = self.items[*pos % self.items.len()].clone();
+                *pos += 1;
+                Ok(item)
+            }
+            "reset" => {
+                *self.pos.lock().unwrap() = 0;
+                Ok(py_none())
+            }
+            _ => Err(Error::from(ErrorKind::UnknownMethod)),
+        }
+    }
+}
+
+/// jinja2.utils.Joiner as a template global: `joiner(sep=", ")` returns a
+/// callable producing `""` on the first call and `sep` on every later call.
+#[derive(Debug)]
+pub struct Joiner {
+    sep: String,
+    used: std::sync::Mutex<bool>,
+}
+
+impl Joiner {
+    pub fn new(sep: String) -> Joiner {
+        Joiner {
+            sep,
+            used: std::sync::Mutex::new(false),
+        }
+    }
+}
+
+impl minijinja::value::Object for Joiner {
+    fn call(
+        self: &std::sync::Arc<Self>,
+        _state: &minijinja::State<'_, '_>,
+        _args: &[Value],
+    ) -> Result<Value, minijinja::Error> {
+        let mut used = self.used.lock().unwrap();
+        Ok(Value::from(if *used {
+            self.sep.clone()
+        } else {
+            *used = true;
+            String::new()
+        }))
+    }
+}
+
+/// Process-wide state for the `random` filter: seeded once from the system
+/// time, advanced per call so back-to-back calls never share an index.
+static RANDOM_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn random_u64() -> u64 {
+    use std::sync::atomic::Ordering;
+    let mut seed = RANDOM_STATE.load(Ordering::Relaxed);
+    if seed == 0 {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| (d.subsec_nanos() as u64) ^ d.as_secs())
+            .unwrap_or(0x9E3779B97F4A7C15);
+        seed = (t ^ 0x9E3779B97F4A7C15) | 1;
+        RANDOM_STATE
+            .compare_exchange(0, seed, Ordering::Relaxed, Ordering::Relaxed)
+            .ok();
+    }
+    // xorshift64* over the fetch_add result
+    let mut x = RANDOM_STATE.fetch_add(0x9E3779B97F4A7C15, Ordering::Relaxed);
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    x.wrapping_mul(0x2545F4914F6CDD1D)
+}
+
+const LOREM_WORDS: &[&str] = &[
+    "lorem", "ipsum", "dolor", "sit", "amet", "consectetur", "adipiscing", "elit",
+    "sed", "do", "eiusmod", "tempor", "incididunt", "ut", "labore", "et", "dolore",
+    "magna", "aliqua", "enim", "ad", "minim", "veniam", "quis", "nostrud",
+    "exercitation", "ullamco", "laboris", "nisi", "aliquip", "ex", "ea", "commodo",
+    "consequat", "duis", "aute", "irure", "in", "reprehenderit", "voluptate",
+    "velit", "esse", "cillum", "fugiat", "nulla", "pariatur", "excepteur", "sint",
+    "occaecat", "cupidatat", "non", "proident", "sunt", "culpa", "qui", "officia",
+    "deserunt", "mollit", "anim", "id", "est", "laborum",
+];
+
+/// jinja2.utils.generate_lorem_ipsum(n=5, html=True, min=20, max=100) as a
+/// pure-Rust function shared by the `lipsum` template global and the Python
+/// binding (`jutils::generate_lorem_ipsum`).
+pub(crate) fn lorem_ipsum(n: usize, html: bool, min: usize, max: usize) -> String {
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+        .unwrap_or(0x9E3779B9);
+    let mut rand = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) as usize
+    };
+    let mut out = String::new();
+    for _ in 0..n.max(1) {
+        let count = min + rand() % (max.saturating_sub(min).max(1) + 1);
+        let words: Vec<&str> = (0..count)
+            .map(|_| LOREM_WORDS[rand() % LOREM_WORDS.len()])
+            .collect();
+        let mut sentence = words.join(" ");
+        if let Some(c) = sentence.chars().next() {
+            sentence = c.to_uppercase().collect::<String>() + &sentence[1..];
+        }
+        sentence.push('.');
+        if html {
+            out.push_str(&format!("<p>{}</p>\n", sentence));
+        } else {
+            out.push_str(&sentence);
+            out.push_str("\n\n");
+        }
+    }
+    out.trim_end().to_string()
 }
 
 /// Python-like str methods for jinja compatibility (called for unknown methods).
@@ -3900,5 +4112,132 @@ fn find_attr<'a>(attrs: &'a str, name: &str) -> AttrRes<'a> {
             tables_fix_scan("<w:tbl><w:tblGrid><w:gridCol w:w=\"1\"/></w:tblGrid><w:tr><w:tc><w:tbl><w:tblGrid><w:gridCol w:w=\"1\"/></w:tblGrid><w:tr><w:tc/><w:tc/></w:tr></w:tbl></w:tc></w:tr></w:tbl>"),
             TblScan::NeedsFix
         );
+    }
+}
+
+#[cfg(test)]
+mod jinja_globals_tests {
+    use super::*;
+
+    fn render(src: &str) -> Result<String, minijinja::Error> {
+        let core = TplCore::default();
+        let env = make_env(false, &core);
+        env.template_from_str(src).and_then(|t| t.render(()))
+    }
+
+    #[test]
+    fn cycler_cycles_and_current() {
+        assert_eq!(
+            render("{% set c = cycler('odd', 'even') %}{{ c.next() }} {{ c.next() }} {{ c.next() }}").unwrap(),
+            "odd even odd"
+        );
+        // current before the first next() is the last item (jinja2 parity)
+        assert_eq!(
+            render("{% set c = cycler(1, 2, 3) %}{{ c.current }}").unwrap(),
+            "3"
+        );
+        // current tracks the last next()
+        assert_eq!(
+            render("{% set c = cycler(1, 2, 3) %}{{ c.next() }}{{ c.current }}{{ c.next() }}{{ c.current }}").unwrap(),
+            "1122"
+        );
+        // reset restarts the cycle
+        assert_eq!(
+            render("{% set c = cycler('a', 'b') %}{{ c.next() }}{{ c.next() }}{% set _ = c.reset() %}{{ c.next() }}").unwrap(),
+            "aba"
+        );
+    }
+
+    #[test]
+    fn cycler_empty_next_errors() {
+        let err = render("{% set c = cycler() %}{{ c.next() }}").unwrap_err();
+        assert!(err.to_string().contains("no items"));
+    }
+
+    #[test]
+    fn joiner_separates() {
+        assert_eq!(
+            render("{% set sep = joiner() %}{{ sep() }}a{{ sep() }}b{{ sep() }}c").unwrap(),
+            "a, b, c"
+        );
+        assert_eq!(
+            render("{% set sep = joiner('|') %}{{ sep() }}a{{ sep() }}b").unwrap(),
+            "a|b"
+        );
+    }
+
+    #[test]
+    fn lipsum_paragraphs() {
+        // html=true wraps each paragraph in <p> (autoescape off here)
+        let html = render("{{ lipsum(2) }}").unwrap();
+        let paras: Vec<&str> = html.split('\n').collect();
+        assert_eq!(paras.len(), 2);
+        for p in paras {
+            assert!(p.starts_with("<p>") && p.ends_with(".</p>"), "{}", p);
+        }
+        // html=false: paragraphs separated by a blank line, plain sentences
+        let text = render("{{ lipsum(n=2, html=false, min=3, max=5) }}").unwrap();
+        let paras: Vec<&str> = text.split("\n\n").collect();
+        assert_eq!(paras.len(), 2);
+        for p in paras {
+            assert!(!p.contains('<') && p.ends_with('.'), "{}", p);
+            let words: Vec<&str> = p[..p.len() - 1].split(' ').collect();
+            assert!((3..=5).contains(&words.len()), "{}", p);
+            for w in words {
+                assert!(LOREM_WORDS.contains(&w.to_lowercase().as_str()), "{}", w);
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_builtin_available() {
+        // provided by minijinja builtins (jinja2 parity), not by us
+        assert_eq!(
+            render("{% set ns = namespace(found=false) %}{% set ns.found = true %}{{ ns.found }}").unwrap(),
+            "true"
+        );
+    }
+
+    #[test]
+    fn random_within_sequence() {
+        // single-element sequence: the choice is deterministic
+        assert_eq!(render("{{ [42]|random }}").unwrap(), "42");
+        // choices always come from the sequence
+        for _ in 0..16 {
+            let v = render("{{ [1, 2, 3, 4, 5]|random }}").unwrap();
+            assert!(["1", "2", "3", "4", "5"].contains(&v.as_str()), "{}", v);
+        }
+        // empty sequence errors (unchanged behavior)
+        assert!(render("{{ []|random }}").is_err());
+    }
+
+    #[test]
+    fn xmlattr_jinja2_semantics() {
+        // autospace=true (default) prepends a single leading space
+        assert_eq!(
+            render("{{ {'class': 'x', 'id': 'y'}|xmlattr }}").unwrap(),
+            " class=\"x\" id=\"y\""
+        );
+        assert_eq!(
+            render("{{ {'class': 'x'}|xmlattr(false) }}").unwrap(),
+            "class=\"x\""
+        );
+        // none values are skipped
+        assert_eq!(
+            render("{{ {'class': 'x', 'title': none}|xmlattr }}").unwrap(),
+            " class=\"x\""
+        );
+        // keys that could break attribute syntax are skipped
+        assert_eq!(
+            render("{{ {'a/b': '1', 'a>b': '2', 'a=b': '3', 'ok': '4'}|xmlattr }}").unwrap(),
+            " ok=\"4\""
+        );
+        // values are escaped
+        assert_eq!(
+            render("{{ {'title': '<a>&\"'}|xmlattr }}").unwrap(),
+            " title=\"&lt;a&gt;&amp;&#34;\""
+        );
+        // empty map renders nothing (no stray space)
+        assert_eq!(render("x{{ {}|xmlattr }}y").unwrap(), "xy");
     }
 }

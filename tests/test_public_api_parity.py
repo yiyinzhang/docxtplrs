@@ -327,36 +327,39 @@ def test_post_processing_noop_when_empty(tmp_path):
 
 def test_replacement_dicts_roundtrip():
     tpl = tpl_of(tp("x"))
-    assert tpl.crc_to_new_media == {}
-    assert tpl.crc_to_new_embedded == {}
-    assert tpl.zipname_to_replace == {}
-    assert tpl.pics_to_replace == {}
+    assert len(tpl.crc_to_new_media) == 0
+    assert len(tpl.crc_to_new_embedded) == 0
+    assert len(tpl.zipname_to_replace) == 0
+    assert len(tpl.pics_to_replace) == 0
 
     tpl.crc_to_new_media = {123: b"abc"}
-    assert tpl.crc_to_new_media == {123: b"abc"}
+    assert dict(tpl.crc_to_new_media.items()) == {123: b"abc"}
     tpl.crc_to_new_embedded = {456: b"def"}
-    assert tpl.crc_to_new_embedded == {456: b"def"}
+    assert dict(tpl.crc_to_new_embedded.items()) == {456: b"def"}
     tpl.zipname_to_replace = {"word/a.bin": b"g"}
-    assert tpl.zipname_to_replace == {"word/a.bin": b"g"}
+    assert dict(tpl.zipname_to_replace.items()) == {"word/a.bin": b"g"}
     tpl.pics_to_replace = {"p.png": b"h"}
-    assert tpl.pics_to_replace == {"p.png": b"h"}
+    assert dict(tpl.pics_to_replace.items()) == {"p.png": b"h"}
 
-    # getters return snapshots: in-place mutation does not stick
-    snap = tpl.crc_to_new_media
-    snap[999] = b"x"
-    assert tpl.crc_to_new_media == {123: b"abc"}
+    # getters return live views (docxtpl parity): in-place mutation sticks
+    live = tpl.crc_to_new_media
+    live[999] = b"x"
+    assert tpl.crc_to_new_media[999] == b"x"
+    assert 999 in tpl.crc_to_new_media
+    del tpl.crc_to_new_media[999]
+    assert dict(tpl.crc_to_new_media.items()) == {123: b"abc"}
 
     # setter replaces the whole map
     tpl.crc_to_new_media = {}
-    assert tpl.crc_to_new_media == {}
+    assert len(tpl.crc_to_new_media) == 0
 
 
 def test_replacement_dicts_updated_by_replace_methods():
     tpl = tpl_of(tp("x"))
     tpl.replace_zipname("word/embeddings/x.bin", io.BytesIO(b"zz"))
-    assert tpl.zipname_to_replace == {"word/embeddings/x.bin": b"zz"}
+    assert dict(tpl.zipname_to_replace.items()) == {"word/embeddings/x.bin": b"zz"}
     tpl.reset_replacements()
-    assert tpl.zipname_to_replace == {}
+    assert len(tpl.zipname_to_replace) == 0
 
 
 # ---------------- template_file / docx / pic_map / flags ----------------

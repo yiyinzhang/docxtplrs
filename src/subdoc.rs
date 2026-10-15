@@ -18,6 +18,39 @@ const FOOTNOTES_CT: &str =
 const ENDNOTE_CT: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.endnotes+xml";
 
+/// Options for the subdoc merge pipeline. [`SubdocOpts::new`] reproduces the
+/// default render-pipeline behavior (restart numbering, dissolve property
+/// fields, rename style conflicts).
+#[derive(Debug, Clone, Copy)]
+pub struct SubdocOpts {
+    /// preserve the subdoc's non-empty body-level sectPr as its own section
+    pub keep_sections: bool,
+    /// restart numbering of the subdoc's first list (docxcompose
+    /// restart_numbering, default true)
+    pub restart_numbering: bool,
+    /// dissolve DOCPROPERTY fields keeping their cached values; the Composer
+    /// does its own value-aware dissolve and disables this
+    pub dissolve_property_fields: bool,
+    /// retarget style references to the master's same-named style instead of
+    /// renaming conflicting definitions (docxcompose preserve_styles=False)
+    pub map_styles_by_name: bool,
+    /// copy the subdoc's default paragraph style properties onto unstyled
+    /// runs/paragraphs (docxcompose preserve_styles=True)
+    pub retain_default_formatting: bool,
+}
+
+impl SubdocOpts {
+    pub fn new(keep_sections: bool) -> SubdocOpts {
+        SubdocOpts {
+            keep_sections,
+            restart_numbering: true,
+            dissolve_property_fields: true,
+            map_styles_by_name: false,
+            retain_default_formatting: false,
+        }
+    }
+}
+
 /// Produce the block-level xml for a subdocument to be inserted into the
 /// master. With `keep_sections` the subdoc's non-empty body-level `w:sectPr`
 /// is preserved: the subdoc content becomes its own section (page
@@ -37,6 +70,16 @@ pub(crate) fn subdoc_xml_info(
     subdoc_bytes: &[u8],
     keep_sections: bool,
 ) -> Result<(String, bool), String> {
+    subdoc_xml_info_opts(tpl, subdoc_bytes, SubdocOpts::new(keep_sections))
+}
+
+/// Full subdoc merge with explicit options (see [`SubdocOpts`]).
+pub(crate) fn subdoc_xml_info_opts(
+    tpl: &mut TplCore,
+    subdoc_bytes: &[u8],
+    opts: SubdocOpts,
+) -> Result<(String, bool), String> {
+    let keep_sections = opts.keep_sections;
     let sub_pkg = Package::from_bytes(subdoc_bytes)?;
     let doc_xml = sub_pkg
         .get_string(DOCUMENT_PART)
@@ -84,7 +127,16 @@ pub(crate) fn subdoc_xml_info(
     }
 
     // dissolve custom property fields (keep the values)
-    body_xml = dissolve_property_fields(body_xml);
+    if opts.dissolve_property_fields {
+        body_xml = dissolve_property_fields(body_xml);
+    }
+
+    // preserve_styles=True: retain the subdoc's default paragraph style
+    // formatting on unstyled runs/paragraphs (before the style merge, while
+    // references still use the subdoc's style ids)
+    if opts.retain_default_formatting {
+        body_xml = retain_formatting_from_default_styles(tpl, &sub_pkg, body_xml)?;
+    }
 
     let mut rid_map: HashMap<String, String> = HashMap::new();
     // header/footer parts copied for the preserved sections (master part
@@ -187,7 +239,7 @@ pub(crate) fn subdoc_xml_info(
         + en_content.is_some() as usize
         + c_content.is_some() as usize;
     if extras == 0 {
-        style_renames = merge_styles(tpl, &sub_pkg, &mut body_xml)?;
+        style_renames = merge_styles(tpl, &sub_pkg, &mut body_xml, opts.map_styles_by_name)?;
         body_xml = merge_numbering(tpl, &sub_pkg, body_xml, &style_renames)?;
     } else {
         let hf_contents: Vec<String> = {
@@ -214,7 +266,7 @@ pub(crate) fn subdoc_xml_info(
             joined.push_str(HF_PART_SEP);
             joined.push_str(c);
         }
-        style_renames = merge_styles(tpl, &sub_pkg, &mut joined)?;
+        style_renames = merge_styles(tpl, &sub_pkg, &mut joined, opts.map_styles_by_name)?;
         joined = merge_numbering(tpl, &sub_pkg, joined, &style_renames)?;
         let mut segs = joined.split(HF_PART_SEP);
         body_xml = segs.next().unwrap_or_default().to_string();
@@ -243,7 +295,9 @@ pub(crate) fn subdoc_xml_info(
     }
 
     // restart numbering of the first list in the subdoc (docxcompose default)
-    body_xml = restart_first_numbering(tpl, body_xml)?;
+    if opts.restart_numbering {
+        body_xml = restart_first_numbering(tpl, body_xml)?;
+    }
 
     // footnotes merge
     body_xml = merge_footnotes(tpl, body_xml, fn_content)?;
@@ -764,12 +818,16 @@ fn sub_content_type_override(pkg: &Package, part_name: &str) -> Option<String> {
 // ---------------- styles ----------------
 
 /// Merge styles referenced by the subdoc body. Conflicting style definitions
-/// are renamed (like docxcompose) and references updated.
+/// are renamed (like docxcompose preserve_styles=True) and references
+/// updated — unless `map_by_name` is set (docxcompose preserve_styles=False):
+/// then references to a style whose name exists in the master are retargeted
+/// to the master's style id and the subdoc's definition is not copied.
 /// Returns the map of renamed style ids (old -> new).
 fn merge_styles(
     tpl: &mut TplCore,
     sub: &Package,
     body_xml: &mut String,
+    map_by_name: bool,
 ) -> Result<HashMap<String, String>, String> {
     let mut renames: HashMap<String, String> = HashMap::new();
     let Some(sub_styles_xml) = sub.get_string("word/styles.xml") else {
@@ -837,23 +895,47 @@ fn merge_styles(
 
     // decide renames for conflicting definitions
     let existing_ids: HashSet<String> = master_by_id.keys().cloned().collect();
-    for st in &sub_styles {
-        let Some(id) = st.get_attr("w:styleId").map(|s| s.to_string()) else {
-            continue;
-        };
-        if !referenced.contains(&id) {
-            continue;
+    if map_by_name {
+        // docxcompose preserve_styles=False: style ids are language-specific
+        // but names are not, so references are mapped through the style name
+        // to the master's style id; a style whose id the master already has
+        // is not copied either (the master's definition wins)
+        let mut master_by_name: HashMap<&str, &str> = HashMap::new();
+        for mst in &master_styles {
+            if let (Some(id), Some(name)) = (mst.get_attr("w:styleId"), style_name(mst)) {
+                master_by_name.entry(name).or_insert(id);
+            }
         }
-        if let Some(&master_st) = master_by_id.get(&id) {
-            if !elements_equivalent(st, master_st) {
-                // conflict: rename like docxcompose (id_1, id_2, ...)
-                let mut n = 1;
-                let mut new_id = format!("{}_{}", id, n);
-                while existing_ids.contains(&new_id) || style_by_id.contains_key(&new_id) {
-                    n += 1;
-                    new_id = format!("{}_{}", id, n);
+        for st in &sub_styles {
+            let Some(id) = st.get_attr("w:styleId").map(|s| s.to_string()) else {
+                continue;
+            };
+            if !referenced.contains(&id) || existing_ids.contains(&id) {
+                continue;
+            }
+            if let Some(mid) = style_name(st).and_then(|n| master_by_name.get(n)) {
+                renames.insert(id, mid.to_string());
+            }
+        }
+    } else {
+        for st in &sub_styles {
+            let Some(id) = st.get_attr("w:styleId").map(|s| s.to_string()) else {
+                continue;
+            };
+            if !referenced.contains(&id) {
+                continue;
+            }
+            if let Some(&master_st) = master_by_id.get(&id) {
+                if !elements_equivalent(st, master_st) {
+                    // conflict: rename like docxcompose (id_1, id_2, ...)
+                    let mut n = 1;
+                    let mut new_id = format!("{}_{}", id, n);
+                    while existing_ids.contains(&new_id) || style_by_id.contains_key(&new_id) {
+                        n += 1;
+                        new_id = format!("{}_{}", id, n);
+                    }
+                    renames.insert(id, new_id);
                 }
-                renames.insert(id, new_id);
             }
         }
     }
@@ -888,20 +970,23 @@ fn merge_styles(
         if !referenced.contains(&id) {
             continue;
         }
+        if renames.contains_key(&id) && map_by_name {
+            continue; // absorbed by the master's same-named style
+        }
         if existing_ids.contains(&id) && !renames.contains_key(&id) {
             continue; // identical definition already present
         }
         let mut st = (*st).clone();
         if let Some(new_id) = renames.get(&id) {
             st.set_attr("w:styleId", new_id);
-            // remap internal references
-            for tag in ["w:basedOn", "w:link", "w:next"] {
-                if let Some(dep) = st.find_mut(tag) {
-                    if let Some(v) = dep.get_attr("w:val") {
-                        if let Some(nv) = renames.get(v) {
-                            let nv = nv.clone();
-                            dep.set_attr("w:val", &nv);
-                        }
+        }
+        // remap internal references
+        for tag in ["w:basedOn", "w:link", "w:next"] {
+            if let Some(dep) = st.find_mut(tag) {
+                if let Some(v) = dep.get_attr("w:val") {
+                    if let Some(nv) = renames.get(v) {
+                        let nv = nv.clone();
+                        dep.set_attr("w:val", &nv);
                     }
                 }
             }
@@ -933,6 +1018,170 @@ fn collect_style_elems<'a>(el: &'a Element, out: &mut Vec<&'a Element>) {
             if e.name == "w:style" {
                 out.push(e);
             }
+        }
+    }
+}
+
+/// The style's name (w:name/@w:val).
+fn style_name(style: &Element) -> Option<&str> {
+    style.find("w:name").and_then(|n| n.get_attr("w:val"))
+}
+
+/// docxcompose retain_formatting_from_default_styles (paragraph styles only,
+/// which is all docxcompose supports): when the subdoc's default paragraph
+/// style differs from the master's, its run properties are copied onto runs
+/// without w:rPr/w:rStyle and its paragraph properties onto paragraphs
+/// without w:pPr/w:pStyle, so the merged content keeps its look.
+fn retain_formatting_from_default_styles(
+    tpl: &mut TplCore,
+    sub: &Package,
+    body_xml: String,
+) -> Result<String, String> {
+    let Some(sub_styles_xml) = sub.get_string("word/styles.xml") else {
+        return Ok(body_xml);
+    };
+    let Ok(sub_styles_dom) = Document::parse(&sub_styles_xml) else {
+        return Ok(body_xml);
+    };
+    let mut sub_styles: Vec<&Element> = Vec::new();
+    collect_style_elems(&sub_styles_dom.root, &mut sub_styles);
+    let Some(default_style) = sub_styles.iter().find(|e| is_default_paragraph_style(e)) else {
+        return Ok(body_xml);
+    };
+
+    // nothing to retain when the master's default paragraph style is identical
+    let pkg = tpl.package.as_ref().ok_or("package not loaded")?;
+    if let Some(master_xml) = pkg.get_string("word/styles.xml") {
+        if let Ok(master_dom) = Document::parse(&master_xml) {
+            let mut master_styles: Vec<&Element> = Vec::new();
+            collect_style_elems(&master_dom.root, &mut master_styles);
+            if let Some(mds) = master_styles.iter().find(|e| is_default_paragraph_style(e)) {
+                if elements_equivalent(default_style, mds) {
+                    return Ok(body_xml);
+                }
+            }
+        }
+    }
+
+    let child_elems = |parent: Option<&Element>| -> Vec<Element> {
+        parent
+            .map(|p| {
+                p.children
+                    .iter()
+                    .filter_map(|c| match c {
+                        Node::Elem(e) => Some(e.clone()),
+                        Node::Text(_) => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let run_props = child_elems(default_style.find("w:rPr"));
+    let para_props = child_elems(default_style.find("w:pPr"));
+    if run_props.is_empty() && para_props.is_empty() {
+        return Ok(body_xml);
+    }
+
+    let style_by_id: HashMap<String, &Element> = sub_styles
+        .iter()
+        .filter_map(|e| e.get_attr("w:styleId").map(|id| (id.to_string(), *e)))
+        .collect();
+
+    let mut dom = match parse_body_fragment(&body_xml) {
+        Ok(d) => d,
+        Err(_) => return Ok(body_xml),
+    };
+    let ctx = RetainCtx {
+        run_props: &run_props,
+        para_props: &para_props,
+        style_by_id: &style_by_id,
+    };
+    retain_apply(&mut dom.root, None, &ctx);
+    Ok(serialize_body_fragment(&dom))
+}
+
+fn is_default_paragraph_style(e: &Element) -> bool {
+    e.get_attr("w:type") == Some("paragraph")
+        && matches!(e.get_attr("w:default"), Some("1") | Some("true") | Some("on"))
+}
+
+struct RetainCtx<'a> {
+    run_props: &'a [Element],
+    para_props: &'a [Element],
+    style_by_id: &'a HashMap<String, &'a Element>,
+}
+
+fn retain_apply(el: &mut Element, pstyle: Option<String>, ctx: &RetainCtx) {
+    // nearest pStyle on the ancestor chain (docxcompose checks
+    // */w:pStyle/@w:val of each ancestor of the run)
+    let mut pstyle = pstyle;
+    for c in &el.children {
+        if let Node::Elem(e) = c {
+            if let Some(v) = e.find("w:pStyle").and_then(|p| p.get_attr("w:val")) {
+                pstyle = Some(v.to_string());
+                break;
+            }
+        }
+    }
+
+    if el.name == "w:p" && !ctx.para_props.is_empty() {
+        if el.find("w:pPr").is_none() {
+            el.children.insert(0, Node::Elem(Element::new("w:pPr")));
+        }
+        if let Some(ppr) = el.find_mut("w:pPr") {
+            if ppr.find("w:pStyle").is_none() {
+                let existing: HashSet<String> = ppr
+                    .children
+                    .iter()
+                    .filter_map(|c| match c {
+                        Node::Elem(e) => Some(e.name.to_string()),
+                        Node::Text(_) => None,
+                    })
+                    .collect();
+                for pp in ctx.para_props {
+                    if !existing.contains(pp.name.as_str()) {
+                        ppr.children.push(Node::Elem(pp.clone()));
+                    }
+                }
+            }
+        }
+    }
+    if el.name == "w:r" && !ctx.run_props.is_empty() {
+        if el.find("w:rPr").is_none() {
+            el.children.insert(0, Node::Elem(Element::new("w:rPr")));
+        }
+        if let Some(rpr) = el.find_mut("w:rPr") {
+            if rpr.find("w:rStyle").is_none() {
+                // properties already defined by the ancestor paragraph's
+                // style are not added (they win over the default style)
+                let from_style: HashSet<&str> = pstyle
+                    .as_deref()
+                    .and_then(|id| ctx.style_by_id.get(id))
+                    .map(|st| {
+                        let mut s = HashSet::new();
+                        for tag in ["w:rPr", "w:pPr"] {
+                            if let Some(x) = st.find(tag) {
+                                for c in &x.children {
+                                    if let Node::Elem(e) = c {
+                                        s.insert(e.name.as_str());
+                                    }
+                                }
+                            }
+                        }
+                        s
+                    })
+                    .unwrap_or_default();
+                for rp in ctx.run_props {
+                    if !from_style.contains(rp.name.as_str()) {
+                        rpr.children.push(Node::Elem(rp.clone()));
+                    }
+                }
+            }
+        }
+    }
+    for c in el.children.iter_mut() {
+        if let Node::Elem(e) = c {
+            retain_apply(e, pstyle.clone(), ctx);
         }
     }
 }

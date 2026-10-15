@@ -656,6 +656,19 @@ impl PyDocxTemplate {
     }
 
     #[setter]
+    fn set_current_rendering_part(&self, value: Option<String>) {
+        let mut core = self.core.borrow_mut();
+        crate::pybridge::set_current_rendering_part(&mut *core, value);
+    }
+
+    /// Running wp:docPr id counter (docxtpl docx_ids_index), seeded to 1000
+    /// on every render_init.
+    #[getter]
+    fn docx_ids_index(&self) -> u32 {
+        self.core.borrow().docx_ids_index
+    }
+
+    #[setter]
     fn set_is_rendered(&self, v: bool) {
         self.core.borrow_mut().is_rendered = v;
     }
@@ -666,15 +679,14 @@ impl PyDocxTemplate {
     }
 
     /// Media replacement map {crc32: new_bytes} (docxtpl crc_to_new_media).
-    /// The getter returns a snapshot copy: mutating it in place has no
-    /// effect, reassign the attribute instead (unlike docxtpl's live dict).
+    /// Returns a live mutable view: assignments like
+    /// `tpl.crc_to_new_media[12345] = b"..."` update the map in place.
     #[getter]
-    fn crc_to_new_media(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let dict = PyDict::new(py);
-        for (k, v) in &self.core.borrow().crc_to_new_media {
-            dict.set_item(k, PyBytes::new(py, v))?;
-        }
-        Ok(dict.unbind())
+    fn crc_to_new_media(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<PyReplacementDict>> {
+        Py::new(py, PyReplacementDict {
+            tpl: slf,
+            kind: ReplacementKind::Media,
+        })
     }
 
     #[setter]
@@ -689,14 +701,13 @@ impl PyDocxTemplate {
     }
 
     /// Embedded-object replacement map {crc32: new_bytes} (docxtpl
-    /// crc_to_new_embedded). Snapshot semantics: see crc_to_new_media.
+    /// crc_to_new_embedded). Returns a live mutable view.
     #[getter]
-    fn crc_to_new_embedded(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let dict = PyDict::new(py);
-        for (k, v) in &self.core.borrow().crc_to_new_embedded {
-            dict.set_item(k, PyBytes::new(py, v))?;
-        }
-        Ok(dict.unbind())
+    fn crc_to_new_embedded(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<PyReplacementDict>> {
+        Py::new(py, PyReplacementDict {
+            tpl: slf,
+            kind: ReplacementKind::Embedded,
+        })
     }
 
     #[setter]
@@ -711,14 +722,13 @@ impl PyDocxTemplate {
     }
 
     /// Zip-entry replacement map {zipname: new_bytes} (docxtpl
-    /// zipname_to_replace). Snapshot semantics: see crc_to_new_media.
+    /// zipname_to_replace). Returns a live mutable view.
     #[getter]
-    fn zipname_to_replace(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let dict = PyDict::new(py);
-        for (k, v) in &self.core.borrow().zipname_to_replace {
-            dict.set_item(k, PyBytes::new(py, v))?;
-        }
-        Ok(dict.unbind())
+    fn zipname_to_replace(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<PyReplacementDict>> {
+        Py::new(py, PyReplacementDict {
+            tpl: slf,
+            kind: ReplacementKind::Zipname,
+        })
     }
 
     #[setter]
@@ -733,14 +743,13 @@ impl PyDocxTemplate {
     }
 
     /// Picture replacement map {name/title/descr: new_bytes} (docxtpl
-    /// pics_to_replace). Snapshot semantics: see crc_to_new_media.
+    /// pics_to_replace). Returns a live mutable view.
     #[getter]
-    fn pics_to_replace(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let dict = PyDict::new(py);
-        for (k, v) in &self.core.borrow().pics_to_replace {
-            dict.set_item(k, PyBytes::new(py, v))?;
-        }
-        Ok(dict.unbind())
+    fn pics_to_replace(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<PyReplacementDict>> {
+        Py::new(py, PyReplacementDict {
+            tpl: slf,
+            kind: ReplacementKind::Pics,
+        })
     }
 
     #[setter]
@@ -1038,10 +1047,11 @@ impl PyDocxTemplate {
     }
 
     /// Apply the pending zip-level replacements (crc_to_new_media /
-    /// crc_to_new_embedded / zipname_to_replace) to a docx file on disk,
-    /// rewriting it in place (docxtpl post_processing). The live package is
-    /// not touched. No-op when all replacement dicts are empty.
-    fn post_processing(&self, docx_file: &str) -> PyResult<()> {
+    /// crc_to_new_embedded / zipname_to_replace) to a docx file given as a
+    /// path or a file-like object, rewriting it in place / via its write()
+    /// method (docxtpl post_processing). The live package is not touched.
+    /// No-op when all replacement dicts are empty.
+    fn post_processing(&self, py: Python<'_>, docx_file: &Bound<'_, PyAny>) -> PyResult<()> {
         let core = self.core.borrow();
         if core.crc_to_new_media.is_empty()
             && core.crc_to_new_embedded.is_empty()
@@ -1049,11 +1059,23 @@ impl PyDocxTemplate {
         {
             return Ok(());
         }
-        let data = std::fs::read(docx_file)
-            .map_err(|e| PyValueError::new_err(format!("cannot read {}: {}", docx_file, e)))?;
+        let data = read_bytes_source(docx_file)?;
         let out = core.post_processing_bytes(&data).map_err(to_pyerr)?;
-        std::fs::write(docx_file, &out)
-            .map_err(|e| PyValueError::new_err(format!("cannot write {}: {}", docx_file, e)))
+        if let Ok(path) = docx_file.extract::<String>() {
+            std::fs::write(&path, &out)
+                .map_err(|e| PyValueError::new_err(format!("cannot write {}: {}", path, e)))?;
+            return Ok(());
+        }
+        if let Ok(fspath) = docx_file.call_method0("__fspath__") {
+            if let Ok(path) = fspath.extract::<String>() {
+                std::fs::write(&path, &out)
+                    .map_err(|e| PyValueError::new_err(format!("cannot write {}: {}", path, e)))?;
+                return Ok(());
+            }
+        }
+        let b = PyBytes::new(py, &out);
+        docx_file.call_method1("write", (b,))?;
+        Ok(())
     }
 }
 
@@ -1162,6 +1184,11 @@ impl PyRichText {
     #[getter]
     fn xml(&self) -> String {
         self.xml.borrow().clone()
+    }
+
+    #[setter]
+    fn set_xml(&self, v: String) {
+        *self.xml.borrow_mut() = v;
     }
 
     fn __str__(&self) -> String {
@@ -1378,6 +1405,8 @@ pub struct PyInlineImage {
     pub anchor: Option<String>,
     pub title: Option<String>,
     pub descr: Option<String>,
+    /// the original image source object (docxtpl image_descriptor)
+    pub image_descriptor: Py<PyAny>,
     pub tpl: Py<PyDocxTemplate>,
 }
 
@@ -1411,8 +1440,48 @@ impl PyInlineImage {
             anchor,
             title,
             descr,
+            image_descriptor: image_descriptor.clone().unbind(),
             tpl,
         })
+    }
+
+    /// The template this image belongs to (docxtpl tpl).
+    #[getter]
+    fn tpl(&self, py: Python<'_>) -> Py<PyDocxTemplate> {
+        self.tpl.clone_ref(py)
+    }
+
+    /// The original image source object (docxtpl image_descriptor).
+    #[getter]
+    fn image_descriptor(&self, py: Python<'_>) -> Py<PyAny> {
+        self.image_descriptor.clone_ref(py)
+    }
+
+    /// Image width as a Length (EMU), None when unset (docxtpl width).
+    #[getter]
+    fn width(&self) -> Option<PyLength> {
+        self.width.map(|emu| PyLength { emu })
+    }
+
+    /// Image height as a Length (EMU), None when unset (docxtpl height).
+    #[getter]
+    fn height(&self) -> Option<PyLength> {
+        self.height.map(|emu| PyLength { emu })
+    }
+
+    #[getter]
+    fn anchor(&self) -> Option<String> {
+        self.anchor.clone()
+    }
+
+    #[getter]
+    fn title(&self) -> Option<String> {
+        self.title.clone()
+    }
+
+    #[getter]
+    fn descr(&self) -> Option<String> {
+        self.descr.clone()
     }
 }
 
@@ -1911,26 +1980,101 @@ pub struct PyComposer {
 #[pymethods]
 impl PyComposer {
     /// master: path, bytes, or file-like object with the master docx.
+    /// preserve_styles (docxcompose): False (default) maps the appended
+    /// document's styles to the master's same-named styles; True keeps them
+    /// (conflicts renamed) and retains the default paragraph style's
+    /// formatting on unstyled runs/paragraphs.
     #[new]
-    fn new(master: &Bound<'_, PyAny>) -> PyResult<Self> {
+    #[pyo3(signature = (master, preserve_styles=false))]
+    fn new(master: &Bound<'_, PyAny>, preserve_styles: bool) -> PyResult<Self> {
         let bytes = read_bytes_source(master)?;
-        let inner = crate::composer::Composer::new(bytes).map_err(to_pyerr)?;
+        let mut inner = crate::composer::Composer::new(bytes).map_err(to_pyerr)?;
+        inner.preserve_styles = preserve_styles;
         Ok(PyComposer {
             inner: RefCell::new(inner),
         })
     }
 
+    /// The composed document as a read-only Document facade: a snapshot
+    /// built from the current save bytes; later appends/inserts are not
+    /// reflected.
+    #[getter]
+    fn doc(&self, py: Python<'_>) -> PyResult<Py<crate::docmodel::PyDocument>> {
+        let bytes = self.inner.borrow_mut().save_bytes().map_err(to_pyerr)?;
+        let tpl = Py::new(
+            py,
+            PyDocxTemplate {
+                core: RefCell::new(TplCore::new(bytes)),
+                doc: RefCell::new(None),
+                template_file: None,
+            },
+        )?;
+        Py::new(py, crate::docmodel::PyDocument { tpl })
+    }
+
+    /// Whether the first list of each merged document restarts numbering
+    /// (docxcompose restart_numbering, default True).
+    #[getter]
+    fn restart_numbering(&self) -> bool {
+        self.inner.borrow().restart_numbering
+    }
+
+    #[setter]
+    fn set_restart_numbering(&self, v: bool) {
+        self.inner.borrow_mut().restart_numbering = v;
+    }
+
+    /// The preserve_styles flag given at construction (docxcompose).
+    #[getter]
+    fn preserve_styles(&self) -> bool {
+        self.inner.borrow().preserve_styles
+    }
+
+    /// The body index at which append() inserts: the master body's first
+    /// sectPr, or the end of the body (docxcompose append_index).
+    fn append_index(&self) -> PyResult<usize> {
+        self.inner.borrow_mut().append_index().map_err(to_pyerr)
+    }
+
     /// Append one whole docx (path, bytes, or file-like) to the master's
     /// body, preceded by a page break. Styles/numbering/media/footnotes are
-    /// merged like docxcompose (style conflicts renamed `X_1`, the first
-    /// list restarts numbering); the appended document's section properties
-    /// (page setup, header/footer references) are dropped.
-    fn append(&self, py: Python<'_>, doc: &Bound<'_, PyAny>) -> PyResult<()> {
+    /// merged like docxcompose. With remove_property_fields (default True),
+    /// DOCPROPERTY fields referencing custom document properties are
+    /// dissolved into their literal values.
+    #[pyo3(signature = (doc, remove_property_fields=true))]
+    fn append(
+        &self,
+        py: Python<'_>,
+        doc: &Bound<'_, PyAny>,
+        remove_property_fields: bool,
+    ) -> PyResult<()> {
         let bytes = read_bytes_source(doc)?;
         let inner = AssertSend(&self.inner);
         py.detach(move || {
             let inner = inner; // capture AssertSend as a whole
-            inner.0.borrow_mut().append(&bytes)
+            inner.0.borrow_mut().append_opts(&bytes, remove_property_fields)
+        })
+        .map_err(to_pyerr)
+    }
+
+    /// Insert one whole docx (path, bytes, or file-like) at the given body
+    /// index (docxcompose insert()).
+    #[pyo3(signature = (index, doc, remove_property_fields=true))]
+    fn insert(
+        &self,
+        py: Python<'_>,
+        index: usize,
+        doc: &Bound<'_, PyAny>,
+        remove_property_fields: bool,
+    ) -> PyResult<()> {
+        let bytes = read_bytes_source(doc)?;
+        let inner = AssertSend(&self.inner);
+        py.detach(move || {
+            let inner = inner; // capture AssertSend as a whole
+            inner
+                .0
+                .borrow_mut()
+                .insert_at(index, &bytes, remove_property_fields)
         })
         .map_err(to_pyerr)
     }
@@ -1959,5 +2103,353 @@ impl PyComposer {
         let b = PyBytes::new(py, &bytes);
         filename.call_method1("write", (b,))?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------- ReplacementDict
+
+/// Kind of replacement map (internal tag for dispatch).
+#[derive(Clone, Copy, Debug)]
+enum ReplacementKind {
+    Media,
+    Embedded,
+    Zipname,
+    Pics,
+}
+
+/// A mutable dictionary view over one of the replacement maps
+/// (crc_to_new_media / crc_to_new_embedded / zipname_to_replace / pics_to_replace).
+/// Implements the Python mapping protocol: __getitem__/__setitem__/__delitem__/
+/// __contains__/__len__/__iter__, plus get/keys/values/items/update/clear.
+///
+/// Mutations are applied immediately to the underlying map, so this behaves
+/// like docxtpl's live dict attributes.
+#[pyclass(name = "ReplacementDict", unsendable)]
+pub struct PyReplacementDict {
+    tpl: Py<PyDocxTemplate>,
+    kind: ReplacementKind,
+}
+
+impl PyReplacementDict {
+    /// Get a value by key (converts key type as needed).
+    fn get_value(&self, key: &Bound<'_, PyAny>) -> PyResult<Option<Vec<u8>>> {
+        let py = key.py();
+        let tpl = self.tpl.bind(py);
+        let tpl_ref = tpl.borrow();
+        let core = tpl_ref.core.borrow();
+        match self.kind {
+            ReplacementKind::Media | ReplacementKind::Embedded => {
+                let k: u32 = key.extract()?;
+                let map = if matches!(self.kind, ReplacementKind::Media) {
+                    &core.crc_to_new_media
+                } else {
+                    &core.crc_to_new_embedded
+                };
+                Ok(map.get(&k).cloned())
+            }
+            ReplacementKind::Zipname | ReplacementKind::Pics => {
+                let k: String = key.extract()?;
+                let map = if matches!(self.kind, ReplacementKind::Zipname) {
+                    &core.zipname_to_replace
+                } else {
+                    &core.pics_to_replace
+                };
+                Ok(map.get(&k).cloned())
+            }
+        }
+    }
+
+    /// Set a value by key (converts key type as needed).
+    fn set_value(&self, key: &Bound<'_, PyAny>, value: Vec<u8>) -> PyResult<()> {
+        let py = key.py();
+        let tpl = self.tpl.bind(py);
+        let tpl_ref = tpl.borrow();
+        let mut core = tpl_ref.core.borrow_mut();
+        match self.kind {
+            ReplacementKind::Media | ReplacementKind::Embedded => {
+                let k: u32 = key.extract()?;
+                let map = if matches!(self.kind, ReplacementKind::Media) {
+                    &mut core.crc_to_new_media
+                } else {
+                    &mut core.crc_to_new_embedded
+                };
+                map.insert(k, value);
+            }
+            ReplacementKind::Zipname | ReplacementKind::Pics => {
+                let k: String = key.extract()?;
+                let map = if matches!(self.kind, ReplacementKind::Zipname) {
+                    &mut core.zipname_to_replace
+                } else {
+                    &mut core.pics_to_replace
+                };
+                map.insert(k, value);
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete a value by key.
+    fn del_value(&self, key: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let py = key.py();
+        let tpl = self.tpl.bind(py);
+        let tpl_ref = tpl.borrow();
+        let mut core = tpl_ref.core.borrow_mut();
+        match self.kind {
+            ReplacementKind::Media | ReplacementKind::Embedded => {
+                let k: u32 = key.extract()?;
+                let map = if matches!(self.kind, ReplacementKind::Media) {
+                    &mut core.crc_to_new_media
+                } else {
+                    &mut core.crc_to_new_embedded
+                };
+                Ok(map.remove(&k).is_some())
+            }
+            ReplacementKind::Zipname | ReplacementKind::Pics => {
+                let k: String = key.extract()?;
+                let map = if matches!(self.kind, ReplacementKind::Zipname) {
+                    &mut core.zipname_to_replace
+                } else {
+                    &mut core.pics_to_replace
+                };
+                Ok(map.remove(&k).is_some())
+            }
+        }
+    }
+
+    /// Check if key exists.
+    fn contains_key(&self, key: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let py = key.py();
+        let tpl = self.tpl.bind(py);
+        let tpl_ref = tpl.borrow();
+        let core = tpl_ref.core.borrow();
+        match self.kind {
+            ReplacementKind::Media | ReplacementKind::Embedded => {
+                let k: u32 = key.extract()?;
+                let map = if matches!(self.kind, ReplacementKind::Media) {
+                    &core.crc_to_new_media
+                } else {
+                    &core.crc_to_new_embedded
+                };
+                Ok(map.contains_key(&k))
+            }
+            ReplacementKind::Zipname | ReplacementKind::Pics => {
+                let k: String = key.extract()?;
+                let map = if matches!(self.kind, ReplacementKind::Zipname) {
+                    &core.zipname_to_replace
+                } else {
+                    &core.pics_to_replace
+                };
+                Ok(map.contains_key(&k))
+            }
+        }
+    }
+
+    /// Get length.
+    fn len(&self, py: Python<'_>) -> usize {
+        let tpl = self.tpl.bind(py);
+        let tpl_ref = tpl.borrow();
+        let core = tpl_ref.core.borrow();
+        match self.kind {
+            ReplacementKind::Media => core.crc_to_new_media.len(),
+            ReplacementKind::Embedded => core.crc_to_new_embedded.len(),
+            ReplacementKind::Zipname => core.zipname_to_replace.len(),
+            ReplacementKind::Pics => core.pics_to_replace.len(),
+        }
+    }
+
+    /// Get all keys as Python objects.
+    fn get_keys(&self, py: Python<'_>) -> Vec<Py<PyAny>> {
+        let tpl = self.tpl.bind(py);
+        let tpl_ref = tpl.borrow();
+        let core = tpl_ref.core.borrow();
+        match self.kind {
+            ReplacementKind::Media => core
+                .crc_to_new_media
+                .keys()
+                .map(|k| k.into_pyobject(py).unwrap().into_any().unbind())
+                .collect(),
+            ReplacementKind::Embedded => core
+                .crc_to_new_embedded
+                .keys()
+                .map(|k| k.into_pyobject(py).unwrap().into_any().unbind())
+                .collect(),
+            ReplacementKind::Zipname => core
+                .zipname_to_replace
+                .keys()
+                .map(|k| k.clone().into_pyobject(py).unwrap().into_any().unbind())
+                .collect(),
+            ReplacementKind::Pics => core
+                .pics_to_replace
+                .keys()
+                .map(|k| k.clone().into_pyobject(py).unwrap().into_any().unbind())
+                .collect(),
+        }
+    }
+
+    /// Clear all entries.
+    fn clear_map(&self, py: Python<'_>) {
+        let tpl = self.tpl.bind(py);
+        let tpl_ref = tpl.borrow();
+        let mut core = tpl_ref.core.borrow_mut();
+        match self.kind {
+            ReplacementKind::Media => core.crc_to_new_media.clear(),
+            ReplacementKind::Embedded => core.crc_to_new_embedded.clear(),
+            ReplacementKind::Zipname => core.zipname_to_replace.clear(),
+            ReplacementKind::Pics => core.pics_to_replace.clear(),
+        }
+    }
+}
+
+#[pymethods]
+impl PyReplacementDict {
+    fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyBytes>> {
+        match self.get_value(key)? {
+            Some(v) => Ok(PyBytes::new(py, &v).unbind()),
+            None => {
+                let key_repr = key.str()?.to_string_lossy().to_string();
+                Err(pyo3::exceptions::PyKeyError::new_err(key_repr))
+            }
+        }
+    }
+
+    fn __setitem__(&self, key: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let bytes = value
+            .cast::<PyBytes>()
+            .map(|b| b.as_bytes().to_vec())
+            .or_else(|_| value.extract::<Vec<u8>>())?;
+        self.set_value(key, bytes)
+    }
+
+    fn __delitem__(&self, key: &Bound<'_, PyAny>) -> PyResult<()> {
+        if self.del_value(key)? {
+            Ok(())
+        } else {
+            let key_repr = key.str()?.to_string_lossy().to_string();
+            Err(pyo3::exceptions::PyKeyError::new_err(key_repr))
+        }
+    }
+
+    fn __contains__(&self, key: &Bound<'_, PyAny>) -> PyResult<bool> {
+        self.contains_key(key)
+    }
+
+    fn __len__(&self, py: Python<'_>) -> usize {
+        self.len(py)
+    }
+
+    fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let keys = self.get_keys(py);
+        let list = PyList::new(py, keys)?;
+        Ok(list.call_method0("__iter__")?.unbind())
+    }
+
+    #[pyo3(signature = (key, default=None))]
+    fn get(&self, py: Python<'_>, key: &Bound<'_, PyAny>, default: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
+        match self.get_value(key)? {
+            Some(v) => Ok(PyBytes::new(py, &v).into_any().unbind()),
+            None => match default {
+                Some(d) => Ok(d.clone().unbind()),
+                None => Ok(py.None()),
+            },
+        }
+    }
+
+    fn keys(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let keys = self.get_keys(py);
+        Ok(PyList::new(py, keys)?.unbind())
+    }
+
+    fn values(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let tpl = self.tpl.bind(py);
+        let tpl_ref = tpl.borrow();
+        let core = tpl_ref.core.borrow();
+        let values: Vec<Py<PyBytes>> = match self.kind {
+            ReplacementKind::Media => core
+                .crc_to_new_media
+                .values()
+                .map(|v| PyBytes::new(py, v).unbind())
+                .collect(),
+            ReplacementKind::Embedded => core
+                .crc_to_new_embedded
+                .values()
+                .map(|v| PyBytes::new(py, v).unbind())
+                .collect(),
+            ReplacementKind::Zipname => core
+                .zipname_to_replace
+                .values()
+                .map(|v| PyBytes::new(py, v).unbind())
+                .collect(),
+            ReplacementKind::Pics => core
+                .pics_to_replace
+                .values()
+                .map(|v| PyBytes::new(py, v).unbind())
+                .collect(),
+        };
+        Ok(PyList::new(py, values)?.unbind())
+    }
+
+    fn items(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let tpl = self.tpl.bind(py);
+        let tpl_ref = tpl.borrow();
+        let core = tpl_ref.core.borrow();
+        let items: Vec<(Py<PyAny>, Py<PyBytes>)> = match self.kind {
+            ReplacementKind::Media => core
+                .crc_to_new_media
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.into_pyobject(py).unwrap().into_any().unbind(),
+                        PyBytes::new(py, v).unbind(),
+                    )
+                })
+                .collect(),
+            ReplacementKind::Embedded => core
+                .crc_to_new_embedded
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.into_pyobject(py).unwrap().into_any().unbind(),
+                        PyBytes::new(py, v).unbind(),
+                    )
+                })
+                .collect(),
+            ReplacementKind::Zipname => core
+                .zipname_to_replace
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone().into_pyobject(py).unwrap().into_any().unbind(),
+                        PyBytes::new(py, v).unbind(),
+                    )
+                })
+                .collect(),
+            ReplacementKind::Pics => core
+                .pics_to_replace
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone().into_pyobject(py).unwrap().into_any().unbind(),
+                        PyBytes::new(py, v).unbind(),
+                    )
+                })
+                .collect(),
+        };
+        Ok(PyList::new(py, items)?.unbind())
+    }
+
+    fn update(&self, other: &Bound<'_, PyAny>) -> PyResult<()> {
+        let dict = other.cast::<PyDict>()?;
+        for (k, v) in dict.iter() {
+            let bytes = v
+                .cast::<PyBytes>()
+                .map(|b| b.as_bytes().to_vec())
+                .or_else(|_| v.extract::<Vec<u8>>())?;
+            self.set_value(&k, bytes)?;
+        }
+        Ok(())
+    }
+
+    fn clear(&self, py: Python<'_>) {
+        self.clear_map(py);
     }
 }

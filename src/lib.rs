@@ -10,6 +10,7 @@ mod docmodel_add;
 #[cfg(feature = "python")]
 mod docmodel_fmt;
 pub mod composer;
+pub mod customprops;
 pub mod doc;
 pub mod gettext;
 pub mod image;
@@ -36,7 +37,7 @@ use pyo3::prelude::*;
 #[cfg(feature = "python")]
 #[pymodule]
 fn docxtplrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("__version__", "0.3.0")?;
+    m.add("__version__", "0.3.1")?;
 
     m.add_class::<pyclasses::PyDocxTemplate>()?;
     m.add_class::<pyclasses::PyRichText>()?;
@@ -82,6 +83,7 @@ fn docxtplrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<doccomments::PyComments>()?;
     m.add_class::<doccomments::PyComment>()?;
     m.add_class::<pyxml::PyXmlElement>()?;
+    m.add_class::<pyclasses::PyReplacementDict>()?;
 
     // aliases like docxtpl: R = RichText, RP = RichTextParagraph
     m.add("R", m.getattr("RichText")?)?;
